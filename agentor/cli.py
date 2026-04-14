@@ -1,5 +1,8 @@
 import argparse
 import sys
+import threading
+import time
+from collections import deque
 from pathlib import Path
 
 from .committer import approve_and_commit, reject
@@ -116,24 +119,120 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+REPL_HELP = """commands:
+  s, status        — counts + pool state
+  l, list          — list items grouped by status
+  r, review        — review items awaiting approval
+  log              — tail recent daemon log lines
+  h, help, ?       — this help
+  q, quit, exit    — stop daemon and exit
+"""
+
+
+def _make_daemon_logger(log_path: Path, ring: deque) -> callable:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = log_path.open("a", buffering=1)
+
+    def log(msg: str) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        line = f"[{stamp}] {msg}"
+        log_file.write(line + "\n")
+        ring.append(line)
+        print(f"[daemon] {msg}", flush=True)
+
+    return log
+
+
+def _print_daemon_status(cfg: Config, store: Store, daemon: Daemon) -> None:
+    print(f"project: {cfg.project_name}  pool_size: {cfg.agent.pool_size}  "
+          f"interval: {daemon.scan_interval}s  workers: {len(daemon.workers)}")
+    print(f"stats: scans={daemon.stats.scans} dispatched={daemon.stats.dispatched} "
+          f"completed={daemon.stats.completed} failed={daemon.stats.failed}")
+    for status in ItemStatus:
+        n = store.count_by_status(status)
+        if n:
+            print(f"  {status.value:<18} {n}")
+
+
+def _print_list(store: Store) -> None:
+    for status in ItemStatus:
+        rows = store.list_by_status(status)
+        if not rows:
+            continue
+        print(f"[{status.value}]")
+        for r in rows:
+            print(f"  {r.id}  {r.title}  ({r.source_file})")
+
+
+def _repl(cfg: Config, store: Store, daemon: Daemon, log_ring: deque) -> None:
+    print(REPL_HELP)
+    while True:
+        try:
+            line = input("agentor> ").strip().lower()
+        except EOFError:
+            print()
+            return
+        except KeyboardInterrupt:
+            print()
+            return
+
+        if line in ("q", "quit", "exit"):
+            return
+        if line in ("", "h", "help", "?"):
+            print(REPL_HELP)
+        elif line in ("s", "status"):
+            _print_daemon_status(cfg, store, daemon)
+        elif line in ("l", "list"):
+            _print_list(store)
+        elif line in ("r", "review"):
+            items = store.list_by_status(ItemStatus.AWAITING_REVIEW)
+            if not items:
+                print("no items awaiting review.")
+            else:
+                print(f"{len(items)} item(s) awaiting review.\n")
+                for item in items:
+                    _review_one(cfg, store, item)
+        elif line == "log":
+            if not log_ring:
+                print("(no log lines yet)")
+            else:
+                for ln in list(log_ring):
+                    print(ln)
+        else:
+            print(f"unknown command: {line!r}. type 'help'.")
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     cfg = load(_find_config(args.config))
     store = _open_store(cfg)
+    log_ring: deque = deque(maxlen=200)
+    log_path = cfg.project_root / ".agentor" / "agentor.log"
+    logger = _make_daemon_logger(log_path, log_ring)
+
+    daemon = Daemon(
+        config=cfg,
+        store=store,
+        runner_factory=lambda c, s: StubRunner(c, s),
+        scan_interval=args.interval,
+        log=logger,
+        install_signals=False,
+    )
+    t = threading.Thread(target=daemon.run, name="agentor-daemon", daemon=True)
+
+    print(f"agentor started for {cfg.project_name} "
+          f"(pool_size={cfg.agent.pool_size}, interval={args.interval}s)")
+    print(f"log: {log_path}")
+    t.start()
     try:
-        daemon = Daemon(
-            config=cfg,
-            store=store,
-            runner_factory=lambda c, s: StubRunner(c, s),
-            scan_interval=args.interval,
-        )
-        print(f"agentor started for {cfg.project_name} "
-              f"(pool_size={cfg.agent.pool_size}, interval={args.interval}s)")
-        print("ctrl-c to stop")
-        stats = daemon.run()
-        print(f"stopped. scans={stats.scans} dispatched={stats.dispatched} "
-              f"completed={stats.completed} failed={stats.failed}")
+        _repl(cfg, store, daemon, log_ring)
     finally:
+        print("stopping daemon...")
+        daemon.stop_event.set()
+        t.join(timeout=60)
         store.close()
+        s = daemon.stats
+        print(f"stopped. scans={s.scans} dispatched={s.dispatched} "
+              f"completed={s.completed} failed={s.failed}")
     return 0
 
 

@@ -31,12 +31,14 @@ class Daemon:
         runner_factory: Callable[[Config, Store], Runner],
         scan_interval: float = 5.0,
         log: Callable[[str], None] = print,
+        install_signals: bool = True,
     ):
         self.config = config
         self.store = store
         self.runner_factory = runner_factory
         self.scan_interval = scan_interval
         self.log = log
+        self.install_signals = install_signals
         self.stop_event = threading.Event()
         self.force_stop = False
         self.workers: set[threading.Thread] = set()
@@ -111,7 +113,8 @@ class Daemon:
         signal.signal(signal.SIGTERM, handler)
 
     def run(self) -> DaemonStats:
-        self._install_signal_handlers()
+        if self.install_signals:
+            self._install_signal_handlers()
         recovered = recover_on_startup(self.config, self.store)
         if recovered:
             self.log(f"recovered {len(recovered)} items from crashed run")
