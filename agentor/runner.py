@@ -62,23 +62,40 @@ class Runner:
         try:
             git_ops.worktree_add(repo, wt_path, branch, self.config.git.base_branch)
         except git_ops.GitError as e:
-            self.store.transition(
-                item.id, ItemStatus.QUEUED,
-                worktree_path=None, branch=None,
-                last_error=f"worktree_add: {e}",
-            )
-            return RunResult(item.id, wt_path, branch, "", [], "", error=str(e))
+            err = str(e)
+            if item.attempts >= self.config.agent.max_attempts:
+                self.store.transition(
+                    item.id, ItemStatus.REJECTED,
+                    worktree_path=None, branch=None,
+                    last_error=f"worktree_add exhausted after {item.attempts} attempts: {err}",
+                    note="max_attempts reached",
+                )
+            else:
+                self.store.transition(
+                    item.id, ItemStatus.QUEUED,
+                    worktree_path=None, branch=None,
+                    last_error=f"worktree_add: {err}",
+                )
+            return RunResult(item.id, wt_path, branch, "", [], "", error=err)
 
         try:
             summary, files_changed = self.do_work(item, wt_path)
         except Exception as e:
             last_error = f"do_work: {e}"
-            self.store.transition(
-                item.id, ItemStatus.REJECTED,
-                last_error=last_error,
-                note="runner failed",
-            )
             git_ops.worktree_remove(repo, wt_path, force=True)
+            if item.attempts >= self.config.agent.max_attempts:
+                self.store.transition(
+                    item.id, ItemStatus.REJECTED,
+                    worktree_path=None, branch=None,
+                    last_error=last_error,
+                    note="max_attempts reached",
+                )
+            else:
+                self.store.transition(
+                    item.id, ItemStatus.QUEUED,
+                    worktree_path=None, branch=None,
+                    last_error=last_error,
+                )
             return RunResult(item.id, wt_path, branch, "", [], "", error=last_error)
 
         diff = git_ops.diff_vs_base(wt_path, self.config.git.base_branch)

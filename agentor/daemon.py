@@ -47,9 +47,18 @@ class Daemon:
             return False
         # peek to plan worktree path before claiming (need title for slug)
         queued = self.store.list_by_status(ItemStatus.QUEUED)
-        if not queued:
+        max_attempts = self.config.agent.max_attempts
+        nxt = next((q for q in queued if q.attempts < max_attempts), None)
+        if nxt is None:
+            if queued:
+                # all remaining have exhausted attempts — auto-reject them
+                for q in queued:
+                    self.store.transition(
+                        q.id, ItemStatus.REJECTED,
+                        last_error=q.last_error or "max_attempts reached before dispatch",
+                        note="auto-reject: exhausted",
+                    )
             return False
-        nxt = queued[0]
         wt_path, branch = plan_worktree(self.config, nxt)
         claimed = self.store.claim_next_queued(str(wt_path), branch)
         if claimed is None:
