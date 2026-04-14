@@ -8,6 +8,7 @@ from pathlib import Path
 from .committer import approve_and_commit, reject
 from .config import Config, load
 from .daemon import Daemon
+from .dashboard import run_dashboard
 from .git_ops import diff_vs_base
 from .models import ItemStatus
 from .runner import make_runner
@@ -129,7 +130,7 @@ REPL_HELP = """commands:
 """
 
 
-def _make_daemon_logger(log_path: Path, ring: deque) -> callable:
+def _make_daemon_logger(log_path: Path, ring: deque, to_stdout: bool) -> callable:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("a", buffering=1)
 
@@ -138,7 +139,8 @@ def _make_daemon_logger(log_path: Path, ring: deque) -> callable:
         line = f"[{stamp}] {msg}"
         log_file.write(line + "\n")
         ring.append(line)
-        print(f"[daemon] {msg}", flush=True)
+        if to_stdout:
+            print(f"[daemon] {msg}", flush=True)
 
     return log
 
@@ -207,7 +209,12 @@ def cmd_start(args: argparse.Namespace) -> int:
     store = _open_store(cfg)
     log_ring: deque = deque(maxlen=200)
     log_path = cfg.project_root / ".agentor" / "agentor.log"
-    logger = _make_daemon_logger(log_path, log_ring)
+
+    ui = args.ui
+    if ui == "auto":
+        ui = "dashboard" if sys.stdout.isatty() else "repl"
+
+    logger = _make_daemon_logger(log_path, log_ring, to_stdout=(ui == "repl"))
 
     daemon = Daemon(
         config=cfg,
@@ -219,13 +226,17 @@ def cmd_start(args: argparse.Namespace) -> int:
     )
     t = threading.Thread(target=daemon.run, name="agentor-daemon", daemon=True)
 
-    print(f"agentor started for {cfg.project_name} "
-          f"(pool_size={cfg.agent.pool_size}, runner={cfg.agent.runner}, "
-          f"interval={args.interval}s)")
-    print(f"log: {log_path}")
+    if ui == "repl":
+        print(f"agentor started for {cfg.project_name} "
+              f"(pool_size={cfg.agent.pool_size}, runner={cfg.agent.runner}, "
+              f"interval={args.interval}s)")
+        print(f"log: {log_path}")
     t.start()
     try:
-        _repl(cfg, store, daemon, log_ring)
+        if ui == "dashboard":
+            run_dashboard(cfg, store, daemon, log_ring)
+        else:
+            _repl(cfg, store, daemon, log_ring)
     finally:
         print("stopping daemon...")
         daemon.stop_event.set()
@@ -306,6 +317,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("start", help="run daemon loop")
     sp.add_argument("--interval", type=float, default=5.0,
                     help="scan interval in seconds (default 5)")
+    sp.add_argument("--ui", choices=["auto", "dashboard", "repl"], default="auto",
+                    help="UI mode (default: auto — dashboard on tty, repl otherwise)")
     sp.set_defaults(func=cmd_start)
 
     sp = sub.add_parser("review", help="review items awaiting approval")
