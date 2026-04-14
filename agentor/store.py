@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -87,24 +88,29 @@ class Store:
 
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(db_path, isolation_level=None)  # autocommit
+        self.conn = sqlite3.connect(
+            db_path, isolation_level=None, check_same_thread=False,
+        )
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.executescript(SCHEMA)
+        self._lock = threading.RLock()
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
-        self.conn.execute("BEGIN")
-        try:
-            yield self.conn
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
+        with self._lock:
+            self.conn.execute("BEGIN")
+            try:
+                yield self.conn
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
 
     def upsert_discovered(self, item: Item) -> bool:
         """Insert an item seen in a source file if not already present.
@@ -135,22 +141,25 @@ class Store:
         return True
 
     def get(self, item_id: str) -> StoredItem | None:
-        row = self.conn.execute(
-            "SELECT * FROM items WHERE id = ?", (item_id,)
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM items WHERE id = ?", (item_id,)
+            ).fetchone()
         return _row_to_stored(row) if row else None
 
     def list_by_status(self, status: ItemStatus) -> list[StoredItem]:
-        rows = self.conn.execute(
-            "SELECT * FROM items WHERE status = ? ORDER BY created_at",
-            (status.value,),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM items WHERE status = ? ORDER BY created_at",
+                (status.value,),
+            ).fetchall()
         return [_row_to_stored(r) for r in rows]
 
     def count_by_status(self, status: ItemStatus) -> int:
-        row = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM items WHERE status = ?", (status.value,)
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM items WHERE status = ?", (status.value,)
+            ).fetchone()
         return row["n"]
 
     def transition(
@@ -225,9 +234,10 @@ class Store:
         return self.count_by_status(ItemStatus.WORKING) < pool_size
 
     def transitions_for(self, item_id: str) -> list[dict]:
-        rows = self.conn.execute(
-            """SELECT from_status, to_status, note, at
-               FROM transitions WHERE item_id = ? ORDER BY id""",
-            (item_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT from_status, to_status, note, at
+                   FROM transitions WHERE item_id = ? ORDER BY id""",
+                (item_id,),
+            ).fetchall()
         return [dict(r) for r in rows]

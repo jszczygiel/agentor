@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
 tmp/
-.agentor/state.db
+.agentor/
 *.egg-info/
 .venv/

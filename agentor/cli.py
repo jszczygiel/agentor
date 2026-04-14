@@ -2,8 +2,12 @@ import argparse
 import sys
 from pathlib import Path
 
+from .committer import approve_and_commit, reject
 from .config import Config, load
+from .daemon import Daemon
+from .git_ops import diff_vs_base
 from .models import ItemStatus
+from .runner import StubRunner
 from .store import Store
 from .watcher import scan_once
 
@@ -112,6 +116,76 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_start(args: argparse.Namespace) -> int:
+    cfg = load(_find_config(args.config))
+    store = _open_store(cfg)
+    try:
+        daemon = Daemon(
+            config=cfg,
+            store=store,
+            runner_factory=lambda c, s: StubRunner(c, s),
+            scan_interval=args.interval,
+        )
+        print(f"agentor started for {cfg.project_name} "
+              f"(pool_size={cfg.agent.pool_size}, interval={args.interval}s)")
+        print("ctrl-c to stop")
+        stats = daemon.run()
+        print(f"stopped. scans={stats.scans} dispatched={stats.dispatched} "
+              f"completed={stats.completed} failed={stats.failed}")
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    cfg = load(_find_config(args.config))
+    store = _open_store(cfg)
+    try:
+        items = store.list_by_status(ItemStatus.AWAITING_REVIEW)
+        if not items:
+            print("no items awaiting review.")
+            return 0
+        print(f"{len(items)} item(s) awaiting review.\n")
+        for item in items:
+            _review_one(cfg, store, item)
+    finally:
+        store.close()
+    return 0
+
+
+def _review_one(cfg: Config, store: Store, item) -> None:
+    print("=" * 72)
+    print(f"id:     {item.id}")
+    print(f"title:  {item.title}")
+    print(f"source: {item.source_file}:{item.source_line}")
+    print(f"branch: {item.branch}")
+    print(f"wt:     {item.worktree_path}")
+    if item.result_json:
+        import json as _json
+        res = _json.loads(item.result_json)
+        print(f"summary: {res.get('summary')}")
+        print(f"files:   {res.get('files_changed')}")
+    print()
+    diff = diff_vs_base(Path(item.worktree_path), cfg.git.base_branch)
+    print(diff or "(empty diff)")
+    print()
+    choice = input("[a]pprove / [r]eject / [s]kip ? ").strip().lower()
+    if choice == "a":
+        msg = input("commit message (blank = default): ").strip()
+        if not msg:
+            msg = f"{item.title}\n\nAgent work for item {item.id}."
+        sha = approve_and_commit(cfg, store, item, msg)
+        print(f"committed {sha[:8]} on {item.branch}")
+    elif choice == "r":
+        fb = input("feedback for agent: ").strip()
+        fresh = store.get(item.id)
+        reject(store, fresh, fb or "(no feedback)")
+        print("rejected.")
+    else:
+        print("skipped.")
+    print()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="agentor", description="Agent work orchestrator")
     p.add_argument("--config", "-c", help="path to agentor.toml")
@@ -128,6 +202,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("status", help="show queue status")
     sp.add_argument("--list", "-l", action="store_true", help="list items")
     sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("start", help="run daemon loop")
+    sp.add_argument("--interval", type=float, default=5.0,
+                    help="scan interval in seconds (default 5)")
+    sp.set_defaults(func=cmd_start)
+
+    sp = sub.add_parser("review", help="review items awaiting approval")
+    sp.set_defaults(func=cmd_review)
 
     return p
 
