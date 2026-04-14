@@ -59,6 +59,9 @@ class Runner:
             git_ops.worktree_remove(repo, wt_path, force=True)
             if wt_path.exists():
                 shutil.rmtree(wt_path, ignore_errors=True)
+        # stale branch from a previous run blocks `worktree add -b`. Force-delete.
+        if git_ops.branch_exists(repo, branch):
+            git_ops.branch_delete(repo, branch, force=True)
 
         try:
             git_ops.worktree_add(repo, wt_path, branch, self.config.git.base_branch)

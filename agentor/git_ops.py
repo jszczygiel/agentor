@@ -56,6 +56,16 @@ def current_branch(repo: Path) -> str:
     return cp.stdout.strip()
 
 
+def branch_exists(repo: Path, branch: str) -> bool:
+    cp = run(repo, "rev-parse", "--verify", branch, check=False)
+    return cp.returncode == 0
+
+
+def branch_delete(repo: Path, branch: str, force: bool = True) -> None:
+    flag = "-D" if force else "-d"
+    run(repo, "branch", flag, branch, check=False)
+
+
 def diff_vs_base(worktree: Path, base: str) -> str:
     """Return combined diff (staged + unstaged + untracked) vs the base branch."""
     tracked = run(
