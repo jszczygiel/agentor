@@ -7,6 +7,7 @@ from .models import Item
 TAG_RE = re.compile(r"@(\w+):(\S+)")
 CHECKBOX_RE = re.compile(r"^(\s*)- \[( |x|X)\] (.+)$")
 HEADING_RE = re.compile(r"^(#{1,6}) (.+)$")
+FRONTMATTER_KV_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$")
 
 
 def _item_id(source_file: str, title: str, body: str) -> str:
@@ -39,6 +40,8 @@ def extract_items(source_file: Path, mode: str, project_root: Path) -> list[Item
         return _extract_checkbox(text, rel)
     if mode == "heading":
         return _extract_heading(text, rel)
+    if mode == "frontmatter":
+        return _extract_frontmatter(text, rel)
     raise ValueError(f"unknown parsing mode: {mode}")
 
 
@@ -89,6 +92,51 @@ def _extract_checkbox(text: str, source_file: str) -> list[Item]:
         ))
         i = j
     return items
+
+
+def _parse_frontmatter(text: str) -> tuple[dict[str, str], str, int]:
+    """Parse a YAML-ish frontmatter block at the top of the file.
+    Only supports flat key: value pairs — no lists/dicts. Returns
+    (fields, body, body_start_line). If no frontmatter, returns ({}, text, 1)."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text, 1
+    fields: dict[str, str] = {}
+    i = 1
+    while i < len(lines):
+        if lines[i].strip() == "---":
+            body_start = i + 1
+            body = "\n".join(lines[body_start:])
+            return fields, body, body_start + 1
+        m = FRONTMATTER_KV_RE.match(lines[i])
+        if m:
+            key = m.group(1)
+            val = m.group(2).strip().strip('"').strip("'")
+            fields[key] = val
+        i += 1
+    # no closing --- — treat as no frontmatter
+    return {}, text, 1
+
+
+def _extract_frontmatter(text: str, source_file: str) -> list[Item]:
+    """One file == one item. Title from frontmatter `title:`, or filename fallback.
+    Skip unless `state` is absent or equals `available`."""
+    fields, body_raw, body_line = _parse_frontmatter(text)
+    state = fields.get("state", "available").lower()
+    if state != "available":
+        return []
+    title = fields.get("title") or Path(source_file).stem.replace("-", " ")
+    body, body_tags = _extract_tags(body_raw.strip())
+    tags = {k: v for k, v in fields.items() if k not in {"title", "state"}}
+    tags.update(body_tags)
+    return [Item(
+        id=_item_id(source_file, title, body),
+        title=title,
+        body=body,
+        source_file=source_file,
+        source_line=body_line,
+        tags=tags,
+    )]
 
 
 def _extract_heading(text: str, source_file: str) -> list[Item]:

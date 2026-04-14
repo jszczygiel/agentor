@@ -85,5 +85,58 @@ class TestHeadingMode(unittest.TestCase):
             self.assertNotIn("Second", first.body)
 
 
+class TestFrontmatterMode(unittest.TestCase):
+    def test_basic_frontmatter_item(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "fix-crash.md"
+            f.write_text(
+                "---\n"
+                "title: Fix crash on empty image\n"
+                "state: available\n"
+                "category: bugs\n"
+                "---\n"
+                "\n"
+                "Repro: open app, tap empty slot.\n"
+            )
+            items = extract_items(f, "frontmatter", root)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].title, "Fix crash on empty image")
+            self.assertIn("Repro", items[0].body)
+            self.assertEqual(items[0].tags.get("category"), "bugs")
+
+    def test_state_not_available_skipped(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "in-flight.md"
+            f.write_text(
+                "---\n"
+                "title: Something\n"
+                "state: in_progress\n"
+                "---\n"
+                "body\n"
+            )
+            items = extract_items(f, "frontmatter", root)
+            self.assertEqual(items, [])
+
+    def test_no_frontmatter_title_from_filename(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "wind-aware-pathfinding.md"
+            f.write_text("plain body, no frontmatter\n")
+            items = extract_items(f, "frontmatter", root)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].title, "wind aware pathfinding")
+
+    def test_missing_state_defaults_to_available(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "x.md"
+            f.write_text("---\ntitle: T\n---\nbody\n")
+            items = extract_items(f, "frontmatter", root)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].title, "T")
+
+
 if __name__ == "__main__":
     unittest.main()
