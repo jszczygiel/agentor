@@ -20,6 +20,24 @@ class AgentConfig:
     model: str = "claude-opus-4-6"
     max_attempts: int = 3
     pool_size: int = 1  # max concurrent agents working on items
+    runner: str = "stub"  # "stub" | "claude"
+    # Command template for the claude runner. "{prompt}" is replaced per item.
+    command: list[str] = field(default_factory=lambda: [
+        "claude", "-p", "{prompt}", "--dangerously-skip-permissions",
+    ])
+    # Prompt sent to Claude. Placeholders: {title}, {body}, {source_file}.
+    prompt_template: str = (
+        "/caveman ultra\n"
+        "/develop\n\n"
+        "Task from the project backlog:\n\n"
+        "Title: {title}\n\n"
+        "Description:\n{body}\n\n"
+        "Source: {source_file}\n\n"
+        "Follow the /develop skill end-to-end inside this worktree. Commit "
+        "your final change on this branch — a human reviewer will approve or "
+        "reject the commit afterwards."
+    )
+    timeout_seconds: int = 1800
     build_cmd: str | None = None
     test_cmd: str | None = None
 

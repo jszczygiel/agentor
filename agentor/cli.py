@@ -10,7 +10,7 @@ from .config import Config, load
 from .daemon import Daemon
 from .git_ops import diff_vs_base
 from .models import ItemStatus
-from .runner import StubRunner
+from .runner import make_runner
 from .store import Store
 from .watcher import scan_once
 
@@ -212,7 +212,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     daemon = Daemon(
         config=cfg,
         store=store,
-        runner_factory=lambda c, s: StubRunner(c, s),
+        runner_factory=make_runner,
         scan_interval=args.interval,
         log=logger,
         install_signals=False,
@@ -220,7 +220,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     t = threading.Thread(target=daemon.run, name="agentor-daemon", daemon=True)
 
     print(f"agentor started for {cfg.project_name} "
-          f"(pool_size={cfg.agent.pool_size}, interval={args.interval}s)")
+          f"(pool_size={cfg.agent.pool_size}, runner={cfg.agent.runner}, "
+          f"interval={args.interval}s)")
     print(f"log: {log_path}")
     t.start()
     try:

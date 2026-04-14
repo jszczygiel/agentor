@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import subprocess
 import unittest
 from pathlib import Path
@@ -9,7 +11,7 @@ from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
                             ReviewConfig, SourcesConfig)
 from agentor.models import ItemStatus
 from agentor.recovery import recover_on_startup
-from agentor.runner import StubRunner, plan_worktree
+from agentor.runner import ClaudeRunner, StubRunner, make_runner, plan_worktree
 from agentor.store import Store
 from agentor.watcher import scan_once
 
@@ -143,6 +145,122 @@ class TestFrontmatterMarkDone(unittest.TestCase):
             cwd=self.root, capture_output=True, text=True,
         )
         self.assertNotEqual(cp.returncode, 0)
+
+
+def _write_fake_claude(bin_dir: Path, script: str) -> Path:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / "claude"
+    fake.write_text("#!/bin/sh\n" + script)
+    st = os.stat(fake)
+    os.chmod(fake, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return fake
+
+
+class TestClaudeRunner(unittest.TestCase):
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name) / "proj"
+        self.root.mkdir()
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] Add hello file\n  greet world\n")
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _run_with_fake(self, script: str) -> tuple:
+        bin_dir = Path(self.td.name) / "bin"
+        _write_fake_claude(bin_dir, script)
+        cfg = Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[], mark_done=False),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                runner="claude", pool_size=1, max_attempts=1,
+                command=[str(bin_dir / "claude"), "-p", "{prompt}"],
+                prompt_template="TASK: {title}\n\n{body}",
+                timeout_seconds=10,
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        return cfg, claimed, make_runner(cfg, self.store).run(claimed)
+
+    def test_claude_runner_committed_change(self):
+        script = """
+set -e
+echo "HELLO" > hello.txt
+git add hello.txt
+git -c user.email=x -c user.name=x commit -q -m "add hello"
+echo "/develop finished"
+"""
+        cfg, claimed, result = self._run_with_fake(script)
+        self.assertIsNone(result.error, msg=result.error)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_REVIEW)
+        data = json.loads(refreshed.result_json)
+        self.assertIn("hello.txt", data["files_changed"])
+
+    def test_claude_runner_approve_records_existing_sha(self):
+        script = """
+set -e
+echo "HELLO" > hello.txt
+git add hello.txt
+git -c user.email=x -c user.name=x commit -q -m "add hello"
+"""
+        cfg, claimed, _ = self._run_with_fake(script)
+        item = self.store.get(claimed.id)
+        wt = Path(item.worktree_path)
+        pre_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=wt,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        sha = approve_and_commit(cfg, self.store, item, "new commit (should not fire)")
+        self.assertEqual(sha, pre_sha)
+        final = self.store.get(claimed.id)
+        self.assertEqual(final.status, ItemStatus.MERGED)
+        notes = [t["note"] for t in self.store.transitions_for(claimed.id) if t["note"]]
+        self.assertTrue(any("recorded existing commit" in n for n in notes),
+                        f"expected 'recorded existing commit' note, got {notes}")
+        self.assertFalse(wt.exists())
+
+    def test_claude_runner_fails_on_nonzero_exit(self):
+        script = "echo oops >&2\nexit 2\n"
+        cfg, claimed, result = self._run_with_fake(script)
+        self.assertIsNotNone(result.error)
+        refreshed = self.store.get(claimed.id)
+        # with max_attempts=1, failure goes to REJECTED
+        self.assertEqual(refreshed.status, ItemStatus.REJECTED)
+
+    def test_claude_runner_timeout(self):
+        # sleep > timeout
+        script = "sleep 5\n"
+        bin_dir = Path(self.td.name) / "bin"
+        _write_fake_claude(bin_dir, script)
+        cfg = Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[], mark_done=False),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                runner="claude", pool_size=1, max_attempts=1,
+                command=[str(bin_dir / "claude"), "-p", "{prompt}"],
+                timeout_seconds=1,
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        result = make_runner(cfg, self.store).run(claimed)
+        self.assertIsNotNone(result.error)
+        self.assertIn("timed out", result.error)
 
 
 class TestRecovery(unittest.TestCase):

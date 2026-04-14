@@ -1,5 +1,6 @@
 import json
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -129,3 +130,94 @@ class StubRunner(Runner):
         )
         summary = f"stub: added note for '{item.title}'"
         return summary, [str(note_path.relative_to(worktree))]
+
+
+class ClaudeRunner(Runner):
+    """Spawns a headless `claude -p` subprocess inside the worktree. The child
+    Claude Code instance auto-loads the project's CLAUDE.md and can invoke
+    skills (e.g. /develop) freely. The child is expected to commit its work
+    on the agent branch; agentor surfaces that diff for review."""
+
+    def do_work(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
+        prompt = self.config.agent.prompt_template.format(
+            title=item.title, body=item.body, source_file=item.source_file,
+        )
+        args = [a.format(prompt=prompt) for a in self.config.agent.command]
+        # transcript lives at the project root, NOT in the worktree, so it
+        # doesn't dirty the agent's diff.
+        transcript_path = (
+            self.config.project_root / ".agentor" / "transcripts" / f"{item.id}.log"
+        )
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            cp = subprocess.run(
+                args, cwd=worktree, capture_output=True, text=True,
+                timeout=self.config.agent.timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as e:
+            transcript_path.write_text(
+                f"TIMEOUT after {self.config.agent.timeout_seconds}s\n\n"
+                f"stdout:\n{e.stdout or ''}\n\nstderr:\n{e.stderr or ''}\n"
+            )
+            raise RuntimeError(
+                f"claude timed out after {self.config.agent.timeout_seconds}s"
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"claude CLI not found. First arg was: {args[0]!r}. "
+                f"Install claude or set agent.command in agentor.toml."
+            )
+
+        transcript_path.write_text(
+            f"exit: {cp.returncode}\n"
+            f"args: {args}\n\n"
+            f"stdout:\n{cp.stdout}\n\nstderr:\n{cp.stderr}\n"
+        )
+
+        if cp.returncode != 0:
+            tail = (cp.stderr or cp.stdout)[-500:].strip()
+            raise RuntimeError(f"claude exited {cp.returncode}: {tail}")
+
+        files = _list_changes(worktree, self.config.git.base_branch)
+        summary = _derive_summary(worktree, cp.stdout, item.title)
+        return summary, files
+
+
+def _list_changes(worktree: Path, base_branch: str) -> list[str]:
+    committed = subprocess.run(
+        ["git", "diff", "--name-only", f"{base_branch}..HEAD"],
+        cwd=worktree, capture_output=True, text=True,
+    ).stdout.strip().splitlines()
+    uncommitted_raw = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=worktree, capture_output=True, text=True,
+    ).stdout.splitlines()
+    uncommitted = [ln[3:] for ln in uncommitted_raw if len(ln) > 3]
+    return sorted(set(committed + uncommitted))
+
+
+def _derive_summary(worktree: Path, stdout: str, title: str) -> str:
+    """Prefer AGENT_SUMMARY.md in worktree, else last commit message,
+    else last non-empty stdout line."""
+    summary_file = worktree / "AGENT_SUMMARY.md"
+    if summary_file.exists():
+        return summary_file.read_text().strip()[:500]
+    cp = subprocess.run(
+        ["git", "log", "-1", "--pretty=%B"], cwd=worktree,
+        capture_output=True, text=True,
+    )
+    msg = cp.stdout.strip()
+    if msg:
+        return msg[:500]
+    lines = [ln for ln in stdout.strip().splitlines() if ln.strip()]
+    return (lines[-1] if lines else f"(no summary) {title}")[:500]
+
+
+def make_runner(config: Config, store: Store) -> Runner:
+    kind = config.agent.runner.lower()
+    if kind == "stub":
+        return StubRunner(config, store)
+    if kind == "claude":
+        return ClaudeRunner(config, store)
+    raise ValueError(f"unknown agent.runner: {kind!r}")

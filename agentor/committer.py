@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 from . import git_ops
@@ -6,12 +7,21 @@ from .models import ItemStatus
 from .store import Store, StoredItem
 
 
+def _has_uncommitted(wt: Path) -> bool:
+    cp = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=wt,
+        capture_output=True, text=True,
+    )
+    return bool(cp.stdout.strip())
+
+
 def approve_and_commit(
     config: Config, store: Store, item: StoredItem, message: str
 ) -> str:
-    """Commit pending changes in the item's worktree, transition to MERGED,
-    remove the worktree, and optionally delete the source file.
-    Returns the commit SHA."""
+    """Approve the agent's work. If there are uncommitted changes in the
+    worktree, commit them with `message`. If the agent already committed
+    (e.g. via /develop), just record the existing HEAD. Then remove the
+    worktree and transition to MERGED. Returns the commit SHA."""
     assert item.status == ItemStatus.AWAITING_REVIEW, \
         f"commit expects AWAITING_REVIEW, got {item.status}"
     assert item.worktree_path
@@ -24,13 +34,18 @@ def approve_and_commit(
         if src_in_wt.exists():
             src_in_wt.unlink()
 
-    sha = git_ops.commit_all(wt, message)
+    if _has_uncommitted(wt):
+        sha = git_ops.commit_all(wt, message)
+        note_prefix = "committed"
+    else:
+        sha = git_ops.run(wt, "rev-parse", "HEAD").stdout.strip()
+        note_prefix = "recorded existing commit"
 
     git_ops.worktree_remove(repo, wt, force=False)
 
     store.transition(
         item.id, ItemStatus.MERGED,
-        note=f"committed {sha[:8]} on {item.branch}",
+        note=f"{note_prefix} {sha[:8]} on {item.branch}",
     )
     return sha
 
