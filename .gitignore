@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+tmp/
+.agentor/state.db
+*.egg-info/
+.venv/

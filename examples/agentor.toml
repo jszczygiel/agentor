@@ -1,0 +1,29 @@
+[project]
+name = "colorme"
+root = "../../colorme"
+
+[sources]
+watch = [
+  "docs/backlog.md",
+  "docs/ideas.md",
+]
+mark_done = true
+
+[parsing]
+mode = "checkbox"
+
+[agent]
+model = "claude-opus-4-6"
+max_attempts = 3
+pool_size = 1
+build_cmd = "./gradlew :app:assembleDebug"
+test_cmd = "./gradlew test"
+
+[git]
+base_branch = "main"
+branch_prefix = "agent/"
+auto_merge = false
+
+[review]
+port = 7777
+notify = true
