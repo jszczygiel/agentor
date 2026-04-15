@@ -1,6 +1,11 @@
 import json
+import os
+import re
 import shutil
+import signal
 import subprocess
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +15,128 @@ from .config import Config
 from .models import ItemStatus
 from .slug import slugify
 from .store import Store, StoredItem
+
+
+class ProcRegistry:
+    """Tracks live agent subprocesses so the daemon can kill them on shutdown.
+    Each Popen is spawned with `start_new_session=True` so we can signal the
+    whole process group — kills any sub-tools (bash, git, sub-agents) claude
+    itself may have spawned. Without this the parent exits but the agent
+    child lives on as an orphan, burning tokens."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._procs: dict[str, subprocess.Popen] = {}
+
+    def register(self, key: str, p: subprocess.Popen) -> None:
+        with self._lock:
+            self._procs[key] = p
+
+    def unregister(self, key: str) -> None:
+        with self._lock:
+            self._procs.pop(key, None)
+
+    def kill_all(self, log=None) -> int:
+        with self._lock:
+            procs = list(self._procs.items())
+            self._procs.clear()
+        live = [(k, p) for k, p in procs if p.poll() is None]
+        if not live:
+            return 0
+        if log:
+            log(f"killing {len(live)} agent subprocess(es)")
+        for _, p in live:
+            _signal_group(p, signal.SIGTERM)
+        deadline = time.monotonic() + 3.0
+        for _, p in live:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                p.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                _signal_group(p, signal.SIGKILL)
+                try:
+                    p.wait(timeout=2.0)
+                except Exception:
+                    pass
+        return len(live)
+
+
+def _signal_group(p: subprocess.Popen, sig: int) -> None:
+    try:
+        os.killpg(os.getpgid(p.pid), sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except Exception:
+        try:
+            if sig == signal.SIGKILL:
+                p.kill()
+            else:
+                p.terminate()
+        except Exception:
+            pass
+
+
+class InfrastructureError(RuntimeError):
+    """Raised when a dispatch fails for system-level reasons unrelated to the
+    item itself: broken git worktree, missing repo, base branch gone, etc.
+
+    Caught by the daemon, which pauses dispatch and surfaces a sticky alert
+    to the user. The item's status is left untouched (still WORKING) and
+    the dispatch attempt is not charged — fixing the infrastructure should
+    be enough to let the existing item resume."""
+
+
+_INFRA_NEEDLES = (
+    "not a git repository",
+    "fatal: invalid reference",
+    "no such file or directory",
+    "not a working tree",
+    "fatal: bad object",
+    "fatal: bad revision",
+    # Stale per-item branches/worktrees from prior runs that pre-flight
+    # cleanup couldn't remove (e.g. branch checked out in an unknown
+    # external worktree). Treat as infra so the user gets paged instead
+    # of the item silently burning attempts.
+    "already exists",
+    "is already checked out",
+    "already used by worktree",
+)
+
+
+def _is_infrastructure_error(msg: str) -> bool:
+    """Heuristic: distinguish git plumbing failures (broken worktree slot,
+    missing branch, corrupt registration) from item-level failures
+    (claude exited 1, agent timed out, etc.). Conservative — false
+    negatives just fall through to the existing per-item retry path."""
+    low = (msg or "").lower()
+    return any(n in low for n in _INFRA_NEEDLES)
+
+
+def _is_dead_session_error(msg: str) -> bool:
+    """Detect claude's "No conversation found with session ID: …" error.
+    Means our persisted session_id no longer exists in claude's local
+    storage (cleared, expired, or never made it to disk after a crash).
+    Resuming with that id will keep failing — we need to drop the id and
+    start a fresh session, but without losing the approved plan."""
+    return "no conversation found with session id" in (msg or "").lower()
+
+
+def _is_shutdown_error(msg: str) -> bool:
+    """Detect that the failure was the daemon killing the agent on
+    shutdown (^C). Not the item's fault — must not charge an attempt or
+    transition state. Recovery on next startup picks the WORKING item up."""
+    return "agentor shutdown" in (msg or "").lower()
+
+
+_ERR_NOISE = re.compile(r"\d+|\(\$[\d.]+\)|\([^)]*\)|\s+")
+
+
+def _error_signature(msg: str) -> str:
+    """Strip variable bits (counts, dollar amounts, ids, whitespace) from an
+    error message so two attempts that hit the same wall match. Example:
+    'claude killed: max_turns=30 hit (30 turns)' →
+    'claude killed: max_turns= hit'."""
+    return _ERR_NOISE.sub("", (msg or "").lower())[:80]
 
 
 @dataclass
@@ -27,10 +154,17 @@ def worktree_root(config: Config) -> Path:
     return config.project_root / ".agentor" / "worktrees"
 
 
-def plan_worktree(config: Config, item: StoredItem) -> tuple[Path, str]:
+def plan_worktree(
+    config: Config, item: StoredItem, store: Store | None = None,
+) -> tuple[Path, str]:
+    """Ephemeral per-item worktree. Path is `{project}-{slug}-{shortid}`
+    under `.agentor/worktrees/`; the worktree is created at dispatch and
+    removed after commit/merge. `store` is unused here — kept for call-site
+    compatibility."""
+    del store  # unused
     slug = slugify(item.title)
-    unique = f"{slug}-{item.id[:8]}"
-    branch = f"{config.git.branch_prefix}{unique}"
+    unique = f"{config.project_name}-{slug}-{item.id[:8]}"
+    branch = f"{config.git.branch_prefix}{slug}-{item.id[:8]}"
     path = worktree_root(config) / unique
     return path, branch
 
@@ -41,11 +175,45 @@ class Runner:
     def __init__(self, config: Config, store: Store):
         self.config = config
         self.store = store
+        # Set by Daemon after construction. Allows in-flight subprocesses to
+        # be killed on shutdown rather than orphaned.
+        self.proc_registry: ProcRegistry | None = None
+        self.stop_event: threading.Event | None = None
 
     def do_work(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
         """Perform the agent's work inside the worktree. Return (summary, files_changed).
         Subclasses override. The base class commits no changes — committer does that."""
         raise NotImplementedError
+
+    def _record_failure(
+        self, item: StoredItem, phase: str, error: str,
+        files_changed: list[str] | None = None,
+    ) -> None:
+        """Write a failure row for diagnostics. Pulls turns/duration from
+        the last claude run if available (populated by
+        `_invoke_claude_*` into self._last_usage). Safe for subclasses
+        without that attribute — falls back to None fields."""
+        usage = getattr(self, "_last_usage", None) or {}
+        phase_tag = getattr(self, "_last_phase", phase)
+        transcript = None
+        try:
+            transcript = str(
+                self.config.project_root / ".agentor" / "transcripts"
+                / f"{item.id}.{phase_tag}.log"
+            )
+        except Exception:
+            transcript = None
+        self.store.record_failure(
+            item_id=item.id,
+            attempt=item.attempts,
+            phase=phase_tag,
+            error=error,
+            error_sig=_error_signature(error),
+            num_turns=usage.get("num_turns"),
+            duration_ms=usage.get("duration_ms"),
+            files_changed=files_changed,
+            transcript_path=transcript,
+        )
 
     def run(self, item: StoredItem) -> RunResult:
         """Item must already be in WORKING state with worktree_path and branch set
@@ -60,98 +228,157 @@ class Runner:
         # teardown/recreate so the agent picks up where it left off. Otherwise
         # do the normal pre-flight nuke so stale state doesn't leak.
         resume = bool(item.session_id) and wt_path.exists()
-
-        if not resume:
-            # Pre-flight cleanup. Order matters: remove the worktree dir, then
-            # prune stale registrations (.git/worktrees/<name>/ left after a
-            # manual rm -rf), THEN delete the branch — git refuses to delete a
-            # branch while it is still associated with a (possibly ghost)
-            # worktree.
-            git_ops.worktree_remove(repo, wt_path, force=True)
-            if wt_path.exists():
-                shutil.rmtree(wt_path, ignore_errors=True)
-            git_ops.worktree_prune(repo)
-            if git_ops.branch_exists(repo, branch):
-                git_ops.branch_delete(repo, branch, force=True)
-
         try:
-            if not resume:
-                git_ops.worktree_add(repo, wt_path, branch, self.config.git.base_branch)
-        except git_ops.GitError as e:
-            err = str(e)
-            if item.attempts >= self.config.agent.max_attempts:
-                self.store.transition(
-                    item.id, ItemStatus.REJECTED,
-                    worktree_path=None, branch=None,
-                    last_error=f"worktree_add exhausted after {item.attempts} attempts: {err}",
-                    note="max_attempts reached",
+            if (self.stop_event is not None
+                    and self.stop_event.is_set()):
+                self.store.note_infra_failure(
+                    item.id, "agentor shutdown before dispatch",
                 )
-            else:
+                return RunResult(item.id, wt_path, branch, "", [], "",
+                                 error="agentor shutdown before dispatch")
+            if not resume:
+                # Pre-flight cleanup. Order matters: remove the worktree
+                # dir, then prune stale registrations
+                # (.git/worktrees/<name>/ left after a manual rm -rf),
+                # THEN delete the branch — git refuses to delete a
+                # branch while still associated with a (possibly ghost)
+                # worktree.
+                git_ops.worktree_remove(repo, wt_path, force=True)
+                if wt_path.exists():
+                    shutil.rmtree(wt_path, ignore_errors=True)
+                git_ops.worktree_prune(repo)
+                if git_ops.branch_exists(repo, branch):
+                    held_at = git_ops.branch_checked_out_at(repo, branch)
+                    if held_at is not None and held_at != wt_path:
+                        git_ops.worktree_remove(repo, held_at, force=True)
+                        if held_at.exists():
+                            shutil.rmtree(held_at, ignore_errors=True)
+                        git_ops.worktree_prune(repo)
+                    git_ops.branch_delete(repo, branch, force=True)
+
+            try:
+                if not resume:
+                    git_ops.worktree_add(
+                        repo, wt_path, branch,
+                        self.config.git.base_branch,
+                    )
+            except git_ops.GitError as e:
+                err = str(e)
+                self._record_failure(item, "setup", err)
+                if _is_infrastructure_error(err):
+                    # Don't transition state, don't charge an attempt — this
+                    # is the slot/repo being broken, not the item failing.
+                    # Daemon will catch InfrastructureError, pause dispatch,
+                    # and put a sticky alert on the dashboard.
+                    self.store.note_infra_failure(item.id, err)
+                    raise InfrastructureError(err)
                 self.store.transition(
-                    item.id, ItemStatus.QUEUED,
+                    item.id, ItemStatus.ERRORED,
                     worktree_path=None, branch=None, session_id=None,
                     last_error=f"worktree_add: {err}",
+                    note="worktree_add failed → errored",
                 )
-            return RunResult(item.id, wt_path, branch, "", [], "", error=err)
+                return RunResult(item.id, wt_path, branch, "", [], "", error=err)
 
-        try:
-            summary, files_changed = self.do_work(item, wt_path)
-        except Exception as e:
-            last_error = f"do_work: {e}"
-            git_ops.worktree_remove(repo, wt_path, force=True)
-            if item.attempts >= self.config.agent.max_attempts:
+            try:
+                summary, files_changed = self.do_work(item, wt_path)
+            except Exception as e:
+                last_error = f"do_work: {e}"
+                self._record_failure(item, "do_work", last_error)
+                if _is_shutdown_error(last_error):
+                    # Operator killed us. Refund the attempt and leave the
+                    # item WORKING so recovery can resume on next startup.
+                    # No InfrastructureError raise — we don't want a sticky
+                    # alert for an intentional ^C.
+                    self.store.note_infra_failure(item.id, last_error)
+                    return RunResult(item.id, wt_path, branch, "", [], "",
+                                     error=last_error)
+                if _is_infrastructure_error(last_error):
+                    # Same treatment as the worktree_add infra path — leave
+                    # state alone, refund the attempt, surface to user.
+                    self.store.note_infra_failure(item.id, last_error)
+                    raise InfrastructureError(last_error)
+                if _is_dead_session_error(last_error) and item.session_id:
+                    # claude lost the session. Resuming with the same id
+                    # will keep failing on every attempt until rejection —
+                    # drop the session_id, refund the attempt, and bounce
+                    # back to QUEUED so the next dispatch starts a fresh
+                    # session. result_json (with the approved plan) is
+                    # kept so we don't make the user re-approve.
+                    git_ops.worktree_remove(repo, wt_path, force=True)
+                    self.store.transition(
+                        item.id, ItemStatus.QUEUED,
+                        worktree_path=None, branch=None, session_id=None,
+                        attempts=max(0, item.attempts - 1),
+                        last_error=last_error,
+                        note="claude session lost; restart with fresh session",
+                    )
+                    return RunResult(item.id, wt_path, branch, "", [], "",
+                                     error=last_error)
+                git_ops.worktree_remove(repo, wt_path, force=True)
+                # Any agent-side failure parks the item in ERRORED so the
+                # daemon immediately moves on to the next queued item. The
+                # operator re-queues (via revert) once the root cause is
+                # fixed — no auto-retry loop.
                 self.store.transition(
-                    item.id, ItemStatus.REJECTED,
-                    worktree_path=None, branch=None,
-                    last_error=last_error,
-                    note="max_attempts reached",
-                )
-            else:
-                self.store.transition(
-                    item.id, ItemStatus.QUEUED,
+                    item.id, ItemStatus.ERRORED,
                     worktree_path=None, branch=None, session_id=None,
                     last_error=last_error,
+                    note="do_work failed → errored",
                 )
-            return RunResult(item.id, wt_path, branch, "", [], "", error=last_error)
+                return RunResult(item.id, wt_path, branch, "", [], "", error=last_error)
 
-        diff = git_ops.diff_vs_base(wt_path, self.config.git.base_branch)
-        phase = getattr(self, "_last_phase", "execute")
-        next_status = (ItemStatus.AWAITING_PLAN_REVIEW if phase == "plan"
-                       else ItemStatus.AWAITING_REVIEW)
-        result = {
-            "phase": phase,
-            "summary": summary,
-            "files_changed": files_changed,
-            "diff_len": len(diff),
-        }
-        if phase == "plan":
-            # Keep the plan text intact so the execute phase can inject it
-            # into the follow-up prompt and the review UI can display it.
-            result["plan"] = summary
-        else:
-            # Carry the approved plan forward on the final result for audit.
-            prior = _parse_result_json(item.result_json)
-            if prior.get("plan"):
-                result["plan"] = prior["plan"]
-        envelope = getattr(self, "_last_usage", None)
-        if envelope:
-            # Surface cost/turn/timing fields at the top level of result_json
-            # so the dashboard's `_cost_total` / `_cost_breakdown` /
-            # `_build_detail_lines` can read them without digging into a
-            # nested 'usage' dict.
-            for k, v in envelope.items():
-                result[k] = v
-        note = ("plan ready for human review" if phase == "plan"
-                else "awaiting user review")
-        self.store.transition(
-            item.id, next_status,
-            result_json=json.dumps(result),
-            note=note,
-        )
-        return RunResult(
-            item_id=item.id, worktree_path=wt_path, branch=branch,
-            summary=summary, files_changed=files_changed, diff=diff,
-        )
+            try:
+                diff = git_ops.diff_vs_base(wt_path, self.config.git.base_branch)
+            except git_ops.GitError as e:
+                # Slot went bad between do_work returning and us reading
+                # the diff (rare — usually means the worktree registration
+                # was nuked under us). Treat as infra so the user sees an
+                # alert instead of "worker crashed" with no recovery.
+                err = f"diff_vs_base: {e}"
+                self._record_failure(item, "diff", err)
+                if _is_infrastructure_error(err):
+                    self.store.note_infra_failure(item.id, err)
+                    raise InfrastructureError(err)
+                raise
+            phase = getattr(self, "_last_phase", "execute")
+            next_status = (ItemStatus.AWAITING_PLAN_REVIEW if phase == "plan"
+                           else ItemStatus.AWAITING_REVIEW)
+            result = {
+                "phase": phase,
+                "summary": summary,
+                "files_changed": files_changed,
+                "diff_len": len(diff),
+            }
+            if phase == "plan":
+                # Keep the plan text intact so the execute phase can inject
+                # it into the follow-up prompt and the review UI can show it.
+                result["plan"] = summary
+            else:
+                # Carry the approved plan forward on the final result.
+                prior = _parse_result_json(item.result_json)
+                if prior.get("plan"):
+                    result["plan"] = prior["plan"]
+            envelope = getattr(self, "_last_usage", None)
+            if envelope:
+                # Surface turn/timing/usage fields at the top level of
+                # result_json so the dashboard can read them without
+                # digging into a nested 'usage' dict.
+                for k, v in envelope.items():
+                    result[k] = v
+            note = ("plan ready for human review" if phase == "plan"
+                    else "awaiting user review")
+            self.store.transition(
+                item.id, next_status,
+                result_json=json.dumps(result),
+                note=note,
+            )
+            return RunResult(
+                item_id=item.id, worktree_path=wt_path, branch=branch,
+                summary=summary, files_changed=files_changed, diff=diff,
+            )
+        finally:
+            pass
 
 
 class StubRunner(Runner):
@@ -184,6 +411,10 @@ class ClaudeRunner(Runner):
         prior = _parse_result_json(item.result_json)
         if prior.get("phase") == "plan":
             return self._do_execute(item, worktree, prior.get("plan", ""))
+        if self.config.agent.single_phase:
+            return self._do_execute(
+                item, worktree, "(no plan; spec is in the task body)",
+            )
         return self._do_plan(item, worktree)
 
     def _do_plan(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
@@ -224,19 +455,29 @@ class ClaudeRunner(Runner):
         the top of the prompt so the agent can iterate on it. Clears the
         persisted feedback immediately so it's consumed only once and doesn't
         leak into subsequent unrelated runs."""
-        if not item.last_error:
+        if not item.feedback:
             return prompt
         hint = ("Produce a revised plan." if phase == "plan"
                 else "Address this feedback during execution.")
+        # Cap reviewer feedback so a giant pasted log/diff doesn't reseed
+        # tens of thousands of fresh tokens on every retry. Head + tail keeps
+        # both the user's intent and any concrete error tail.
+        feedback = item.feedback
+        max_len = 800
+        if len(feedback) > max_len:
+            half = (max_len - 20) // 2
+            feedback = (
+                f"{feedback[:half]}\n\n[…truncated…]\n\n{feedback[-half:]}"
+            )
         block = (
             "REVIEWER FEEDBACK FROM A PREVIOUS REJECTED ATTEMPT:\n"
-            f"{item.last_error}\n\n"
+            f"{feedback}\n\n"
             f"{hint}\n\n"
         )
-        # Consume feedback — clear last_error so the NEXT run starts clean.
+        # Consume feedback — clear it so the NEXT run starts clean.
         # Direct SQL so we don't have to fake a status transition.
         self.store.conn.execute(
-            "UPDATE items SET last_error = NULL WHERE id = ?", (item.id,)
+            "UPDATE items SET feedback = NULL WHERE id = ?", (item.id,)
         )
         return block + prompt
 
@@ -287,36 +528,56 @@ class ClaudeRunner(Runner):
         self, item: StoredItem, args: list[str], worktree: Path,
         transcript_path: Path,
     ) -> tuple[str, str]:
+        # Use Popen + communicate (not subprocess.run) so the process is
+        # registered with proc_registry and can be killed on shutdown via
+        # SIGTERM to its process group. Otherwise a long blocking run would
+        # orphan the claude child when agentor exits.
         try:
-            cp = subprocess.run(
-                args, cwd=worktree, capture_output=True, text=True,
-                timeout=self.config.agent.timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as e:
-            transcript_path.write_text(
-                f"TIMEOUT after {self.config.agent.timeout_seconds}s\n\n"
-                f"stdout:\n{e.stdout or ''}\n\nstderr:\n{e.stderr or ''}\n"
-            )
-            raise RuntimeError(
-                f"claude timed out after {self.config.agent.timeout_seconds}s"
+            p = subprocess.Popen(
+                args, cwd=worktree,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True,
             )
         except FileNotFoundError:
             raise RuntimeError(
                 f"claude CLI not found. First arg was: {args[0]!r}. "
                 f"Install claude or set agent.command in agentor.toml."
             )
+        if self.proc_registry is not None:
+            self.proc_registry.register(item.id, p)
+        try:
+            try:
+                stdout, stderr = p.communicate(
+                    timeout=self.config.agent.timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as e:
+                _signal_group(p, signal.SIGKILL)
+                stdout, stderr = p.communicate()
+                transcript_path.write_text(
+                    f"TIMEOUT after {self.config.agent.timeout_seconds}s\n\n"
+                    f"stdout:\n{stdout or e.stdout or ''}\n\n"
+                    f"stderr:\n{stderr or e.stderr or ''}\n"
+                )
+                raise RuntimeError(
+                    f"claude timed out after {self.config.agent.timeout_seconds}s"
+                )
+        finally:
+            if self.proc_registry is not None:
+                self.proc_registry.unregister(item.id)
 
         transcript_path.write_text(
-            f"exit: {cp.returncode}\n"
+            f"exit: {p.returncode}\n"
             f"args: {args}\n\n"
-            f"stdout:\n{cp.stdout}\n\nstderr:\n{cp.stderr}\n"
+            f"stdout:\n{stdout}\n\nstderr:\n{stderr}\n"
         )
-        if cp.returncode != 0:
-            tail = (cp.stderr or cp.stdout)[-500:].strip()
-            raise RuntimeError(f"claude exited {cp.returncode}: {tail}")
-        summary = _derive_summary(worktree, cp.stdout, item.title)
-        self._last_usage = _parse_usage(cp.stdout)
-        return summary, cp.stdout
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise RuntimeError("claude killed: agentor shutdown")
+        if p.returncode != 0:
+            tail = (stderr or stdout)[-500:].strip()
+            raise RuntimeError(f"claude exited {p.returncode}: {tail}")
+        summary = _derive_summary(worktree, stdout, item.title)
+        self._last_usage = _parse_usage(stdout)
+        return summary, stdout
 
     def _invoke_claude_streaming(
         self, item: StoredItem, args: list[str], worktree: Path,
@@ -326,16 +587,23 @@ class ClaudeRunner(Runner):
         stream-json event, and publish live usage/iterations to the store."""
         import threading
         try:
+            # start_new_session=True puts claude (and anything it spawns)
+            # in its own process group so the daemon can SIGTERM the whole
+            # tree on shutdown via os.killpg. Without this, killing the
+            # Popen leaves grand-children (sub-agents, bash, git) running.
             p = subprocess.Popen(
                 args, cwd=worktree,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1,
+                start_new_session=True,
             )
         except FileNotFoundError:
             raise RuntimeError(
                 f"claude CLI not found. First arg was: {args[0]!r}. "
                 f"Install claude or set agent.command in agentor.toml."
             )
+        if self.proc_registry is not None:
+            self.proc_registry.register(item.id, p)
 
         # Kill the child on timeout. Timer fires from its own thread; using
         # p.kill() (SIGKILL) is safe because the main loop will detect EOF
@@ -372,6 +640,8 @@ class ClaudeRunner(Runner):
 
         state = _StreamState(item_id=item.id, phase=phase_tag)
         stdout_buf: list[str] = []
+        cap_reason: str | None = None
+        max_turns = int(self.config.agent.max_turns or 0)
         try:
             for line in iter(p.stdout.readline, ""):
                 stdout_buf.append(line)
@@ -389,9 +659,25 @@ class ClaudeRunner(Runner):
                 # result event. Cheaper than per-line, enough for live UX.
                 if ev.get("type") in ("assistant", "result"):
                     self._publish_live(item.id, state)
+                # Runaway guard — stop if the agent is looping past its
+                # turn budget. No cost cap: a user-level subscription
+                # makes mid-stream dollar accounting misleading, and
+                # max_turns already bounds runaway behaviour effectively.
+                if max_turns and state.num_turns >= max_turns:
+                    cap_reason = (
+                        f"max_turns={max_turns} hit ({state.num_turns} turns)"
+                    )
+                if cap_reason:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    break
             p.wait(timeout=5)
         finally:
             timer.cancel()
+            if self.proc_registry is not None:
+                self.proc_registry.unregister(item.id)
             try:
                 p.stdout.close()
             except Exception:
@@ -413,6 +699,10 @@ class ClaudeRunner(Runner):
             raise RuntimeError(
                 f"claude timed out after {self.config.agent.timeout_seconds}s"
             )
+        if cap_reason:
+            raise RuntimeError(f"claude killed: {cap_reason}")
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise RuntimeError("claude killed: agentor shutdown")
         if p.returncode not in (0, None):
             tail = (stderr_text or stdout_text)[-500:].strip()
             raise RuntimeError(f"claude exited {p.returncode}: {tail}")
@@ -422,7 +712,7 @@ class ClaudeRunner(Runner):
 
     def _publish_live(self, item_id: str, state: "_StreamState") -> None:
         """Write the current partial envelope to result_json so the dashboard
-        can show live CTX% / tokens / cost without waiting for exit."""
+        can show live CTX% / tokens without waiting for exit."""
         try:
             blob = json.dumps({
                 "phase": state.phase,
@@ -439,8 +729,8 @@ class ClaudeRunner(Runner):
 class _StreamState:
     """Accumulator for claude stream-json events. Builds the same envelope
     shape as the blocking `--output-format json` path (usage, iterations,
-    modelUsage, total_cost_usd, num_turns, stop_reason) so the rest of the
-    dashboard doesn't care which mode produced the data."""
+    modelUsage, num_turns, stop_reason) so the rest of the dashboard
+    doesn't care which mode produced the data."""
 
     def __init__(self, item_id: str, phase: str):
         self.item_id = item_id
@@ -451,8 +741,8 @@ class _StreamState:
         self.stop_reason: str | None = None
         self.duration_ms: int | None = None
         self.duration_api_ms: int | None = None
-        self.total_cost_usd: float = 0.0
         # modelUsage is keyed by model id, mirroring claude's final envelope.
+        # Used for token accounting and context-window detection, not cost.
         self.model_usage: dict[str, dict] = {}
         # Last seen result text (set by the terminal 'result' event).
         self.result_text: str | None = None
@@ -479,11 +769,12 @@ class _StreamState:
                     usage.get("cache_creation_input_tokens", 0) or 0),
                 "model": model,
             })
-            # Aggregate into modelUsage.
+            # Aggregate token usage per model. `contextWindow` is filled in
+            # from the terminal `result` event when claude reports it.
             mu = self.model_usage.setdefault(model, {
                 "inputTokens": 0, "outputTokens": 0,
                 "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
-                "costUSD": 0.0, "contextWindow": 0,
+                "contextWindow": 0,
             })
             mu["inputTokens"] += int(usage.get("input_tokens", 0) or 0)
             mu["outputTokens"] += int(usage.get("output_tokens", 0) or 0)
@@ -493,10 +784,6 @@ class _StreamState:
                 usage.get("cache_creation_input_tokens", 0) or 0)
             return
         if etype == "result":
-            # Final envelope — trust its numbers over the aggregate we built
-            # (it's what claude reports for billing).
-            if ev.get("total_cost_usd") is not None:
-                self.total_cost_usd = float(ev["total_cost_usd"])
             if ev.get("num_turns") is not None:
                 self.num_turns = int(ev["num_turns"])
             if ev.get("stop_reason"):
@@ -506,8 +793,8 @@ class _StreamState:
             if ev.get("duration_api_ms") is not None:
                 self.duration_api_ms = int(ev["duration_api_ms"])
             if isinstance(ev.get("modelUsage"), dict):
-                # Claude's own modelUsage includes costUSD and contextWindow
-                # which we can't derive ourselves.
+                # Adopt claude's authoritative per-model breakdown — it
+                # reports `contextWindow` which we can't derive ourselves.
                 self.model_usage = ev["modelUsage"]
             result = ev.get("result")
             if isinstance(result, str):
@@ -516,8 +803,6 @@ class _StreamState:
     def envelope(self) -> dict:
         """Produce the same envelope shape _parse_usage would build off the
         blocking JSON path, so dashboard code stays agnostic of mode."""
-        # Aggregate `usage` from iterations for dashboards that read the
-        # flat usage dict.
         flat_usage = {
             "input_tokens": sum(i["input_tokens"] for i in self.iterations),
             "output_tokens": sum(i["output_tokens"] for i in self.iterations),
@@ -532,8 +817,6 @@ class _StreamState:
             "modelUsage": self.model_usage,
             "num_turns": self.num_turns,
         }
-        if self.total_cost_usd:
-            out["total_cost_usd"] = self.total_cost_usd
         if self.stop_reason:
             out["stop_reason"] = self.stop_reason
         if self.duration_ms is not None:
@@ -581,11 +864,11 @@ def _parse_result_json(blob: str | None) -> dict:
 
 
 def _parse_usage(stdout: str) -> dict | None:
-    """Extract the entire cost/usage envelope from a `--output-format json`
-    claude run. Returns a dict with `usage`, `total_cost_usd`, `modelUsage`,
-    `num_turns`, `duration_ms`, `duration_api_ms`, `stop_reason` when
-    available. Parses defensively — stdout may be plain text or have trailing
-    log noise. Returns None if nothing usable can be pulled out."""
+    """Extract the usage envelope from a `--output-format json` claude run.
+    Returns a dict with `usage`, `modelUsage`, `num_turns`, `duration_ms`,
+    `duration_api_ms`, `stop_reason` when available. Parses defensively —
+    stdout may be plain text or have trailing log noise. Returns None if
+    nothing usable can be pulled out."""
     text = (stdout or "").strip()
     if not text:
         return None
@@ -604,7 +887,7 @@ def _parse_usage(stdout: str) -> dict | None:
     # Flatten fields the dashboard cares about. `usage` stays as a nested
     # dict because existing readers (_tokens_used variants) pick from it.
     out: dict = {}
-    for k in ("usage", "total_cost_usd", "modelUsage", "num_turns",
+    for k in ("usage", "modelUsage", "num_turns",
               "duration_ms", "duration_api_ms", "stop_reason", "session_id",
               "result"):
         if k in obj and obj[k] is not None:

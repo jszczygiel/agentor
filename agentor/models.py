@@ -11,6 +11,7 @@ class ItemStatus(str, Enum):
     AWAITING_REVIEW = "awaiting_review"
     APPROVED = "approved"
     REJECTED = "rejected"
+    ERRORED = "errored"              # agent-side failure; operator must intervene
     MERGED = "merged"
     CANCELLED = "cancelled"
     DEFERRED = "deferred"

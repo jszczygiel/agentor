@@ -11,16 +11,17 @@ from .git_ops import diff_vs_base
 from .models import ItemStatus
 from .store import Store, StoredItem
 
-ACTIONS = ("[l]ist  [p]ickup  [r]eview  [d]eferred  [i]nspect  "
-           "[tab]filter  [+/-]pool  [m]ode  [q]uit")
+ACTIONS = ("[p]ickup  [r]eview  [d]eferred  [i]nspect  "
+           "[tab]filter  [+/-]pool  [m]ode  [u]npause  [q]uit")
 
 # Filter views: ordered list cycled by Tab. Each entry maps a filter name
 # to the statuses to display (None = all).
 FILTERS: list[tuple[str, list[ItemStatus] | None]] = [
     ("all", [ItemStatus.WORKING, ItemStatus.AWAITING_PLAN_REVIEW,
              ItemStatus.AWAITING_REVIEW, ItemStatus.QUEUED,
-             ItemStatus.BACKLOG, ItemStatus.REJECTED,
+             ItemStatus.BACKLOG, ItemStatus.ERRORED, ItemStatus.REJECTED,
              ItemStatus.MERGED, ItemStatus.CANCELLED, ItemStatus.DEFERRED]),
+    ("errored", [ItemStatus.ERRORED]),
     ("backlog", [ItemStatus.BACKLOG]),
     ("queued", [ItemStatus.QUEUED]),
     ("working", [ItemStatus.WORKING]),
@@ -60,9 +61,7 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
         k = chr(ch).lower() if 0 < ch < 256 else ""
         if k == "q":
             return
-        if k == "l":
-            filter_idx = next(i for i, (n, _) in enumerate(FILTERS) if n == "all")
-        elif k == "r":
+        if k == "r":
             _review_mode(stdscr, cfg, store, daemon)
         elif k == "p":
             _pickup_mode(stdscr, cfg, store, daemon)
@@ -86,6 +85,10 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
             )
             if cfg.agent.pickup_mode == "auto":
                 daemon.try_fill_pool()
+        elif k == "u":
+            # Acknowledge a system alert and resume dispatching. No-op when
+            # nothing is paused, so safe to spam.
+            daemon.clear_alert()
         elif k == "\t":
             filter_idx = (filter_idx + 1) % len(FILTERS)
 
@@ -132,28 +135,33 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx):
     _safe_addstr(stdscr, row, 0, f" {ACTIONS}".ljust(w), w, curses.A_REVERSE)
     row += 1
 
-    # current task panel — always visible
-    current = _pick_current(store)
-    elapsed = _elapsed_for(store, current.id) if current else None
-    if current:
-        line = (f" ▶ NOW  {current.id[:8]}  {_fmt_elapsed(elapsed)}  "
-                f"{current.title}")
-        _safe_addstr(stdscr, row, 0, line.ljust(w), w,
-                     curses.color_pair(_status_color(ItemStatus.WORKING))
-                     | curses.A_BOLD)
-    else:
-        _safe_addstr(stdscr, row, 0, " ▶ NOW  (no task running)".ljust(w), w,
-                     curses.A_DIM)
-    row += 1
+    # system alert banner — sticky red row when daemon has paused itself
+    # because of an infrastructure failure. Truncated to fit; full message
+    # is in the log ring.
+    if daemon.system_alert:
+        # Tail of the message is usually the most informative part of a git
+        # error (the actual failure line). Show the prefix and let the user
+        # scroll the log for the full text.
+        msg = daemon.system_alert.replace("\n", " ").strip()
+        if len(msg) > w - 30:
+            msg = msg[: w - 33] + "..."
+        banner = f" ⚠ PAUSED — {msg}  (press [u] to resume) "
+        _safe_addstr(stdscr, row, 0, banner.ljust(w), w,
+                     curses.color_pair(4) | curses.A_BOLD | curses.A_REVERSE)
+        row += 1
 
     # combined status + counts line
     s = daemon.stats
     counts = {st: store.count_by_status(st) for st in ItemStatus}
+    # Active items (excluding terminal states) that currently carry an
+    # unresolved last_error. Surfaces stuck/faulty items in the header
+    # even when the default 'all' filter would visually smear them into
+    # the rest of the queue.
     status_line = (
         f" {cfg.agent.runner}  pool={cfg.agent.pool_size}  "
         f"mode={cfg.agent.pickup_mode}  "
         f"workers={len(daemon.workers)}  "
-        f"done={s.completed}  failed={s.failed}  │  "
+        f"done={s.completed}  errored={counts[ItemStatus.ERRORED]}  │  "
         f"backlog={counts[ItemStatus.BACKLOG]}  "
         f"queued={counts[ItemStatus.QUEUED]}  "
         f"working={counts[ItemStatus.WORKING]}  "
@@ -171,7 +179,7 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx):
     # body table
     body_top = row
     body_height = h - body_top - 1  # leave 1 line for log
-    _, filter_statuses = FILTERS[filter_idx]
+    _filter_name_cur, filter_statuses = FILTERS[filter_idx]
     statuses = filter_statuses if filter_statuses is not None else list(ItemStatus)
     _render_table(stdscr, store, body_top, body_height, w, statuses,
                   cfg.agent.context_window)
@@ -190,11 +198,6 @@ def _safe_addstr(stdscr, y, x, s, w, attr=0):
         stdscr.addnstr(y, x, s, w, attr)
     except curses.error:
         pass
-
-
-def _pick_current(store: Store) -> StoredItem | None:
-    items = store.list_by_status(ItemStatus.WORKING)
-    return items[0] if items else None
 
 
 def _elapsed_for(store: Store, item_id: str) -> float | None:
@@ -238,23 +241,6 @@ def _result_data(item: StoredItem) -> dict | None:
         return json.loads(item.result_json)
     except json.JSONDecodeError:
         return None
-
-
-def _cost_total(item: StoredItem) -> str:
-    """Total $ cost for the agent run, summed across all models. Kept for
-    places that explicitly want dollars (inspect view); the main dashboard
-    column uses _tokens_total instead since a subscription makes $ misleading."""
-    data = _result_data(item)
-    if not data:
-        return "—"
-    total = data.get("total_cost_usd")
-    if total is None:
-        mu = data.get("modelUsage") or {}
-        total = sum(float(v.get("costUSD", 0) or 0) for v in mu.values()
-                    if isinstance(v, dict))
-    if not total:
-        return "—"
-    return f"${float(total):.2f}"
 
 
 def _tokens_for_model(mu_entry: dict) -> int:
@@ -315,11 +301,17 @@ def _ctx_fill_pct(item: StoredItem, fallback_window: int) -> str:
                     if isinstance(v, dict)]
         if reported:
             window = max(window, max(reported))
-    if window <= 0:
-        return "—"
     iters = data.get("iterations")
     last_turn_tokens = 0
+    observed_max = 0
     if isinstance(iters, list) and iters:
+        for turn in iters:
+            if not isinstance(turn, dict):
+                continue
+            t = (int(turn.get("input_tokens", 0) or 0)
+                 + int(turn.get("cache_read_input_tokens", 0) or 0)
+                 + int(turn.get("cache_creation_input_tokens", 0) or 0))
+            observed_max = max(observed_max, t)
         last = iters[-1]
         if isinstance(last, dict):
             last_turn_tokens = (
@@ -327,6 +319,13 @@ def _ctx_fill_pct(item: StoredItem, fallback_window: int) -> str:
                 + int(last.get("cache_read_input_tokens", 0) or 0)
                 + int(last.get("cache_creation_input_tokens", 0) or 0)
             )
+    # Live streams don't populate modelUsage.contextWindow until the terminal
+    # 'result' event. If any turn's working set already exceeded our window
+    # estimate, the model must be on a larger variant — bump accordingly.
+    if observed_max > window:
+        window = 1_000_000 if observed_max > 200_000 else 200_000
+    if window <= 0:
+        return "—"
     if not last_turn_tokens:
         # No per-turn data — approximate with input+cache_create from the
         # flat usage block (summed cache_read would balloon past the window,
@@ -372,8 +371,9 @@ def _tokens_split(item: StoredItem) -> str:
     return " ".join(f"{tag}:{_fmt_tokens(n)}" for tag, n in parts)
 
 
-def _cost_breakdown(item: StoredItem) -> list[dict]:
-    """Per-model cost + token breakdown. Returns empty list if unavailable."""
+def _token_breakdown(item: StoredItem) -> list[dict]:
+    """Per-model token breakdown, sorted by total tokens descending.
+    Returns empty list if unavailable."""
     data = _result_data(item)
     if not data:
         return []
@@ -384,13 +384,13 @@ def _cost_breakdown(item: StoredItem) -> list[dict]:
             continue
         rows.append({
             "model": model,
-            "cost": float(v.get("costUSD", 0) or 0),
             "input": int(v.get("inputTokens", 0) or 0),
             "output": int(v.get("outputTokens", 0) or 0),
             "cache_read": int(v.get("cacheReadInputTokens", 0) or 0),
             "cache_create": int(v.get("cacheCreationInputTokens", 0) or 0),
         })
-    rows.sort(key=lambda r: -r["cost"])
+    rows.sort(key=lambda r: -(r["input"] + r["output"] +
+                              r["cache_read"] + r["cache_create"]))
     return rows
 
 
@@ -406,6 +406,7 @@ def _render_table(stdscr, store, top, height, w, statuses, context_window):
     for st in statuses:
         items = store.list_by_status(st)
         for it in items:
+            has_err = bool(it.last_error)
             if rows_used >= height:
                 _safe_addstr(stdscr, top + rows_used - 1, 0,
                              f" ... (more not shown)".ljust(w), w,
@@ -419,13 +420,23 @@ def _render_table(stdscr, store, top, height, w, statuses, context_window):
                 src = "…" + src[-(_COL_SOURCE - 2):]
             title_max = max(0, w - 1 - _COL_ID - _COL_STATE - _COL_ELAPSED
                               - _COL_CTX - _COL_SOURCE)
+            # `!` marker on the state column when the item carries an
+            # unresolved error — makes sticky problems visible in the
+            # default view without needing the errors filter.
+            marker = "!" if has_err else " "
+            state_cell = f"{marker}{st.value}"[: _COL_STATE]
             title = it.title[:title_max]
-            line = (f" {it.id[:8]:<{_COL_ID-1}}{st.value:<{_COL_STATE}}"
+            line = (f" {it.id[:8]:<{_COL_ID-1}}{state_cell:<{_COL_STATE}}"
                     f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
                     f"{src:<{_COL_SOURCE}}{title}")
-            attr = curses.color_pair(_status_color(st))
-            if st == ItemStatus.WORKING:
-                attr |= curses.A_BOLD
+            if has_err:
+                # Red for rows that need the user's attention; overrides
+                # the status-based color so the error is unmistakable.
+                attr = curses.color_pair(4) | curses.A_BOLD
+            else:
+                attr = curses.color_pair(_status_color(st))
+                if st == ItemStatus.WORKING:
+                    attr |= curses.A_BOLD
             _safe_addstr(stdscr, top + rows_used, 0, line, w, attr)
             rows_used += 1
 
@@ -433,7 +444,7 @@ def _render_table(stdscr, store, top, height, w, statuses, context_window):
 def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
     """Curses-native, one-item-per-screen pickup over BACKLOG + DEFERRED.
     Approving promotes BACKLOG → QUEUED; the daemon dispatches on its own."""
-    from .committer import approve_backlog, defer, restore_deferred
+    from .committer import approve_backlog, defer, delete_idea, restore_deferred
     items = (store.list_by_status(ItemStatus.BACKLOG)
              + store.list_by_status(ItemStatus.DEFERRED))
     if not items:
@@ -457,7 +468,7 @@ def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
                 body = _wrap(fresh.body or "(no description)", w - 2)
                 _show_item_screen(
                     stdscr, header, body,
-                    " [y]approve  [s]defer  [n]leave  [q]uit "
+                    " [y]approve  [s]defer  [x]delete  [n]leave  [q]uit "
                     " · [j/k]scroll ",
                     content_scroll=scroll,
                 )
@@ -485,6 +496,11 @@ def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
                     f = store.get(fresh.id)
                     if f and f.status != ItemStatus.DEFERRED:
                         defer(store, f)
+                    break
+                if k == "x":
+                    f = store.get(fresh.id)
+                    if f and _prompt_yn(stdscr, "delete this idea?"):
+                        delete_idea(store, f)
                     break
                 if k in ("n", ""):
                     break
@@ -601,7 +617,7 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
     data = _result_data(item)
     if not data:
         out.append("")
-        out.append("(no agent result yet — no cost/token data)")
+        out.append("(no agent result yet — no token data)")
         return out
     out.append("")
     out.append("── agent run ──")
@@ -612,17 +628,14 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
                    f"(api: {data.get('duration_api_ms', 0) / 1000:.1f}s)")
     if "stop_reason" in data:
         out.append(f"stop:     {data['stop_reason']}")
-    total = data.get("total_cost_usd")
-    if total is not None:
-        out.append(f"TOTAL:    ${float(total):.4f}")
-    rows = _cost_breakdown(item)
+    rows = _token_breakdown(item)
     if rows:
         out.append("")
-        out.append("── per-model breakdown ──")
-        out.append(f"{'MODEL':<36} {'COST':>9} {'IN':>10} {'OUT':>10} "
+        out.append("── per-model tokens ──")
+        out.append(f"{'MODEL':<36} {'IN':>10} {'OUT':>10} "
                    f"{'CACHE_R':>12} {'CACHE_W':>10}")
         for r in rows:
-            out.append(f"{r['model']:<36} ${r['cost']:>7.4f} "
+            out.append(f"{r['model']:<36} "
                        f"{_fmt_tokens(r['input']):>10} "
                        f"{_fmt_tokens(r['output']):>10} "
                        f"{_fmt_tokens(r['cache_read']):>12} "
@@ -635,6 +648,24 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
     if item.last_error:
         out.append("")
         out.append(f"last_error: {item.last_error[:500]}")
+    failures = store.list_failures(item.id, limit=10)
+    if failures:
+        out.append("")
+        out.append(f"── failure history ({store.count_failures(item.id)} "
+                   f"total, last {len(failures)} shown) ──")
+        for f in failures:
+            when = time.strftime("%Y-%m-%d %H:%M:%S",
+                                 time.localtime(float(f["at"])))
+            header = (f"#{f['attempt']} {f['phase'] or '—'}  {when}"
+                      f"  turns={f['num_turns'] or '—'}"
+                      f"  dur={f['duration_ms'] and f'{f['duration_ms']/1000:.1f}s' or '—'}")
+            out.append(header)
+            err = (f["error"] or "").strip()
+            # Keep each failure compact: first line, up to 3 wrapped lines.
+            for ln in err.splitlines()[:3]:
+                out.append(f"  {ln[:300]}")
+            if f.get("transcript_path"):
+                out.append(f"  transcript: {f['transcript_path']}")
     return out
 
 
@@ -724,7 +755,7 @@ def _review_code_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
         header = [
             f"  code review · {item.title}",
             f"  id {item.id[:8]}  branch {item.branch or '—'}  "
-            f"files {len(files)}  cost {_cost_total(item)}",
+            f"files {len(files)}  tokens {_tokens_total(item)}",
         ]
         content: list[str] = []
         content += _wrap(summary, w - 2)

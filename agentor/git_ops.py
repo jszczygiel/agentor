@@ -67,6 +67,20 @@ def branch_exists(repo: Path, branch: str) -> bool:
     return cp.returncode == 0
 
 
+def branch_checked_out_at(repo: Path, branch: str) -> Path | None:
+    """Return the worktree path that currently has `branch` checked out, or
+    None if no worktree holds it. Used before `branch_delete` to remove
+    the worktree first — git refuses to delete a branch checked out
+    elsewhere, even with -D."""
+    target = f"refs/heads/{branch}"
+    for entry in worktree_list(repo):
+        if entry.get("branch") == target:
+            wt = entry.get("worktree")
+            if wt:
+                return Path(wt)
+    return None
+
+
 def branch_delete(repo: Path, branch: str, force: bool = True) -> None:
     flag = "-D" if force else "-d"
     run(repo, "branch", flag, branch, check=False)

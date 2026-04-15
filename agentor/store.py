@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS items (
     branch        TEXT,
     attempts      INTEGER NOT NULL DEFAULT 0,
     last_error    TEXT,
+    feedback      TEXT,
     result_json   TEXT,
     session_id    TEXT,
     created_at    REAL NOT NULL,
@@ -39,6 +40,21 @@ CREATE TABLE IF NOT EXISTS transitions (
     note       TEXT,
     at         REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS failures (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id            TEXT NOT NULL REFERENCES items(id),
+    attempt            INTEGER NOT NULL,
+    phase              TEXT,
+    error              TEXT NOT NULL,
+    error_sig          TEXT,
+    num_turns          INTEGER,
+    duration_ms        INTEGER,
+    files_changed_json TEXT,
+    transcript_path    TEXT,
+    at                 REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_failures_item ON failures(item_id);
 """
 
 
@@ -47,6 +63,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(items)")}
     if "session_id" not in cols:
         conn.execute("ALTER TABLE items ADD COLUMN session_id TEXT")
+    if "feedback" not in cols:
+        conn.execute("ALTER TABLE items ADD COLUMN feedback TEXT")
 
 
 @dataclass
@@ -62,6 +80,7 @@ class StoredItem:
     branch: str | None
     attempts: int
     last_error: str | None
+    feedback: str | None
     result_json: str | None
     session_id: str | None
     created_at: float
@@ -81,6 +100,7 @@ def _row_to_stored(row: sqlite3.Row) -> StoredItem:
         branch=row["branch"],
         attempts=row["attempts"],
         last_error=row["last_error"],
+        feedback=row["feedback"],
         result_json=row["result_json"],
         session_id=row["session_id"],
         created_at=row["created_at"],
@@ -186,7 +206,7 @@ class Store:
         like worktree_path, branch, attempts, last_error, result_json."""
         now = time.time()
         allowed = {"worktree_path", "branch", "attempts", "last_error",
-                   "result_json", "session_id"}
+                   "feedback", "result_json", "session_id"}
         sets = ["status = ?", "updated_at = ?"]
         params: list[object] = [to.value, now]
         for k, v in fields.items():
@@ -267,3 +287,151 @@ class Store:
                 (item_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def record_failure(
+        self,
+        item_id: str,
+        attempt: int,
+        phase: str | None,
+        error: str,
+        error_sig: str | None = None,
+        num_turns: int | None = None,
+        duration_ms: int | None = None,
+        files_changed: list[str] | None = None,
+        transcript_path: str | None = None,
+    ) -> None:
+        """Persist one failure attempt. Separate table from transitions so
+        rich diagnostics (turns, duration, files touched, transcript
+        pointer) survive across the next attempt's bounce-back, which
+        would otherwise overwrite `last_error` on the item."""
+        now = time.time()
+        files_json = json.dumps(files_changed) if files_changed else None
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO failures
+                   (item_id, attempt, phase, error, error_sig, num_turns,
+                    duration_ms, files_changed_json, transcript_path, at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (item_id, attempt, phase, error, error_sig, num_turns,
+                 duration_ms, files_json, transcript_path, now),
+            )
+
+    def list_failures(self, item_id: str, limit: int = 20) -> list[dict]:
+        """Recent failures for an item, newest first."""
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT * FROM failures WHERE item_id = ?
+                   ORDER BY id DESC LIMIT ?""",
+                (item_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_failures(self, item_id: str) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM failures WHERE item_id = ?",
+                (item_id,),
+            ).fetchone()
+        return row["n"] if row else 0
+
+    def clear_error_and_reset_attempts(self, item_id: str) -> None:
+        """Clear last_error and zero the attempts counter without moving
+        status. Used by the startup auto-recovery sweep for items whose
+        error is known benign (operator ^C, obsolete cap, recoverable
+        session loss) — they should re-enter normal dispatch as if fresh."""
+        now = time.time()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE items SET last_error = NULL, attempts = 0, "
+                "updated_at = ? WHERE id = ?",
+                (now, item_id),
+            )
+
+    def ids_with_errors(self, statuses: list[ItemStatus] | None = None,
+                        ) -> set[str]:
+        """Return the set of item ids where `last_error` is non-null,
+        optionally filtered to a subset of statuses. Used by the dashboard
+        error filter and the `!` marker in rows."""
+        params: list[object] = []
+        sql = "SELECT id FROM items WHERE last_error IS NOT NULL"
+        if statuses:
+            placeholders = ",".join("?" * len(statuses))
+            sql += f" AND status IN ({placeholders})"
+            params.extend(s.value for s in statuses)
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return {r["id"] for r in rows}
+
+    def recent_failure_notes(self, item_id: str, n: int = 3) -> list[str]:
+        """Return the most recent N transition notes whose from_status was
+        WORKING and to_status was QUEUED — i.e. the "bounce back after a
+        do_work failure" transitions. Used by the runner to detect when
+        the same error has fired multiple attempts in a row (a loop) so
+        it can auto-revert instead of reject."""
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT note FROM transitions
+                   WHERE item_id = ? AND from_status = ? AND to_status = ?
+                   ORDER BY id DESC LIMIT ?""",
+                (item_id, ItemStatus.WORKING.value,
+                 ItemStatus.QUEUED.value, n),
+            ).fetchall()
+        return [r["note"] or "" for r in rows]
+
+    def previous_settled_status(self, item_id: str) -> ItemStatus | None:
+        """Find the most recent "settled" status this item was in, other
+        than the current one. Settled = anything except WORKING (which is
+        a transient in-flight state). Returns None if no prior settled
+        state exists.
+
+        Used by the manual revert command and by crash recovery to restore
+        an item without losing user-visible progress — e.g. an item that
+        had reached AWAITING_PLAN_REVIEW, then was re-queued for execute,
+        then crashed mid-work, gets restored to QUEUED (the execute-phase
+        wait, with the approved plan still in result_json) rather than
+        starting from BACKLOG. For a fresh first-time crash, this returns
+        QUEUED. For a rejection cascade, it skips the WORKING bounces and
+        returns the QUEUED state that preceded them."""
+        rows = self.transitions_for(item_id)
+        if len(rows) < 2:
+            return None
+        current = rows[-1]["to_status"]
+        for row in reversed(rows[:-1]):
+            to = row["to_status"]
+            if not to or to == ItemStatus.WORKING.value or to == current:
+                continue
+            try:
+                return ItemStatus(to)
+            except ValueError:
+                continue
+        return None
+
+    def note_infra_failure(self, item_id: str, err: str) -> None:
+        """Record an infrastructure-level failure (broken worktree, missing
+        repo, etc.) without changing item status or charging an attempt.
+
+        Decrements attempts to undo the increment claim_next_queued did at
+        dispatch time — the failure isn't the item's fault, so it shouldn't
+        burn a retry slot. Writes a self-loop transition row (from==to)
+        with a marker note so the history reflects what happened."""
+        now = time.time()
+        with self.tx() as c:
+            row = c.execute(
+                "SELECT status, attempts FROM items WHERE id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"no such item: {item_id}")
+            cur_status = row["status"]
+            new_attempts = max(0, int(row["attempts"]) - 1)
+            c.execute(
+                "UPDATE items SET attempts = ?, last_error = ?, "
+                "updated_at = ? WHERE id = ?",
+                (new_attempts, err, now, item_id),
+            )
+            note = f"infra failure (no attempt charged): {err[:300]}"
+            c.execute(
+                """INSERT INTO transitions
+                   (item_id, from_status, to_status, note, at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (item_id, cur_status, cur_status, note, now),
+            )

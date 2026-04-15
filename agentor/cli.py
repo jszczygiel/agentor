@@ -254,6 +254,72 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_errors(args: argparse.Namespace) -> int:
+    """List items that currently carry a last_error. Same data source as
+    the dashboard errors filter and the `!` marker, but for non-TTY /
+    scripting use."""
+    cfg = load(_find_config(args.config))
+    store = _open_store(cfg)
+    try:
+        err_ids = store.ids_with_errors()
+        if not err_ids:
+            print("no items with errors.")
+            return 0
+        # Use a stable order: newest updated first.
+        rows: list = []
+        for id_ in err_ids:
+            item = store.get(id_)
+            if item is not None:
+                rows.append(item)
+        rows.sort(key=lambda r: r.updated_at, reverse=True)
+        for r in rows:
+            err_head = (r.last_error or "").splitlines()[0][:120]
+            print(f"{r.id}  {r.status.value:<18} attempts={r.attempts}  "
+                  f"{r.title[:50]}")
+            print(f"  → {err_head}")
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_revert(args: argparse.Namespace) -> int:
+    """Revert an item to its previous settled state. Looks at the
+    transitions log to find what the item was doing before the most recent
+    failure cascade (e.g. AWAITING_PLAN_REVIEW before a slot-broken bounce
+    loop ended in REJECTED). Resets attempts/last_error/worktree/branch/
+    session_id so the next dispatch starts fresh."""
+    cfg = load(_find_config(args.config))
+    store = _open_store(cfg)
+    try:
+        item = store.get(args.item_id)
+        if item is None:
+            print(f"no such item: {args.item_id}", file=sys.stderr)
+            return 1
+        prev = store.previous_settled_status(args.item_id)
+        if prev is None:
+            print(f"no prior settled state found for {args.item_id}",
+                  file=sys.stderr)
+            return 1
+        print(f"item:    {item.id}  {item.title!r}")
+        print(f"current: {item.status.value}  attempts={item.attempts}")
+        print(f"target:  {prev.value}")
+        if not args.yes:
+            answer = input("revert? [y/N] ").strip().lower()
+            if answer != "y":
+                print("aborted.")
+                return 0
+        store.transition(
+            item.id, prev,
+            worktree_path=None, branch=None, session_id=None,
+            attempts=0, last_error=None, feedback=None,
+            note=f"manual revert from {item.status.value}",
+        )
+        print(f"reverted {item.id} → {prev.value}")
+    finally:
+        store.close()
+    return 0
+
+
 def cmd_review(args: argparse.Namespace) -> int:
     cfg = load(_find_config(args.config))
     store = _open_store(cfg)
@@ -294,10 +360,15 @@ def _review_one(cfg: Config, store: Store, item) -> None:
         sha = approve_and_commit(cfg, store, item, msg)
         print(f"committed {sha[:8]} on {item.branch}")
     elif choice == "r":
-        fb = input("feedback for agent: ").strip()
+        fb = input("feedback for agent (empty = terminal reject): ").strip()
         fresh = store.get(item.id)
-        reject(store, fresh, fb or "(no feedback)")
-        print("rejected.")
+        if fb:
+            from .committer import reject_and_retry
+            reject_and_retry(store, fresh, fb)
+            print("re-queued for retry with feedback.")
+        else:
+            reject(store, fresh, "(no feedback)")
+            print("rejected (terminal).")
     else:
         print("skipped.")
     print()
@@ -330,6 +401,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("review", help="review items awaiting approval")
     sp.set_defaults(func=cmd_review)
+
+    sp = sub.add_parser("errors",
+                        help="list items with a last_error set")
+    sp.set_defaults(func=cmd_errors)
+
+    sp = sub.add_parser("revert",
+                        help="revert an item to its previous settled state")
+    sp.add_argument("item_id", help="item id (or unique prefix shown in dashboard)")
+    sp.add_argument("-y", "--yes", action="store_true",
+                    help="skip confirmation prompt")
+    sp.set_defaults(func=cmd_revert)
 
     return p
 

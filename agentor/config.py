@@ -1,5 +1,6 @@
+import sys
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 
@@ -36,60 +37,36 @@ class AgentConfig:
     # auto: daemon dispatches queued items as soon as a pool slot frees up.
     # manual: items stay queued until a human approves the pickup via the UI.
     pickup_mode: str = "auto"
+    # When true, skip the plan phase entirely — agent goes straight to
+    # execute on first claim. Saves a full Claude run for items where the
+    # backlog text is already a sufficient spec and human plan-review adds
+    # no value. The execute prompt is rendered with plan="(no plan; spec is
+    # in the task body)" so existing template stays valid.
+    single_phase: bool = False
     # Two-phase flow: agent first produces a plan (no code changes), human
     # reviews, then agent resumes in the same session to execute + commit.
     # Placeholders for both: {title}, {body}, {source_file}. The execute
     # prompt additionally receives {plan}.
     plan_prompt_template: str = (
-        "/caveman ultra\n\n"
         "Task from the project backlog:\n\n"
         "Title: {title}\n\n"
         "Description:\n{body}\n\n"
         "Source: {source_file}\n\n"
-        "PLANNING PHASE. Do NOT modify production code, tests, or game "
-        "data. The only file you may write is TECH.md (produced by "
-        "/research). Read-only grep/read of existing code is expected.\n\n"
-        "Step 1 — ground yourself. Run the /research skill against this "
-        "task so TECH.md captures: current behavior around the area, the "
-        "key files/functions/data structures, related tests, any recent "
-        "commits or TODOs that touched this code. Reference the TECH.md "
-        "findings in the plan below.\n\n"
-        "Step 2 — produce a DELIVERABLE-FOCUSED plan. Lead with *what the "
-        "user will be able to do, see, or rely on after this ships* — "
-        "concrete behavior, UX, or API, not implementation noise. A "
-        "reviewer should be able to tell from section 1 alone whether this "
-        "is the right thing to build.\n\n"
-        "Sections (in this order):\n\n"
-        "1. Deliverable — 3-8 bullets describing the *outcome*. What "
-        "changes from the user/system's perspective? Include concrete "
-        "examples (inputs, outputs, screens, log lines, behavior under "
-        "edge cases). Skip implementation vocabulary here.\n"
-        "2. Acceptance criteria — bulleted, verifiable statements. Each "
-        "should answer 'how would we know this is done?' Think in terms "
-        "of observable behavior, not internal structure.\n"
-        "3. Context (from /research) — key file:line references, the data "
-        "flow, and any existing mechanisms this builds on. Quote "
-        "sparingly; link to TECH.md for depth.\n"
-        "4. Approach — the strategy, and why this shape beats the "
-        "alternatives you considered. Call out the one-line intuition "
-        "('factor-driven target' / 'debounce on settle' / etc).\n"
-        "5. Changes — numbered list of concrete edits. For each: file, "
-        "function/section, what changes (1-3 substantive bullets). "
-        "Include new files with their path and purpose.\n"
-        "6. Data / API impact — schema, config, save format, public "
-        "interface, or migration effects. Write 'none' if truly none.\n"
-        "7. Tests — specific tests to add or update, by test file and "
-        "case name. New test file? Say so with its path.\n"
-        "8. Risks & edge cases — what could break, what could regress, "
-        "concurrency / ordering / error-path concerns, rollback plan.\n"
-        "9. Verification — how you (and the reviewer) will confirm "
-        "success: commands, expected outputs, manual smoke steps.\n"
-        "10. Open questions — ambiguities the reviewer must resolve "
-        "before execution. Be specific: 'should X live in module A or "
-        "B, given Y?' not 'what approach?'\n\n"
-        "Write for a teammate who can give line-level feedback. Err "
-        "toward concrete file paths, function names, and observable "
-        "behavior. A human reviews this plan before execution runs."
+        "PLANNING PHASE. Read-only grep/read is fine. Do NOT modify any "
+        "files. Do NOT spawn sub-agents (no /research, no /develop, no "
+        "Task tool). Grep first; Read 3-8 files directly to ground "
+        "yourself, then write a concise plan. For large files (>10k tokens) "
+        "use `Read` with `offset`/`limit` or grep for the relevant region "
+        "instead of reading whole files — full reads will fail and abort "
+        "the plan.\n\n"
+        "Plan structure (terse, not verbose):\n"
+        "1. Deliverable — 3-5 bullets, observable outcome.\n"
+        "2. Acceptance — 2-4 bullets, how to verify.\n"
+        "3. Changes — numbered file:function edits, one line each.\n"
+        "4. Tests — test files/cases to add or touch.\n"
+        "5. Risks — what could break.\n"
+        "6. Open questions — only if reviewer must resolve.\n\n"
+        "A human reviews this plan before execution runs. Keep it tight."
     )
     execute_prompt_template: str = (
         "The plan below was reviewed and approved by a human. Execute it end-"
@@ -102,6 +79,9 @@ class AgentConfig:
     # Back-compat placeholder; no longer used by the two-phase runner.
     prompt_template: str = ""
     timeout_seconds: int = 1800
+    # Hard cap on agent turns. 0 disables. Live stream watches num_turns
+    # and kills the child when exceeded.
+    max_turns: int = 0
     build_cmd: str | None = None
     test_cmd: str | None = None
 
@@ -130,6 +110,22 @@ class Config:
     review: ReviewConfig
 
 
+def _filter_known(cls, data: dict, section: str) -> dict:
+    """Drop unknown keys before constructing a dataclass, with a warning
+    so stale configs (e.g. a removed option like max_cost_usd) don't
+    crash the loader. Users keep their existing files working and get a
+    nudge to clean up."""
+    known = {f.name for f in fields(cls)}
+    filtered = {}
+    for k, v in (data or {}).items():
+        if k in known:
+            filtered[k] = v
+        else:
+            print(f"[config] ignoring unknown key [{section}].{k} "
+                  f"(removed or misspelled)", file=sys.stderr)
+    return filtered
+
+
 def load(config_path: Path) -> Config:
     """Load agentor config from a TOML file. Project root is the file's parent dir
     unless [project].root is an absolute path."""
@@ -146,9 +142,14 @@ def load(config_path: Path) -> Config:
     return Config(
         project_name=name,
         project_root=root,
-        sources=SourcesConfig(**raw.get("sources", {})),
-        parsing=ParsingConfig(**raw.get("parsing", {})),
-        agent=AgentConfig(**raw.get("agent", {})),
-        git=GitConfig(**raw.get("git", {})),
-        review=ReviewConfig(**raw.get("review", {})),
+        sources=SourcesConfig(**_filter_known(
+            SourcesConfig, raw.get("sources", {}), "sources")),
+        parsing=ParsingConfig(**_filter_known(
+            ParsingConfig, raw.get("parsing", {}), "parsing")),
+        agent=AgentConfig(**_filter_known(
+            AgentConfig, raw.get("agent", {}), "agent")),
+        git=GitConfig(**_filter_known(
+            GitConfig, raw.get("git", {}), "git")),
+        review=ReviewConfig(**_filter_known(
+            ReviewConfig, raw.get("review", {}), "review")),
     )

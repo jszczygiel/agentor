@@ -59,13 +59,13 @@ def reject(store: Store, item: StoredItem, feedback: str) -> None:
     )
     store.transition(
         item.id, ItemStatus.REJECTED,
-        last_error=feedback, note="rejected by user",
+        feedback=feedback, note="rejected by user",
     )
 
 
 def reject_and_retry(store: Store, item: StoredItem, feedback: str) -> None:
     """Reject the agent's output but re-queue the item so it can iterate on
-    the feedback. The runner injects `last_error` into the next prompt.
+    the feedback. The runner injects `feedback` into the next prompt.
 
     - From AWAITING_PLAN_REVIEW → QUEUED with result_json cleared, so the
       runner re-enters the plan phase (same session via --resume).
@@ -73,7 +73,8 @@ def reject_and_retry(store: Store, item: StoredItem, feedback: str) -> None:
       so the runner re-enters the execute phase.
 
     Attempts is reset to 0: human-driven iteration shouldn't eat the agent's
-    own retry budget."""
+    own retry budget. Feedback is stored separately from last_error — it's
+    not a failure, just guidance for the next pass."""
     assert item.status in (
         ItemStatus.AWAITING_REVIEW, ItemStatus.AWAITING_PLAN_REVIEW,
     )
@@ -81,14 +82,14 @@ def reject_and_retry(store: Store, item: StoredItem, feedback: str) -> None:
         store.transition(
             item.id, ItemStatus.QUEUED,
             result_json=None,
-            last_error=feedback,
+            feedback=feedback,
             attempts=0,
             note="plan rejected — re-plan with user feedback",
         )
     else:
         store.transition(
             item.id, ItemStatus.QUEUED,
-            last_error=feedback,
+            feedback=feedback,
             attempts=0,
             note="code rejected — re-execute with user feedback",
         )
@@ -119,6 +120,16 @@ def retry(store: Store, item: StoredItem) -> None:
     """Re-queue a rejected item for another attempt. Keeps the existing worktree."""
     assert item.status == ItemStatus.REJECTED
     store.transition(item.id, ItemStatus.QUEUED, note="retry after rejection")
+
+
+def delete_idea(store: Store, item: StoredItem) -> None:
+    """User rejected an idea at pickup — park it in CANCELLED so scan_once
+    doesn't re-enqueue it from the source markdown on the next pass. Source
+    file is left intact; user can remove the markdown entry whenever."""
+    store.transition(
+        item.id, ItemStatus.CANCELLED,
+        note=f"deleted from pickup (was {item.status.value})",
+    )
 
 
 def defer(store: Store, item: StoredItem) -> None:

@@ -1,5 +1,5 @@
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import git_ops
@@ -8,10 +8,49 @@ from .models import ItemStatus
 from .store import Store, StoredItem
 
 
+# Known-benign last_error patterns. An item carrying any of these is safe to
+# auto-recover on startup: clear the error, zero attempts, leave status
+# alone. Reasons:
+#   - "agentor shutdown"  — operator ^C, not the item's fault
+#   - "max_cost_usd"      — obsolete runaway cap (removed)
+#   - "no conversation found with session id" — already handled at runtime,
+#     safe to clear stale traces
+#   - "no agent result yet — no token data" — dashboard placeholder that
+#     occasionally gets stored; no diagnostic value
+_AUTO_RECOVERABLE_PATTERNS = (
+    "agentor shutdown",
+    "max_cost_usd",
+    "no conversation found with session id",
+    "no agent result yet",
+    "no token data",
+    # Infrastructure-class: the slot was broken at dispatch time. We
+    # already refund attempts at runtime via note_infra_failure, but a
+    # stale last_error can persist on items queued under older code.
+    # The self-heal + branch cleanup in runner makes these recoverable
+    # on the next dispatch; no reason to leave the marker on.
+    "not a git repository",
+    "not a working tree",
+    "fatal: invalid reference",
+    "fatal: bad object",
+    "fatal: bad revision",
+    "already exists",
+    "is already checked out",
+    "already used by worktree",
+)
+
+
+def _is_auto_recoverable_error(msg: str | None) -> bool:
+    if not msg:
+        return False
+    low = msg.lower()
+    return any(p in low for p in _AUTO_RECOVERABLE_PATTERNS)
+
+
 @dataclass
 class RecoveryResult:
     requeued: list[str]   # items reset to QUEUED — must start fresh
     resumable: list[StoredItem]  # WORKING items with session_id + live worktree
+    auto_recovered: list[str] = field(default_factory=list)  # errors cleared
 
 
 def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
@@ -20,7 +59,10 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
     If the item has a persisted session_id AND its worktree still exists on
     disk, leave it WORKING and return it as resumable — the caller re-invokes
     claude with `--resume <session_id>`. Otherwise nuke its worktree and
-    requeue it for a fresh attempt."""
+    revert the item to its previous settled state — typically QUEUED for a
+    fresh item, but AWAITING_PLAN_REVIEW or AWAITING_REVIEW for items that
+    had reached a user-checkpoint before the crash. Without this revert,
+    user-visible progress would be silently lost on every restart."""
     stuck = store.list_by_status(ItemStatus.WORKING)
     requeued: list[str] = []
     resumable: list[StoredItem] = []
@@ -35,10 +77,41 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
             git_ops.worktree_remove(repo, wt, force=True)
             if wt.exists():
                 shutil.rmtree(wt, ignore_errors=True)
+        # Find the last safe state. Falls back to QUEUED when the item has
+        # no settled history (brand-new items that crashed mid-first-run).
+        prev = store.previous_settled_status(item.id) or ItemStatus.QUEUED
         store.transition(
-            item.id, ItemStatus.QUEUED,
-            worktree_path=None, branch=None,
-            note="recovered from crashed run (no session to resume)",
+            item.id, prev,
+            worktree_path=None, branch=None, session_id=None,
+            note=f"recovered from crashed run → {prev.value} (no resumable session)",
         )
         requeued.append(item.id)
-    return RecoveryResult(requeued=requeued, resumable=resumable)
+
+    # Sweep two cases:
+    #  1. Non-terminal items whose last_error matches a known benign
+    #     class. Clear last_error + reset attempts; status unchanged so
+    #     QUEUED items re-enter dispatch, DEFERRED/REJECTED ones just
+    #     lose the `!` marker.
+    #  2. Terminal items (MERGED, CANCELLED) carrying any stale
+    #     last_error from a pre-merge bounce. The work is done; the
+    #     error is noise regardless of class.
+    auto_recovered: list[str] = []
+    active_states = [
+        ItemStatus.QUEUED, ItemStatus.BACKLOG,
+        ItemStatus.AWAITING_PLAN_REVIEW, ItemStatus.AWAITING_REVIEW,
+        ItemStatus.DEFERRED, ItemStatus.REJECTED,
+    ]
+    for st in active_states:
+        for item in store.list_by_status(st):
+            if _is_auto_recoverable_error(item.last_error):
+                store.clear_error_and_reset_attempts(item.id)
+                auto_recovered.append(item.id)
+    for st in (ItemStatus.MERGED, ItemStatus.CANCELLED):
+        for item in store.list_by_status(st):
+            if item.last_error:
+                store.clear_error_and_reset_attempts(item.id)
+                auto_recovered.append(item.id)
+    return RecoveryResult(
+        requeued=requeued, resumable=resumable,
+        auto_recovered=auto_recovered,
+    )

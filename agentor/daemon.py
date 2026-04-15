@@ -7,7 +7,7 @@ from typing import Callable
 from .config import Config
 from .models import ItemStatus
 from .recovery import recover_on_startup
-from .runner import Runner, plan_worktree
+from .runner import InfrastructureError, ProcRegistry, Runner, plan_worktree
 from .store import Store
 from .watcher import scan_once
 
@@ -43,10 +43,36 @@ class Daemon:
         self.force_stop = False
         self.workers: set[threading.Thread] = set()
         self.stats = DaemonStats()
+        self.proc_registry = ProcRegistry()
+        # Set when a runner raises InfrastructureError. While set:
+        #  - dispatch_one and dispatch_specific refuse to claim new items
+        #    (the slot is broken; claiming would just hit the same error
+        #    and waste another attempt, even though we already refund it)
+        #  - dashboard renders a sticky red banner with the message
+        # Cleared by dashboard 'u' key (or programmatically via
+        # clear_alert) once the user has fixed the underlying problem.
+        self.system_alert: str | None = None
+        self.paused: bool = False
+
+    def clear_alert(self) -> None:
+        """Acknowledge the alert and resume dispatching. Called from the
+        dashboard 'u' key after the user has fixed the broken slot/repo."""
+        self.system_alert = None
+        self.paused = False
+        self.log("alert cleared; dispatch resumed")
+
+    def _make_runner(self) -> Runner:
+        r = self.runner_factory(self.config, self.store)
+        r.proc_registry = self.proc_registry
+        r.stop_event = self.stop_event
+        return r
 
     def dispatch_specific(self, item_id: str) -> bool:
         """Manually approve a queued item for pickup. Returns True if it was
         dispatched, False if it could not be (already claimed, no slot, gone)."""
+        if self.paused:
+            self.log(f"manual dispatch denied: paused (system alert active)")
+            return False
         if not self.store.pool_has_slot(self.config.agent.pool_size):
             self.log(f"manual dispatch denied: pool full")
             return False
@@ -54,7 +80,7 @@ class Daemon:
         if item is None or item.status != ItemStatus.QUEUED:
             self.log(f"manual dispatch denied: {item_id} not queued")
             return False
-        wt_path, branch = plan_worktree(self.config, item)
+        wt_path, branch = plan_worktree(self.config, store=self.store, item=item)
         # claim_next_queued returns oldest; we want THIS item. Transition by hand.
         self.store.transition(
             item.id, ItemStatus.WORKING,
@@ -63,7 +89,7 @@ class Daemon:
             note="manual pickup approval",
         )
         claimed = self.store.get(item.id)
-        runner = self.runner_factory(self.config, self.store)
+        runner = self._make_runner()
         self.stats.dispatched += 1
         self.log(f"manual dispatch: {claimed.id} {claimed.title!r} -> {branch}")
         t = threading.Thread(
@@ -87,6 +113,8 @@ class Daemon:
         reaches QUEUED (auto-promoted on discovery in auto mode, or manually
         approved out of BACKLOG), the daemon claims it regardless of pickup
         mode — the manual/auto gate applies at BACKLOG → QUEUED only."""
+        if self.paused:
+            return False
         if not self.store.pool_has_slot(self.config.agent.pool_size):
             return False
         # peek to plan worktree path before claiming (need title for slug)
@@ -103,14 +131,14 @@ class Daemon:
                         note="auto-reject: exhausted",
                     )
             return False
-        wt_path, branch = plan_worktree(self.config, nxt)
+        wt_path, branch = plan_worktree(self.config, store=self.store, item=nxt)
         claimed = self.store.claim_next_queued(str(wt_path), branch)
         if claimed is None:
             return False
         if claimed.id != nxt.id:
             # another path already claimed it — planned wt_path may be wrong,
             # re-plan against the actual claimed item
-            wt_path, branch = plan_worktree(self.config, claimed)
+            wt_path, branch = plan_worktree(self.config, store=self.store, item=claimed)
             self.store.transition(
                 claimed.id, ItemStatus.WORKING,
                 worktree_path=str(wt_path), branch=branch,
@@ -118,7 +146,7 @@ class Daemon:
             )
             claimed = self.store.get(claimed.id)
 
-        runner = self.runner_factory(self.config, self.store)
+        runner = self._make_runner()
         self.stats.dispatched += 1
         self.log(f"dispatch: {claimed.id} {claimed.title!r} -> {branch}")
         t = threading.Thread(
@@ -137,6 +165,17 @@ class Daemon:
             else:
                 self.stats.completed += 1
                 self.log(f"awaiting_review: {claimed.id} — {result.summary}")
+        except InfrastructureError as e:
+            # Don't count as a failure (the item didn't fail; the system
+            # did). Item was left in WORKING by note_infra_failure with
+            # the error recorded; runner refunded its attempt.
+            msg = (f"infrastructure error on {claimed.id} "
+                   f"{claimed.title!r}: {e}")
+            self.system_alert = str(e)
+            self.paused = True
+            self.log(f"[ALERT] {msg}")
+            self.log("[ALERT] dispatch paused — fix issue, then press 'u' "
+                     "in dashboard to resume")
         except Exception as e:
             self.stats.failed += 1
             self.log(f"worker crashed: {claimed.id}: {e}")
@@ -161,8 +200,11 @@ class Daemon:
         if rec.requeued:
             self.log(f"requeued {len(rec.requeued)} items from crashed run "
                      f"(no resumable session)")
+        if rec.auto_recovered:
+            self.log(f"auto-recovered {len(rec.auto_recovered)} items "
+                     f"with benign last_error (shutdown/cap/stale session)")
         for item in rec.resumable:
-            runner = self.runner_factory(self.config, self.store)
+            runner = self._make_runner()
             self.stats.dispatched += 1
             self.log(f"resume: {item.id} {item.title!r} "
                      f"(session {item.session_id[:8]})")
@@ -184,7 +226,13 @@ class Daemon:
                 pass
             self.stop_event.wait(self.scan_interval)
 
-        # drain workers
+        # Kill in-flight agent subprocesses before draining worker threads.
+        # Worker threads are blocked reading subprocess stdout — without the
+        # kill, join() below would time out and the children would be
+        # orphaned at interpreter shutdown.
+        killed = self.proc_registry.kill_all(log=self.log)
+        if killed:
+            self.log(f"killed {killed} in-flight agent(s)")
         self.log(f"waiting for {len(self.workers)} worker(s)")
         for t in list(self.workers):
             t.join(timeout=30)
