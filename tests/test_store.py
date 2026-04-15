@@ -23,18 +23,25 @@ class TestStore(unittest.TestCase):
         self.store.close()
         self.td.cleanup()
 
+    def _upsert_and_queue(self, id: str) -> None:
+        """upsert_discovered now lands items in BACKLOG (so humans can gate
+        new work). Tests that exercise the downstream flow want items already
+        in QUEUED, so promote them explicitly here."""
+        self.store.upsert_discovered(_mk_item(id=id))
+        self.store.transition(id, ItemStatus.QUEUED, note="test promote")
+
     def test_upsert_new_then_duplicate(self):
         item = _mk_item()
         self.assertTrue(self.store.upsert_discovered(item))
         self.assertFalse(self.store.upsert_discovered(item))
         stored = self.store.get(item.id)
         self.assertIsNotNone(stored)
-        self.assertEqual(stored.status, ItemStatus.QUEUED)
+        self.assertEqual(stored.status, ItemStatus.BACKLOG)
         self.assertEqual(stored.tags, {"priority": "high"})
 
     def test_claim_next_queued_transitions_to_working(self):
-        self.store.upsert_discovered(_mk_item(id="a"))
-        self.store.upsert_discovered(_mk_item(id="b"))
+        self._upsert_and_queue("a")
+        self._upsert_and_queue("b")
         claimed = self.store.claim_next_queued("/wt/a", "agent/a")
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed.id, "a")  # oldest first
@@ -49,15 +56,15 @@ class TestStore(unittest.TestCase):
         self.assertIsNone(self.store.claim_next_queued("/wt", "br"))
 
     def test_pool_cap(self):
-        self.store.upsert_discovered(_mk_item(id="a"))
-        self.store.upsert_discovered(_mk_item(id="b"))
+        self._upsert_and_queue("a")
+        self._upsert_and_queue("b")
         self.assertTrue(self.store.pool_has_slot(1))
         self.store.claim_next_queued("/wt/a", "agent/a")
         self.assertFalse(self.store.pool_has_slot(1))
         self.assertTrue(self.store.pool_has_slot(2))
 
     def test_transition_records_history(self):
-        self.store.upsert_discovered(_mk_item(id="a"))
+        self._upsert_and_queue("a")
         self.store.claim_next_queued("/wt/a", "agent/a")
         self.store.transition("a", ItemStatus.AWAITING_REVIEW, note="build passed",
                               result_json='{"files": ["x.py"]}')
@@ -67,7 +74,8 @@ class TestStore(unittest.TestCase):
         history = self.store.transitions_for("a")
         statuses = [(t["from_status"], t["to_status"]) for t in history]
         self.assertEqual(statuses, [
-            (None, "queued"),
+            (None, "backlog"),
+            ("backlog", "queued"),
             ("queued", "working"),
             ("working", "awaiting_review"),
         ])

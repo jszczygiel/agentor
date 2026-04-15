@@ -73,7 +73,20 @@ class Daemon:
         t.start()
         return True
 
+    def try_fill_pool(self) -> int:
+        """Attempt to dispatch as many queued items as the current pool allows,
+        right now — bypasses the scan-interval wait. Returns how many were
+        dispatched."""
+        n = 0
+        while self._dispatch_one():
+            n += 1
+        return n
+
     def _dispatch_one(self) -> bool:
+        """Dispatch one QUEUED item if a pool slot is free. Once an item
+        reaches QUEUED (auto-promoted on discovery in auto mode, or manually
+        approved out of BACKLOG), the daemon claims it regardless of pickup
+        mode — the manual/auto gate applies at BACKLOG → QUEUED only."""
         if not self.store.pool_has_slot(self.config.agent.pool_size):
             return False
         # peek to plan worktree path before claiming (need title for slug)
@@ -144,19 +157,31 @@ class Daemon:
     def run(self) -> DaemonStats:
         if self.install_signals:
             self._install_signal_handlers()
-        recovered = recover_on_startup(self.config, self.store)
-        if recovered:
-            self.log(f"recovered {len(recovered)} items from crashed run")
+        rec = recover_on_startup(self.config, self.store)
+        if rec.requeued:
+            self.log(f"requeued {len(rec.requeued)} items from crashed run "
+                     f"(no resumable session)")
+        for item in rec.resumable:
+            runner = self.runner_factory(self.config, self.store)
+            self.stats.dispatched += 1
+            self.log(f"resume: {item.id} {item.title!r} "
+                     f"(session {item.session_id[:8]})")
+            t = threading.Thread(
+                target=self._run_worker, args=(runner, item), daemon=True,
+            )
+            self.workers.add(t)
+            t.start()
 
-        manual = self.config.agent.pickup_mode == "manual"
         while not self.stop_event.is_set():
+            # scan_once reads pickup_mode itself and promotes BACKLOG → QUEUED
+            # on auto. The daemon always dispatches QUEUED items; the
+            # auto/manual gate sits entirely at the discovery stage.
             result = scan_once(self.config, self.store)
             self.stats.scans += 1
             if result.new_items:
                 self.log(f"scan: {result.new_items} new items")
-            if not manual:
-                while self._dispatch_one():
-                    pass
+            while self._dispatch_one():
+                pass
             self.stop_event.wait(self.scan_interval)
 
         # drain workers

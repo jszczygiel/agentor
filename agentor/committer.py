@@ -51,12 +51,67 @@ def approve_and_commit(
 
 
 def reject(store: Store, item: StoredItem, feedback: str) -> None:
-    """Reject the agent's work. Keep the worktree around so the agent can retry
-    on top of the existing branch with the user's feedback."""
-    assert item.status == ItemStatus.AWAITING_REVIEW
+    """Terminal rejection. Keeps worktree+session around for forensics but
+    moves the item out of the active flow. Valid at either plan or code
+    review stage."""
+    assert item.status in (
+        ItemStatus.AWAITING_REVIEW, ItemStatus.AWAITING_PLAN_REVIEW,
+    )
     store.transition(
         item.id, ItemStatus.REJECTED,
         last_error=feedback, note="rejected by user",
+    )
+
+
+def reject_and_retry(store: Store, item: StoredItem, feedback: str) -> None:
+    """Reject the agent's output but re-queue the item so it can iterate on
+    the feedback. The runner injects `last_error` into the next prompt.
+
+    - From AWAITING_PLAN_REVIEW → QUEUED with result_json cleared, so the
+      runner re-enters the plan phase (same session via --resume).
+    - From AWAITING_REVIEW → QUEUED with result_json.phase=plan preserved,
+      so the runner re-enters the execute phase.
+
+    Attempts is reset to 0: human-driven iteration shouldn't eat the agent's
+    own retry budget."""
+    assert item.status in (
+        ItemStatus.AWAITING_REVIEW, ItemStatus.AWAITING_PLAN_REVIEW,
+    )
+    if item.status == ItemStatus.AWAITING_PLAN_REVIEW:
+        store.transition(
+            item.id, ItemStatus.QUEUED,
+            result_json=None,
+            last_error=feedback,
+            attempts=0,
+            note="plan rejected — re-plan with user feedback",
+        )
+    else:
+        store.transition(
+            item.id, ItemStatus.QUEUED,
+            last_error=feedback,
+            attempts=0,
+            note="code rejected — re-execute with user feedback",
+        )
+
+
+def approve_backlog(store: Store, item: StoredItem) -> None:
+    """Promote a backlog item to QUEUED so the daemon can dispatch it. Used
+    by the pickup UI when pickup_mode is 'manual'."""
+    assert item.status == ItemStatus.BACKLOG
+    store.transition(
+        item.id, ItemStatus.QUEUED,
+        note="approved by user (backlog → queued)",
+    )
+
+
+def approve_plan(store: Store, item: StoredItem) -> None:
+    """User approved the agent's development plan. Push the item back to QUEUED
+    so the daemon re-claims it; the runner sees the persisted plan in
+    result_json and runs the execute phase (resumes the same claude session)."""
+    assert item.status == ItemStatus.AWAITING_PLAN_REVIEW
+    store.transition(
+        item.id, ItemStatus.QUEUED,
+        note="plan approved — execute phase queued",
     )
 
 

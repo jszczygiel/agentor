@@ -4,8 +4,10 @@ from pathlib import Path
 
 
 class ItemStatus(str, Enum):
-    QUEUED = "queued"
+    BACKLOG = "backlog"              # newly discovered, awaiting user approval
+    QUEUED = "queued"                # user-approved, waiting for a worker slot
     WORKING = "working"
+    AWAITING_PLAN_REVIEW = "awaiting_plan_review"
     AWAITING_REVIEW = "awaiting_review"
     APPROVED = "approved"
     REJECTED = "rejected"

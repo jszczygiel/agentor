@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS items (
     attempts      INTEGER NOT NULL DEFAULT 0,
     last_error    TEXT,
     result_json   TEXT,
+    session_id    TEXT,
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL
 );
@@ -41,6 +42,13 @@ CREATE TABLE IF NOT EXISTS transitions (
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotent migrations for DBs created before new columns existed."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(items)")}
+    if "session_id" not in cols:
+        conn.execute("ALTER TABLE items ADD COLUMN session_id TEXT")
+
+
 @dataclass
 class StoredItem:
     id: str
@@ -55,6 +63,7 @@ class StoredItem:
     attempts: int
     last_error: str | None
     result_json: str | None
+    session_id: str | None
     created_at: float
     updated_at: float
 
@@ -73,6 +82,7 @@ def _row_to_stored(row: sqlite3.Row) -> StoredItem:
         attempts=row["attempts"],
         last_error=row["last_error"],
         result_json=row["result_json"],
+        session_id=row["session_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -95,6 +105,7 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.executescript(SCHEMA)
+        _migrate(self.conn)
         self._lock = threading.RLock()
 
     def close(self) -> None:
@@ -114,7 +125,9 @@ class Store:
 
     def upsert_discovered(self, item: Item) -> bool:
         """Insert an item seen in a source file if not already present.
-        Returns True if this was a new item (inserted), False if it already existed."""
+        Items start in BACKLOG — the caller (scan_once + config) decides
+        whether to auto-promote them to QUEUED.
+        Returns True if this was a new item, False if it already existed."""
         now = time.time()
         cur = self.conn.execute(
             "SELECT id FROM items WHERE id = ?", (item.id,)
@@ -130,13 +143,13 @@ class Store:
                 (
                     item.id, item.title, item.body, item.source_file,
                     item.source_line, json.dumps(item.tags),
-                    ItemStatus.QUEUED.value, now, now,
+                    ItemStatus.BACKLOG.value, now, now,
                 ),
             )
             c.execute(
                 """INSERT INTO transitions (item_id, from_status, to_status, at)
                    VALUES (?, NULL, ?, ?)""",
-                (item.id, ItemStatus.QUEUED.value, now),
+                (item.id, ItemStatus.BACKLOG.value, now),
             )
         return True
 
@@ -172,7 +185,8 @@ class Store:
         """Transition an item to a new status and optionally update columns
         like worktree_path, branch, attempts, last_error, result_json."""
         now = time.time()
-        allowed = {"worktree_path", "branch", "attempts", "last_error", "result_json"}
+        allowed = {"worktree_path", "branch", "attempts", "last_error",
+                   "result_json", "session_id"}
         sets = ["status = ?", "updated_at = ?"]
         params: list[object] = [to.value, now]
         for k, v in fields.items():
@@ -232,6 +246,18 @@ class Store:
 
     def pool_has_slot(self, pool_size: int) -> bool:
         return self.count_by_status(ItemStatus.WORKING) < pool_size
+
+    def update_result_json(self, item_id: str, blob: str) -> None:
+        """Write a fresh result_json for an item WITHOUT recording a status
+        transition. Used by the streaming claude runner to publish live
+        usage/cost/iterations data mid-run so the dashboard reflects the
+        current state without waiting for the phase to end."""
+        now = time.time()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE items SET result_json = ?, updated_at = ? WHERE id = ?",
+                (blob, now, item_id),
+            )
 
     def transitions_for(self, item_id: str) -> list[dict]:
         with self._lock:
