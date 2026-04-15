@@ -12,7 +12,8 @@ from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
                             ReviewConfig, SourcesConfig)
 from agentor.models import ItemStatus
 from agentor.recovery import recover_on_startup
-from agentor.runner import ClaudeRunner, StubRunner, make_runner, plan_worktree
+from agentor.runner import (ClaudeRunner, CodexRunner, StubRunner,
+                            make_runner, plan_worktree)
 from agentor.store import Store
 from agentor.watcher import scan_once
 
@@ -148,13 +149,21 @@ class TestFrontmatterMarkDone(unittest.TestCase):
         self.assertNotEqual(cp.returncode, 0)
 
 
-def _write_fake_claude(bin_dir: Path, script: str) -> Path:
+def _write_fake_cli(bin_dir: Path, name: str, script: str) -> Path:
     bin_dir.mkdir(parents=True, exist_ok=True)
-    fake = bin_dir / "claude"
+    fake = bin_dir / name
     fake.write_text("#!/bin/sh\n" + script)
     st = os.stat(fake)
     os.chmod(fake, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return fake
+
+
+def _write_fake_claude(bin_dir: Path, script: str) -> Path:
+    return _write_fake_cli(bin_dir, "claude", script)
+
+
+def _write_fake_codex(bin_dir: Path, script: str) -> Path:
+    return _write_fake_cli(bin_dir, "codex", script)
 
 
 class TestClaudeRunner(unittest.TestCase):
@@ -292,11 +301,18 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"here is the plan",
         self.assertEqual(data["phase"], "plan")
         self.assertEqual(data["plan"], "here is the plan")
         self.assertEqual(data["num_turns"], 2)
+        self.assertEqual(data["progress"]["last_event_type"], "result")
+        self.assertIn("finished: end_turn", data["progress"]["activity"])
         self.assertNotIn("total_cost_usd", data)
         iters = data["iterations"]
         self.assertEqual(len(iters), 2)
         self.assertEqual(iters[-1]["cache_read_input_tokens"], 5300)
         self.assertIn("claude-opus-4-6", data["modelUsage"])
+        transcript = (
+            self.root / ".agentor" / "transcripts" / f"{claimed.id}.plan.log"
+        ).read_text()
+        self.assertIn('"type":"assistant"', transcript)
+        self.assertIn("exit: 0", transcript)
 
     def test_claude_runner_plan_phase_lands_in_plan_review(self):
         """First run (no prior session) is the planning phase; item lands in
@@ -347,6 +363,143 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"here is the plan",
         self.assertIsNotNone(result.error)
         self.assertIn("timed out", result.error)
 
+
+class TestCodexRunner(unittest.TestCase):
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name) / "proj"
+        self.root.mkdir()
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] Add hello file\n  greet world\n")
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _run_with_fake(self, script: str, full_cycle: bool = True) -> tuple:
+        bin_dir = Path(self.td.name) / "bin"
+        _write_fake_codex(bin_dir, script)
+        cfg = Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[], mark_done=False),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                runner="codex", model="gpt-5-codex", pool_size=1,
+                command=[str(bin_dir / "codex"), "exec", "--json",
+                         "-m", "{model}", "-o", "{output_path}", "{prompt}"],
+                resume_command=[
+                    str(bin_dir / "codex"), "exec", "resume", "{session_id}",
+                    "--json", "-m", "{model}", "-o", "{output_path}", "{prompt}",
+                ],
+                plan_prompt_template="PLAN: {title}",
+                execute_prompt_template="EXEC: {title}\nplan={plan}",
+                timeout_seconds=10,
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        runner = make_runner(cfg, self.store)
+        self.assertIsInstance(runner, CodexRunner)
+        result = runner.run(claimed)
+        if not full_cycle or result.error:
+            return cfg, claimed, result
+        fresh = self.store.get(claimed.id)
+        if fresh.status != ItemStatus.AWAITING_PLAN_REVIEW:
+            return cfg, claimed, result
+        approve_plan(self.store, fresh)
+        wt2, br2 = plan_worktree(cfg, fresh)
+        claimed2 = self.store.claim_next_queued(str(wt2), br2)
+        exec_result = runner.run(claimed2)
+        return cfg, claimed2, exec_result
+
+    def test_codex_runner_plan_phase_persists_thread_id(self):
+        script = r"""
+set -e
+mode="new"
+if [ "$1" = "exec" ]; then
+  shift
+fi
+if [ "$1" = "resume" ]; then
+  mode="resume"
+  shift
+  sess="$1"
+  shift
+fi
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) shift ;;
+    -m) shift 2 ;;
+    -o) out="$2"; shift 2 ;;
+    *) prompt="$1"; shift ;;
+  esac
+done
+if [ "$mode" = "new" ]; then
+  printf '%s\n' '{"type":"thread.started","thread_id":"thread-123"}'
+  printf '%s\n' '{"type":"turn.started"}'
+  printf 'codex plan text' > "$out"
+else
+  printf '%s\n' '{"type":"thread.started","thread_id":"thread-123"}'
+  printf '%s\n' '{"type":"turn.started"}'
+  printf 'codex execute text' > "$out"
+fi
+"""
+        _, claimed, result = self._run_with_fake(script, full_cycle=False)
+        self.assertIsNone(result.error, msg=result.error)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_PLAN_REVIEW)
+        self.assertEqual(refreshed.session_id, "thread-123")
+        data = json.loads(refreshed.result_json)
+        self.assertEqual(data["phase"], "plan")
+        self.assertEqual(data["plan"], "codex plan text")
+        self.assertEqual(data["progress"]["last_event_type"], "turn.started")
+        self.assertEqual(data["progress"]["activity"], "turn 1 started")
+
+    def test_codex_runner_committed_change(self):
+        script = r"""
+set -e
+mode="new"
+if [ "$1" = "exec" ]; then
+  shift
+fi
+if [ "$1" = "resume" ]; then
+  mode="resume"
+  shift
+  sess="$1"
+  shift
+fi
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) shift ;;
+    -m) shift 2 ;;
+    -o) out="$2"; shift 2 ;;
+    *) prompt="$1"; shift ;;
+  esac
+done
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-123"}'
+printf '%s\n' '{"type":"turn.started"}'
+if [ "$mode" = "new" ]; then
+  printf 'codex plan text' > "$out"
+  exit 0
+fi
+echo "HELLO" > hello.txt
+git add hello.txt
+git -c user.email=x -c user.name=x commit -q -m "add hello"
+printf 'codex execute text' > "$out"
+"""
+        _, claimed, result = self._run_with_fake(script)
+        self.assertIsNone(result.error, msg=result.error)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_REVIEW)
+        data = json.loads(refreshed.result_json)
+        self.assertEqual(data.get("phase"), "execute")
+        self.assertIn("hello.txt", data["files_changed"])
 
 class TestDeferred(unittest.TestCase):
     def setUp(self):

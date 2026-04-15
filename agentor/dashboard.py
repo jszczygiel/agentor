@@ -218,6 +218,20 @@ def _fmt_elapsed(sec: float | None) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def _fmt_relative_age(sec: float | None) -> str:
+    if sec is None:
+        return "—"
+    if sec < 1:
+        return "just now"
+    if sec < 60:
+        return f"{int(sec)}s ago"
+    m, s = divmod(int(sec), 60)
+    if m < 60:
+        return f"{m}m {s:02d}s ago"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m ago"
+
+
 # Table column layout. The TITLE column gets whatever width remains.
 _COL_ID = 10      # 8 chars + 2 pad
 _COL_STATE = 18   # widest status name + pad
@@ -241,6 +255,35 @@ def _result_data(item: StoredItem) -> dict | None:
         return json.loads(item.result_json)
     except json.JSONDecodeError:
         return None
+
+
+def _progress_data(item: StoredItem) -> dict:
+    data = _result_data(item) or {}
+    progress = data.get("progress")
+    return progress if isinstance(progress, dict) else {}
+
+
+def _phase_for(item: StoredItem) -> str | None:
+    data = _result_data(item) or {}
+    phase = data.get("phase")
+    return phase if isinstance(phase, str) and phase else None
+
+
+def _transcript_path_for(cfg: Config, item: StoredItem) -> Path:
+    phase = _phase_for(item)
+    if not phase:
+        phase = "execute" if item.session_id else "plan"
+    return (
+        cfg.project_root / ".agentor" / "transcripts" / f"{item.id}.{phase}.log"
+    )
+
+
+def _tail_lines(path: Path, limit: int = 12) -> list[str]:
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    return lines[-limit:]
 
 
 def _tokens_for_model(mu_entry: dict) -> int:
@@ -603,6 +646,9 @@ def _inspect_render(stdscr, cfg: Config, store: Store, item: StoredItem) -> None
 
 def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str]:
     out: list[str] = []
+    data = _result_data(item)
+    progress = _progress_data(item)
+    transcript_path = _transcript_path_for(cfg, item)
     out.append(f"id:       {item.id}")
     out.append(f"title:    {item.title}")
     out.append(f"state:    {item.status.value}")
@@ -614,13 +660,36 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
     elapsed = _elapsed_for(store, item.id)
     if elapsed is not None:
         out.append(f"elapsed:  {_fmt_elapsed(elapsed)} (since enter WORKING)")
-    data = _result_data(item)
+    if progress:
+        last_event_at = progress.get("last_event_at")
+        age = None
+        if isinstance(last_event_at, (int, float)):
+            age = max(0.0, time.time() - float(last_event_at))
+        activity = progress.get("activity")
+        event_type = progress.get("last_event_type")
+        live_state = "stalled" if item.status == ItemStatus.WORKING and age is not None and age >= 60 else "active"
+        out.append(f"live:     {live_state} ({_fmt_relative_age(age)})")
+        if isinstance(activity, str) and activity:
+            out.append(f"doing:    {activity}")
+        if isinstance(event_type, str) and event_type:
+            out.append(f"event:    {event_type}")
+    if transcript_path.exists():
+        out.append(f"log:      {transcript_path}")
     if not data:
         out.append("")
         out.append("(no agent result yet — no token data)")
+        tail = _tail_lines(transcript_path)
+        if tail:
+            out.append("")
+            out.append("── transcript tail ──")
+            out.extend(tail)
         return out
     out.append("")
     out.append("── agent run ──")
+    if data.get("live"):
+        out.append("stream:   live")
+    if data.get("phase"):
+        out.append(f"phase:    {data['phase']}")
     if "num_turns" in data:
         out.append(f"turns:    {data['num_turns']}")
     if "duration_ms" in data:
@@ -666,6 +735,11 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
                 out.append(f"  {ln[:300]}")
             if f.get("transcript_path"):
                 out.append(f"  transcript: {f['transcript_path']}")
+    tail = _tail_lines(transcript_path)
+    if tail:
+        out.append("")
+        out.append("── transcript tail ──")
+        out.extend(tail)
     return out
 
 
@@ -973,5 +1047,4 @@ def _build_commit_message(item: StoredItem) -> str:
     if not summary or summary == subject:
         return f"{subject}\n\nAgent work for item {item.id}."
     return f"{subject}\n\n{summary}\n\nAgent work for item {item.id}."
-
 

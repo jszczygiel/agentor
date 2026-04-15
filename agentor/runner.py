@@ -113,12 +113,15 @@ def _is_infrastructure_error(msg: str) -> bool:
 
 
 def _is_dead_session_error(msg: str) -> bool:
-    """Detect claude's "No conversation found with session ID: …" error.
-    Means our persisted session_id no longer exists in claude's local
-    storage (cleared, expired, or never made it to disk after a crash).
-    Resuming with that id will keep failing — we need to drop the id and
-    start a fresh session, but without losing the approved plan."""
-    return "no conversation found with session id" in (msg or "").lower()
+    """Detect CLI resume failures caused by a missing persisted session."""
+    low = (msg or "").lower()
+    needles = (
+        "no conversation found with session id",
+        "session not found",
+        "thread not found",
+        "thread/start failed",
+    )
+    return any(n in low for n in needles)
 
 
 def _is_shutdown_error(msg: str) -> bool:
@@ -190,8 +193,8 @@ class Runner:
         files_changed: list[str] | None = None,
     ) -> None:
         """Write a failure row for diagnostics. Pulls turns/duration from
-        the last claude run if available (populated by
-        `_invoke_claude_*` into self._last_usage). Safe for subclasses
+        the last agent run if available (populated by runner-specific
+        invoke helpers into self._last_usage). Safe for subclasses
         without that attribute — falls back to None fields."""
         usage = getattr(self, "_last_usage", None) or {}
         phase_tag = getattr(self, "_last_phase", phase)
@@ -299,7 +302,7 @@ class Runner:
                     self.store.note_infra_failure(item.id, last_error)
                     raise InfrastructureError(last_error)
                 if _is_dead_session_error(last_error) and item.session_id:
-                    # claude lost the session. Resuming with the same id
+                    # The provider lost the session. Resuming with the same id
                     # will keep failing on every attempt until rejection —
                     # drop the session_id, refund the attempt, and bounce
                     # back to QUEUED so the next dispatch starts a fresh
@@ -311,7 +314,7 @@ class Runner:
                         worktree_path=None, branch=None, session_id=None,
                         attempts=max(0, item.attempts - 1),
                         last_error=last_error,
-                        note="claude session lost; restart with fresh session",
+                        note="agent session lost; restart with fresh session",
                     )
                     return RunResult(item.id, wt_path, branch, "", [], "",
                                      error=last_error)
@@ -491,7 +494,10 @@ class ClaudeRunner(Runner):
 
         Legacy non-streaming commands (no stream-json) still work — we detect
         the output format and fall back to blocking subprocess.run."""
-        args = [a.format(prompt=prompt) for a in self.config.agent.command]
+        args = [
+            a.format(prompt=prompt, model=self.config.agent.model)
+            for a in (self.config.agent.command or _default_claude_command())
+        ]
 
         # Session id: pre-generated + persisted before the child starts so a
         # mid-run crash can be recovered via `claude --resume <id>` on the
@@ -642,9 +648,13 @@ class ClaudeRunner(Runner):
         stdout_buf: list[str] = []
         cap_reason: str | None = None
         max_turns = int(self.config.agent.max_turns or 0)
+        transcript_lines = [f"args: {args}\n", "stdout:\n"]
+        transcript_path.write_text("".join(transcript_lines))
         try:
             for line in iter(p.stdout.readline, ""):
                 stdout_buf.append(line)
+                with transcript_path.open("a") as fh:
+                    fh.write(line)
                 stripped = line.strip()
                 if not stripped:
                     continue
@@ -690,11 +700,9 @@ class ClaudeRunner(Runner):
 
         stdout_text = "".join(stdout_buf)
         stderr_text = "".join(stderr_chunks)
-        transcript_path.write_text(
-            f"exit: {p.returncode}\n"
-            f"args: {args}\n\n"
-            f"stdout:\n{stdout_text}\n\nstderr:\n{stderr_text}\n"
-        )
+        with transcript_path.open("a") as fh:
+            fh.write(f"\n\nstderr:\n{stderr_text}\n")
+            fh.write(f"\nexit: {p.returncode}\n")
         if timed_out.is_set():
             raise RuntimeError(
                 f"claude timed out after {self.config.agent.timeout_seconds}s"
@@ -726,6 +734,231 @@ class ClaudeRunner(Runner):
             pass
 
 
+class CodexRunner(Runner):
+    """Spawns a headless `codex exec` subprocess inside the worktree. Keeps
+    the same two-phase flow as Claude by persisting the `thread_id` emitted
+    by Codex and resuming it during execution."""
+
+    def do_work(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
+        prior = _parse_result_json(item.result_json)
+        if prior.get("phase") == "plan":
+            return self._do_execute(item, worktree, prior.get("plan", ""))
+        if self.config.agent.single_phase:
+            return self._do_execute(
+                item, worktree, "(no plan; spec is in the task body)",
+            )
+        return self._do_plan(item, worktree)
+
+    def _do_plan(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
+        prompt = self.config.agent.plan_prompt_template.format(
+            title=item.title, body=item.body, source_file=item.source_file,
+        )
+        prompt = self._prepend_feedback(item, prompt, phase="plan")
+        output_path = self._last_message_path(item, "plan")
+        _, stdout = self._invoke_codex(item, worktree, prompt, output_path)
+        plan_text = _read_output_message(output_path)
+        if not plan_text:
+            plan_text = (
+                getattr(self, "_last_usage", None) or {}
+            ).get("result") or _extract_codex_result(stdout) or "(no plan text returned)"
+        self._last_phase = "plan"
+        return plan_text, []
+
+    def _do_execute(
+        self, item: StoredItem, worktree: Path, plan: str,
+    ) -> tuple[str, list[str]]:
+        prompt = self.config.agent.execute_prompt_template.format(
+            title=item.title, body=item.body, source_file=item.source_file,
+            plan=plan,
+        )
+        prompt = self._prepend_feedback(item, prompt, phase="execute")
+        output_path = self._last_message_path(item, "execute")
+        summary, stdout = self._invoke_codex(item, worktree, prompt, output_path)
+        files = _list_changes(worktree, self.config.git.base_branch)
+        final_message = _read_output_message(output_path)
+        if final_message:
+            summary = final_message
+        summary = _derive_summary(worktree, summary or stdout, item.title)
+        self._last_phase = "execute"
+        return summary, files
+
+    def _prepend_feedback(self, item: StoredItem, prompt: str, phase: str) -> str:
+        if not item.feedback:
+            return prompt
+        hint = ("Produce a revised plan." if phase == "plan"
+                else "Address this feedback during execution.")
+        feedback = item.feedback
+        max_len = 800
+        if len(feedback) > max_len:
+            half = (max_len - 20) // 2
+            feedback = (
+                f"{feedback[:half]}\n\n[…truncated…]\n\n{feedback[-half:]}"
+            )
+        block = (
+            "REVIEWER FEEDBACK FROM A PREVIOUS REJECTED ATTEMPT:\n"
+            f"{feedback}\n\n"
+            f"{hint}\n\n"
+        )
+        self.store.conn.execute(
+            "UPDATE items SET feedback = NULL WHERE id = ?", (item.id,)
+        )
+        return block + prompt
+
+    def _last_message_path(self, item: StoredItem, phase_tag: str) -> Path:
+        return (
+            self.config.project_root / ".agentor" / "transcripts"
+            / f"{item.id}.{phase_tag}.last-message.txt"
+        )
+
+    def _invoke_codex(
+        self, item: StoredItem, worktree: Path, prompt: str, output_path: Path,
+    ) -> tuple[str, str]:
+        phase_tag = "execute" if item.session_id else "plan"
+        transcript_path = (
+            self.config.project_root / ".agentor" / "transcripts"
+            / f"{item.id}.{phase_tag}.log"
+        )
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.exists():
+            output_path.unlink()
+        args = self._codex_args(item, prompt, output_path)
+        return self._invoke_codex_jsonl(
+            item, args, worktree, transcript_path, output_path, phase_tag,
+        )
+
+    def _codex_args(
+        self, item: StoredItem, prompt: str, output_path: Path,
+    ) -> list[str]:
+        values = {
+            "prompt": prompt,
+            "model": self.config.agent.model,
+            "session_id": item.session_id or "",
+            "output_path": str(output_path),
+        }
+        if item.session_id:
+            tmpl = (
+                self.config.agent.resume_command
+                or _default_codex_resume_command()
+            )
+        else:
+            tmpl = self.config.agent.command or _default_codex_command()
+        return [a.format(**values) for a in tmpl]
+
+    def _invoke_codex_jsonl(
+        self, item: StoredItem, args: list[str], worktree: Path,
+        transcript_path: Path, output_path: Path, phase_tag: str,
+    ) -> tuple[str, str]:
+        try:
+            p = subprocess.Popen(
+                args, cwd=worktree,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1, start_new_session=True,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"codex CLI not found. First arg was: {args[0]!r}. "
+                f"Install codex or set agent.command/agent.resume_command in agentor.toml."
+            )
+        if self.proc_registry is not None:
+            self.proc_registry.register(item.id, p)
+
+        timed_out = threading.Event()
+
+        def _on_timeout():
+            timed_out.set()
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+        timer = threading.Timer(self.config.agent.timeout_seconds, _on_timeout)
+        timer.daemon = True
+        timer.start()
+
+        stderr_chunks: list[str] = []
+
+        def _drain_stderr():
+            try:
+                for line in iter(p.stderr.readline, ""):
+                    stderr_chunks.append(line)
+            except Exception:
+                pass
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        state = _CodexStreamState(item_id=item.id, phase=phase_tag)
+        stdout_buf: list[str] = []
+        transcript_path.write_text(f"args: {args}\n\nstdout:\n")
+        try:
+            for line in iter(p.stdout.readline, ""):
+                stdout_buf.append(line)
+                with transcript_path.open("a") as fh:
+                    fh.write(line)
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    ev = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                state.ingest(ev)
+                if state.session_id and state.session_id != item.session_id:
+                    self.store.transition(
+                        item.id, ItemStatus.WORKING,
+                        session_id=state.session_id,
+                        note="session id assigned",
+                    )
+                    item = self.store.get(item.id)
+                self._publish_live(item.id, state)
+            p.wait(timeout=5)
+        finally:
+            timer.cancel()
+            if self.proc_registry is not None:
+                self.proc_registry.unregister(item.id)
+            try:
+                p.stdout.close()
+            except Exception:
+                pass
+            stderr_thread.join(timeout=2)
+            try:
+                p.stderr.close()
+            except Exception:
+                pass
+
+        stdout_text = "".join(stdout_buf)
+        stderr_text = "".join(stderr_chunks)
+        with transcript_path.open("a") as fh:
+            fh.write(f"\n\nstderr:\n{stderr_text}\n")
+            fh.write(f"\nexit: {p.returncode}\n")
+        if timed_out.is_set():
+            raise RuntimeError(
+                f"codex timed out after {self.config.agent.timeout_seconds}s"
+            )
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise RuntimeError("codex killed: agentor shutdown")
+        if p.returncode not in (0, None):
+            tail = (stderr_text or stdout_text)[-500:].strip()
+            raise RuntimeError(f"codex exited {p.returncode}: {tail}")
+        result_text = _read_output_message(output_path) or _extract_codex_result(stdout_text)
+        self._last_usage = state.envelope(result_text=result_text)
+        return result_text or "", stdout_text
+
+    def _publish_live(self, item_id: str, state: "_CodexStreamState") -> None:
+        try:
+            blob = json.dumps({
+                "phase": state.phase,
+                "live": True,
+                **state.envelope(),
+            })
+            self.store.update_result_json(item_id, blob)
+        except Exception:
+            pass
+
+
 class _StreamState:
     """Accumulator for claude stream-json events. Builds the same envelope
     shape as the blocking `--output-format json` path (usage, iterations,
@@ -736,6 +969,9 @@ class _StreamState:
         self.item_id = item_id
         self.phase = phase
         self.session_id: str | None = None
+        self.last_event_at: float | None = None
+        self.last_event_type: str | None = None
+        self.activity: str | None = None
         self.iterations: list[dict] = []
         self.num_turns: int = 0
         self.stop_reason: str | None = None
@@ -749,9 +985,12 @@ class _StreamState:
 
     def ingest(self, ev: dict) -> None:
         etype = ev.get("type")
+        self.last_event_at = time.time()
+        self.last_event_type = str(etype or "unknown")
         if etype == "system" and ev.get("subtype") == "init":
             if ev.get("session_id"):
                 self.session_id = ev["session_id"]
+            self.activity = "session initialized"
             return
         if etype == "assistant":
             msg = ev.get("message") or {}
@@ -760,6 +999,7 @@ class _StreamState:
                 return
             model = msg.get("model") or "unknown"
             self.num_turns += 1
+            self.activity = f"assistant turn {self.num_turns} finished on {model}"
             self.iterations.append({
                 "input_tokens": int(usage.get("input_tokens", 0) or 0),
                 "output_tokens": int(usage.get("output_tokens", 0) or 0),
@@ -788,6 +1028,7 @@ class _StreamState:
                 self.num_turns = int(ev["num_turns"])
             if ev.get("stop_reason"):
                 self.stop_reason = ev["stop_reason"]
+                self.activity = f"finished: {self.stop_reason}"
             if ev.get("duration_ms") is not None:
                 self.duration_ms = int(ev["duration_ms"])
             if ev.get("duration_api_ms") is not None:
@@ -827,6 +1068,77 @@ class _StreamState:
             out["session_id"] = self.session_id
         if self.result_text:
             out["result"] = self.result_text
+        progress: dict[str, object] = {}
+        if self.last_event_at is not None:
+            progress["last_event_at"] = self.last_event_at
+        if self.last_event_type:
+            progress["last_event_type"] = self.last_event_type
+        if self.activity:
+            progress["activity"] = self.activity
+        if progress:
+            out["progress"] = progress
+        return out
+
+
+class _CodexStreamState:
+    """Minimal JSONL accumulator for `codex exec --json` output."""
+
+    def __init__(self, item_id: str, phase: str):
+        self.item_id = item_id
+        self.phase = phase
+        self.session_id: str | None = None
+        self.last_event_at: float | None = None
+        self.last_event_type: str | None = None
+        self.activity: str | None = None
+        self.num_turns: int = 0
+        self.result_text: str | None = None
+        self.last_error: str | None = None
+
+    def ingest(self, ev: dict) -> None:
+        etype = ev.get("type")
+        self.last_event_at = time.time()
+        self.last_event_type = str(etype or "unknown")
+        if etype == "thread.started" and ev.get("thread_id"):
+            self.session_id = str(ev["thread_id"])
+            self.activity = "thread started"
+            return
+        if etype == "turn.started":
+            self.num_turns += 1
+            self.activity = f"turn {self.num_turns} started"
+            return
+        if etype == "error" and ev.get("message"):
+            self.last_error = str(ev["message"])
+            self.activity = f"error: {self.last_error[:120]}"
+            return
+        for key in ("message", "last_message", "result"):
+            val = ev.get(key)
+            if isinstance(val, str) and val.strip():
+                self.result_text = val
+                snippet = " ".join(val.strip().split())
+                self.activity = f"message received: {snippet[:120]}"
+
+    def envelope(self, result_text: str | None = None) -> dict:
+        out: dict = {
+            "usage": {},
+            "iterations": [],
+            "modelUsage": {},
+            "num_turns": self.num_turns,
+        }
+        if self.session_id:
+            out["session_id"] = self.session_id
+        if result_text or self.result_text:
+            out["result"] = result_text or self.result_text
+        if self.last_error:
+            out["stop_reason"] = self.last_error
+        progress: dict[str, object] = {}
+        if self.last_event_at is not None:
+            progress["last_event_at"] = self.last_event_at
+        if self.last_event_type:
+            progress["last_event_type"] = self.last_event_type
+        if self.activity:
+            progress["activity"] = self.activity
+        if progress:
+            out["progress"] = progress
         return out
 
 
@@ -850,6 +1162,23 @@ def _extract_result_field(stdout: str) -> str | None:
         return None
     result = obj.get("result")
     return result if isinstance(result, str) and result.strip() else None
+
+
+def _extract_codex_result(stdout: str) -> str | None:
+    """Best-effort extraction of the final message from Codex JSONL output."""
+    last: str | None = None
+    for line in (stdout or "").splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        for key in ("last_message", "message", "result"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                last = val
+    return last
 
 
 def _parse_result_json(blob: str | None) -> dict:
@@ -895,6 +1224,41 @@ def _parse_usage(stdout: str) -> dict | None:
     return out or None
 
 
+def _read_output_message(path: Path) -> str | None:
+    try:
+        text = path.read_text().strip()
+    except FileNotFoundError:
+        return None
+    return text or None
+
+
+def _default_codex_command() -> list[str]:
+    return [
+        "codex", "exec", "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-m", "{model}",
+        "-o", "{output_path}",
+        "{prompt}",
+    ]
+
+
+def _default_claude_command() -> list[str]:
+    return [
+        "claude", "-p", "{prompt}", "--dangerously-skip-permissions",
+        "--output-format", "stream-json", "--verbose",
+    ]
+
+
+def _default_codex_resume_command() -> list[str]:
+    return [
+        "codex", "exec", "resume", "{session_id}", "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-m", "{model}",
+        "-o", "{output_path}",
+        "{prompt}",
+    ]
+
+
 def _list_changes(worktree: Path, base_branch: str) -> list[str]:
     committed = subprocess.run(
         ["git", "diff", "--name-only", f"{base_branch}..HEAD"],
@@ -931,4 +1295,6 @@ def make_runner(config: Config, store: Store) -> Runner:
         return StubRunner(config, store)
     if kind == "claude":
         return ClaudeRunner(config, store)
+    if kind == "codex":
+        return CodexRunner(config, store)
     raise ValueError(f"unknown agent.runner: {kind!r}")
