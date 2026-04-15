@@ -21,16 +21,15 @@ class AgentConfig:
     model: str = "claude-opus-4-6"
     max_attempts: int = 3
     pool_size: int = 1  # max concurrent agents working on items
-    runner: str = "stub"  # "stub" | "claude"
-    # Command template for the claude runner. "{prompt}" is replaced per item.
-    # --output-format stream-json + --verbose stream per-turn events so the
-    # runner can update CTX% and token counts live while the agent is still
-    # running. Do NOT add --session-id or --resume here; the runner appends
-    # them per-item so crashed agents can be resumed on restart.
-    command: list[str] = field(default_factory=lambda: [
-        "claude", "-p", "{prompt}", "--dangerously-skip-permissions",
-        "--output-format", "stream-json", "--verbose",
-    ])
+    runner: str = "stub"  # "stub" | "claude" | "codex"
+    # Advanced override for the selected runner's base command template.
+    # Normal configs should not need this; each runner has built-in Python
+    # defaults. Supported placeholders: {prompt}, {model}, {output_path}.
+    command: list[str] = field(default_factory=list)
+    # Advanced override used by the codex runner when resuming an existing
+    # session. Supported placeholders: {session_id}, {prompt}, {model},
+    # {output_path}. Normal configs should not need this.
+    resume_command: list[str] = field(default_factory=list)
     # Total context window in tokens (Opus 4.6 1M variant = 1_000_000;
     # standard Opus = 200_000). Used to compute CTX% in the dashboard.
     context_window: int = 200_000

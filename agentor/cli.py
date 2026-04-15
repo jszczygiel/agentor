@@ -60,6 +60,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         'mode = "checkbox"\n'
         '\n'
         '[agent]\n'
+        'runner = "claude"\n'
         'model = "claude-opus-4-6"\n'
         'max_attempts = 3\n'
         'pool_size = 1\n'
