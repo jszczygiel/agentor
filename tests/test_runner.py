@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from agentor.committer import approve_and_commit, reject, retry
+from agentor.committer import approve_and_commit, defer, reject, restore_deferred, retry
 from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
                             ReviewConfig, SourcesConfig)
 from agentor.models import ItemStatus
@@ -261,6 +261,48 @@ git -c user.email=x -c user.name=x commit -q -m "add hello"
         result = make_runner(cfg, self.store).run(claimed)
         self.assertIsNotNone(result.error)
         self.assertIn("timed out", result.error)
+
+
+class TestDeferred(unittest.TestCase):
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] one\n- [ ] two\n")
+        self.cfg = Config(
+            project_name="t", project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(pool_size=1, max_attempts=1),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        self.store = Store(self.root / ".agentor" / "state.db")
+        scan_once(self.cfg, self.store)
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def test_defer_from_queued_then_restore(self):
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        defer(self.store, item)
+        self.assertEqual(self.store.get(item.id).status, ItemStatus.DEFERRED)
+        target = restore_deferred(self.store, self.store.get(item.id))
+        self.assertEqual(target, ItemStatus.QUEUED)
+        self.assertEqual(self.store.get(item.id).status, ItemStatus.QUEUED)
+
+    def test_defer_from_awaiting_then_restore(self):
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(self.cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        StubRunner(self.cfg, self.store).run(claimed)
+        item = self.store.get(claimed.id)
+        self.assertEqual(item.status, ItemStatus.AWAITING_REVIEW)
+        defer(self.store, item)
+        self.assertEqual(self.store.get(item.id).status, ItemStatus.DEFERRED)
+        target = restore_deferred(self.store, self.store.get(item.id))
+        self.assertEqual(target, ItemStatus.AWAITING_REVIEW)
 
 
 class TestDaemonPickupModes(unittest.TestCase):

@@ -64,3 +64,26 @@ def retry(store: Store, item: StoredItem) -> None:
     """Re-queue a rejected item for another attempt. Keeps the existing worktree."""
     assert item.status == ItemStatus.REJECTED
     store.transition(item.id, ItemStatus.QUEUED, note="retry after rejection")
+
+
+def defer(store: Store, item: StoredItem) -> None:
+    """Set an item aside without acting on it. Used by skip in the pickup
+    and review pickers. Restorable via `restore_deferred`."""
+    store.transition(
+        item.id, ItemStatus.DEFERRED,
+        note=f"deferred from {item.status.value}",
+    )
+
+
+def restore_deferred(store: Store, item: StoredItem) -> ItemStatus:
+    """Bring a deferred item back to its previous status (the last non-deferred
+    status in its history). Returns the restored status."""
+    assert item.status == ItemStatus.DEFERRED
+    history = store.transitions_for(item.id)
+    prior = ItemStatus.QUEUED  # default if history somehow has nothing
+    for t in reversed(history):
+        if t["from_status"] and t["from_status"] != ItemStatus.DEFERRED.value:
+            prior = ItemStatus(t["from_status"])
+            break
+    store.transition(item.id, prior, note=f"restored from deferred -> {prior.value}")
+    return prior

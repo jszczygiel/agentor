@@ -1,5 +1,6 @@
 import curses
 import json
+import subprocess
 import time
 from collections import deque
 from pathlib import Path
@@ -10,7 +11,21 @@ from .git_ops import diff_vs_base
 from .models import ItemStatus
 from .store import Store, StoredItem
 
-ACTIONS = "[s]tatus  [l]ist  [p]ickup  [r]eview  [q]uit"
+ACTIONS = "[s]tatus  [l]ist  [p]ickup  [r]eview  [d]eferred  [tab]filter  [q]uit"
+
+# Filter views: ordered list cycled by Tab. Each entry maps a filter name
+# to the statuses to display (None = all).
+FILTERS: list[tuple[str, list[ItemStatus] | None]] = [
+    ("main", [ItemStatus.WORKING, ItemStatus.AWAITING_REVIEW,
+              ItemStatus.QUEUED, ItemStatus.REJECTED]),
+    ("queued", [ItemStatus.QUEUED]),
+    ("working", [ItemStatus.WORKING]),
+    ("awaiting", [ItemStatus.AWAITING_REVIEW]),
+    ("deferred", [ItemStatus.DEFERRED]),
+    ("merged", [ItemStatus.MERGED]),
+    ("rejected", [ItemStatus.REJECTED]),
+    ("all", None),
+]
 REFRESH_MS = 500
 
 
@@ -26,9 +41,9 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
     stdscr.timeout(REFRESH_MS)
     _init_colors()
 
-    view = "main"  # "main" | "list"
+    filter_idx = 0  # index into FILTERS
     while True:
-        _render(stdscr, cfg, store, daemon, log_ring, view)
+        _render(stdscr, cfg, store, daemon, log_ring, filter_idx)
         ch = stdscr.getch()
         if ch == -1:
             continue
@@ -36,17 +51,18 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
         if k == "q":
             return
         if k == "s":
-            view = "main"
+            filter_idx = 0  # back to main
         elif k == "l":
-            view = "list"
+            # "all" view
+            filter_idx = next(i for i, (n, _) in enumerate(FILTERS) if n == "all")
         elif k == "r":
             _review_mode(stdscr, cfg, store)
-            view = "main"
         elif k == "p":
             _pickup_mode(stdscr, cfg, store, daemon)
-            view = "main"
+        elif k == "d":
+            _deferred_mode(stdscr, cfg, store)
         elif k == "\t":
-            view = "list" if view == "main" else "main"
+            filter_idx = (filter_idx + 1) % len(FILTERS)
 
 
 def _init_colors():
@@ -73,13 +89,14 @@ def _status_color(status: ItemStatus) -> int:
     }.get(status, 0)
 
 
-def _render(stdscr, cfg, store, daemon, log_ring, view):
+def _render(stdscr, cfg, store, daemon, log_ring, filter_idx):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     row = 0
 
-    # header bar
-    title = f" agentor — {cfg.project_name} "
+    # header bar — show project + active filter
+    filter_name, _ = FILTERS[filter_idx]
+    title = f" agentor — {cfg.project_name}    filter: {filter_name} ({filter_idx + 1}/{len(FILTERS)}) "
     _safe_addstr(stdscr, row, 0, title.ljust(w), w,
                  curses.A_BOLD | curses.A_REVERSE)
     row += 1
@@ -119,6 +136,7 @@ def _render(stdscr, cfg, store, daemon, log_ring, view):
         f" queued={counts[ItemStatus.QUEUED]}  "
         f"working={counts[ItemStatus.WORKING]}  "
         f"awaiting={counts[ItemStatus.AWAITING_REVIEW]}  "
+        f"deferred={counts[ItemStatus.DEFERRED]}  "
         f"merged={counts[ItemStatus.MERGED]}  "
         f"rejected={counts[ItemStatus.REJECTED]}"
     )
@@ -130,14 +148,9 @@ def _render(stdscr, cfg, store, daemon, log_ring, view):
     # body table
     body_top = row
     body_height = h - body_top - 1  # leave 1 line for log
-    if view == "main":
-        _render_table(stdscr, store, body_top, body_height, w,
-                      [ItemStatus.WORKING, ItemStatus.AWAITING_REVIEW,
-                       ItemStatus.QUEUED, ItemStatus.REJECTED],
-                      cfg.agent.context_window)
-    elif view == "list":
-        _render_table(stdscr, store, body_top, body_height, w,
-                      list(ItemStatus), cfg.agent.context_window)
+    _, filter_statuses = FILTERS[filter_idx]
+    statuses = filter_statuses if filter_statuses is not None else list(ItemStatus)
+    _render_table(stdscr, store, body_top, body_height, w, statuses)
 
     # log tail
     log_row = h - 1
@@ -182,14 +195,24 @@ def _fmt_elapsed(sec: float | None) -> str:
 _COL_ID = 9       # 8 chars + 1 pad
 _COL_STATE = 18   # widest status name + pad
 _COL_ELAPSED = 9
-_COL_CTX = 7
+_COL_TOK = 8
 _COL_SOURCE = 26
 
 
-def _ctx_pct(item: StoredItem, context_window: int) -> str:
-    """Return a short '12%' string from the agent's reported usage, or '—'
-    if no usage is recorded yet."""
-    if not item.result_json or context_window <= 0:
+def _fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def _tokens_used(item: StoredItem) -> str:
+    """Total billed tokens for the agent run (input + cache write/read +
+    output). Reported as an absolute count formatted '12.3k' / '1.2M' rather
+    than as a percent of context_window: cache_read_input_tokens is cumulative
+    across turns and easily exceeds context, so a percent is misleading."""
+    if not item.result_json:
         return "—"
     try:
         data = json.loads(item.result_json)
@@ -198,7 +221,6 @@ def _ctx_pct(item: StoredItem, context_window: int) -> str:
     usage = data.get("usage")
     if not isinstance(usage, dict):
         return "—"
-    # Prefer total_tokens if the SDK provides it; otherwise sum the parts.
     total = usage.get("total_tokens")
     if total is None:
         total = sum(int(usage.get(k, 0) or 0) for k in (
@@ -207,15 +229,14 @@ def _ctx_pct(item: StoredItem, context_window: int) -> str:
         ))
     if not total:
         return "—"
-    pct = 100.0 * total / context_window
-    return f"{pct:.0f}%"
+    return _fmt_tokens(int(total))
 
 
-def _render_table(stdscr, store, top, height, w, statuses, context_window):
+def _render_table(stdscr, store, top, height, w, statuses):
     if height <= 0:
         return
     header = (f" {'ID':<{_COL_ID-1}}{'STATE':<{_COL_STATE}}"
-              f"{'ELAPSED':<{_COL_ELAPSED}}{'CTX':<{_COL_CTX}}"
+              f"{'ELAPSED':<{_COL_ELAPSED}}{'TOK':<{_COL_TOK}}"
               f"{'SOURCE':<{_COL_SOURCE}}TITLE")
     _safe_addstr(stdscr, top, 0, header.ljust(w), w,
                  curses.A_BOLD | curses.A_UNDERLINE)
@@ -230,15 +251,15 @@ def _render_table(stdscr, store, top, height, w, statuses, context_window):
                 return
             elapsed = _elapsed_for(store, it.id) if st == ItemStatus.WORKING else None
             elapsed_s = _fmt_elapsed(elapsed) if elapsed is not None else "—"
-            ctx_s = _ctx_pct(it, context_window)
+            tok_s = _tokens_used(it)
             src = it.source_file
             if len(src) > _COL_SOURCE - 1:
                 src = "…" + src[-(_COL_SOURCE - 2):]
             title_max = max(0, w - 1 - _COL_ID - _COL_STATE - _COL_ELAPSED
-                              - _COL_CTX - _COL_SOURCE)
+                              - _COL_TOK - _COL_SOURCE)
             title = it.title[:title_max]
             line = (f" {it.id[:8]:<{_COL_ID-1}}{st.value:<{_COL_STATE}}"
-                    f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
+                    f"{elapsed_s:<{_COL_ELAPSED}}{tok_s:<{_COL_TOK}}"
                     f"{src:<{_COL_SOURCE}}{title}")
             attr = curses.color_pair(_status_color(st))
             if st == ItemStatus.WORKING:
@@ -248,8 +269,9 @@ def _render_table(stdscr, store, top, height, w, statuses, context_window):
 
 
 def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
-    """Interactive picker over QUEUED items. For each, prompt y/n/skip/quit.
-    On 'y' the daemon dispatches that item."""
+    """Interactive picker over QUEUED items. For each: y=dispatch, s=defer,
+    n=leave queued (browse only), q=quit pickup."""
+    from .committer import defer
     items = store.list_by_status(ItemStatus.QUEUED)
     curses.endwin()
     try:
@@ -261,7 +283,8 @@ def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
             print(f"NOTE: pickup_mode is '{cfg.agent.pickup_mode}'. Daemon "
                   f"may auto-dispatch alongside manual approvals.")
             print()
-        print(f"{len(items)} queued item(s). y=dispatch  s=skip  q=quit pickup\n")
+        print(f"{len(items)} queued item(s). "
+              f"y=dispatch  s=defer (set aside)  n=leave queued  q=quit\n")
         for it in items:
             print("=" * 72)
             print(f"id:     {it.id}")
@@ -271,23 +294,59 @@ def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
                 snippet = it.body.strip().splitlines()[0][:200]
                 print(f"body:   {snippet}")
             print(f"attempts: {it.attempts} / {cfg.agent.max_attempts}")
-            choice = input("[y]es dispatch / [s]kip / [q]uit ? ").strip().lower()
+            choice = input("[y]dispatch [s]defer [n]leave [q]uit ? ").strip().lower()
             if choice == "q":
                 break
+            fresh = store.get(it.id)
             if choice == "y":
-                ok = daemon.dispatch_specific(it.id)
+                ok = daemon.dispatch_specific(fresh.id)
                 if not ok:
                     print("(could not dispatch — pool full or item gone)")
                 else:
                     print("dispatched.")
-                # one-at-a-time when pool=1: stop so user can watch progress
                 if cfg.agent.pool_size == 1:
                     print("\npool is 1 — returning to dashboard so you can "
                           "watch this item.")
                     input("(press enter to return)")
                     return
+            elif choice == "s":
+                defer(store, fresh)
+                print("deferred.")
             else:
-                print("skipped.")
+                print("left in queue.")
+            print()
+    finally:
+        stdscr.clear()
+        stdscr.refresh()
+        curses.doupdate()
+
+
+def _deferred_mode(stdscr, cfg: Config, store: Store) -> None:
+    """Walk DEFERRED items: r=restore, n=leave deferred, q=quit."""
+    from .committer import restore_deferred
+    items = store.list_by_status(ItemStatus.DEFERRED)
+    curses.endwin()
+    try:
+        if not items:
+            print("no deferred items.")
+            input("(press enter to return)")
+            return
+        print(f"{len(items)} deferred item(s). "
+              f"r=restore to prior state  n=leave deferred  q=quit\n")
+        for it in items:
+            print("=" * 72)
+            print(f"id:     {it.id}")
+            print(f"title:  {it.title}")
+            print(f"source: {it.source_file}")
+            choice = input("[r]estore [n]leave [q]uit ? ").strip().lower()
+            if choice == "q":
+                break
+            fresh = store.get(it.id)
+            if choice == "r":
+                target = restore_deferred(store, fresh)
+                print(f"restored -> {target.value}")
+            else:
+                print("left deferred.")
             print()
     finally:
         stdscr.clear()
@@ -315,7 +374,7 @@ def _review_mode(stdscr, cfg: Config, store: Store) -> None:
 
 
 def _review_one_term(cfg: Config, store: Store, item: StoredItem) -> None:
-    from .committer import approve_and_commit, reject
+    from .committer import approve_and_commit, defer, reject
     import json as _json
     print("=" * 72)
     print(f"id:     {item.id}")
@@ -323,28 +382,73 @@ def _review_one_term(cfg: Config, store: Store, item: StoredItem) -> None:
     print(f"source: {item.source_file}:{item.source_line}")
     print(f"branch: {item.branch}")
     print(f"wt:     {item.worktree_path}")
+    files: list[str] = []
     if item.result_json:
         res = _json.loads(item.result_json)
-        print(f"summary: {res.get('summary')}")
-        print(f"files:   {res.get('files_changed')}")
+        summary = res.get("summary") or "(no summary)"
+        files = res.get("files_changed") or []
+        usage = res.get("usage") or {}
+        print()
+        print("--- agent summary ---")
+        print(summary)
+        print()
+        print(f"files changed: {len(files)}")
+        if usage:
+            print(f"tokens: {usage}")
     print()
-    diff = diff_vs_base(Path(item.worktree_path), cfg.git.base_branch)
-    print(diff[:8000] if diff else "(empty diff)")
-    if diff and len(diff) > 8000:
-        print(f"... ({len(diff) - 8000} more bytes truncated)")
-    print()
-    choice = input("[a]pprove / [r]eject / [s]kip ? ").strip().lower()
-    fresh = store.get(item.id)
-    if choice == "a":
-        msg = input("commit message (blank = default): ").strip()
-        if not msg:
-            msg = f"{item.title}\n\nAgent work for item {item.id}."
-        sha = approve_and_commit(cfg, store, fresh, msg)
-        print(f"committed {sha[:8]} on {fresh.branch}")
-    elif choice == "r":
-        fb = input("feedback for agent: ").strip()
-        reject(store, fresh, fb or "(no feedback)")
-        print("rejected.")
-    else:
-        print("skipped.")
-    print()
+
+    while True:
+        choice = input(
+            "[a]approve [r]eject [s]defer [n]leave  "
+            "[v]iew diff [f]iles [c]commits ? "
+        ).strip().lower()
+        fresh = store.get(item.id)
+        wt = Path(item.worktree_path)
+
+        if choice == "v":
+            diff = diff_vs_base(wt, cfg.git.base_branch)
+            _page(diff if diff else "(empty diff)\n")
+            continue
+        if choice == "f":
+            print()
+            for f in files:
+                print(f"  {f}")
+            print()
+            continue
+        if choice == "c":
+            cp = subprocess.run(
+                ["git", "log", "--oneline", "--no-decorate",
+                 f"{cfg.git.base_branch}..HEAD"],
+                cwd=wt, capture_output=True, text=True,
+            )
+            print()
+            print(cp.stdout or "(no commits beyond base)")
+            continue
+        if choice == "a":
+            msg = input("commit message (blank = default): ").strip()
+            if not msg:
+                msg = f"{item.title}\n\nAgent work for item {item.id}."
+            sha = approve_and_commit(cfg, store, fresh, msg)
+            print(f"committed {sha[:8]} on {fresh.branch}")
+            return
+        if choice == "r":
+            fb = input("feedback for agent: ").strip()
+            reject(store, fresh, fb or "(no feedback)")
+            print("rejected.")
+            return
+        if choice == "s":
+            defer(store, fresh)
+            print("deferred.")
+            return
+        if choice in ("n", ""):
+            print("left awaiting review.")
+            return
+
+
+def _page(text: str) -> None:
+    """Show text via $PAGER (less -R if unset). Falls back to print."""
+    try:
+        import pydoc
+        pydoc.pager(text)
+    except Exception:
+        print(text)

@@ -11,6 +11,7 @@ class ItemStatus(str, Enum):
     REJECTED = "rejected"
     MERGED = "merged"
     CANCELLED = "cancelled"
+    DEFERRED = "deferred"
 
 
 @dataclass(frozen=True)
