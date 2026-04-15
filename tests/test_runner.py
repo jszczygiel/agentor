@@ -263,6 +263,73 @@ git -c user.email=x -c user.name=x commit -q -m "add hello"
         self.assertIn("timed out", result.error)
 
 
+class TestDaemonPickupModes(unittest.TestCase):
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] one\n- [ ] two\n")
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _cfg(self, pickup_mode: str) -> Config:
+        return Config(
+            project_name="t", project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[], mark_done=False),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(runner="stub", pool_size=1, max_attempts=1,
+                              pickup_mode=pickup_mode),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+
+    def test_manual_mode_does_not_auto_dispatch(self):
+        from agentor.daemon import Daemon
+        from agentor.runner import make_runner
+        cfg = self._cfg("manual")
+        scan_once(cfg, self.store)
+        d = Daemon(cfg, self.store, make_runner, scan_interval=0.05,
+                   log=lambda m: None, install_signals=False)
+        # run for one tick worth, then signal stop
+        import threading
+        t = threading.Thread(target=d.run, daemon=True)
+        t.start()
+        import time as _t
+        _t.sleep(0.2)
+        d.stop_event.set()
+        t.join(timeout=5)
+        # still queued, nothing dispatched
+        self.assertEqual(d.stats.dispatched, 0)
+        self.assertEqual(len(self.store.list_by_status(ItemStatus.QUEUED)), 2)
+
+    def test_dispatch_specific_works_in_manual_mode(self):
+        from agentor.daemon import Daemon
+        from agentor.runner import make_runner
+        cfg = self._cfg("manual")
+        scan_once(cfg, self.store)
+        d = Daemon(cfg, self.store, make_runner, scan_interval=0.05,
+                   log=lambda m: None, install_signals=False)
+        import threading, time as _t
+        t = threading.Thread(target=d.run, daemon=True)
+        t.start()
+        _t.sleep(0.1)  # let recovery run
+        target = self.store.list_by_status(ItemStatus.QUEUED)[1]
+        ok = d.dispatch_specific(target.id)
+        self.assertTrue(ok)
+        # wait for stub runner to finish
+        for _ in range(30):
+            if self.store.get(target.id).status != ItemStatus.WORKING:
+                break
+            _t.sleep(0.1)
+        d.stop_event.set()
+        t.join(timeout=5)
+        final = self.store.get(target.id)
+        self.assertEqual(final.status, ItemStatus.AWAITING_REVIEW)
+
+
 class TestRecovery(unittest.TestCase):
     def setUp(self):
         self.td = TemporaryDirectory()

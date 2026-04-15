@@ -22,9 +22,18 @@ class AgentConfig:
     pool_size: int = 1  # max concurrent agents working on items
     runner: str = "stub"  # "stub" | "claude"
     # Command template for the claude runner. "{prompt}" is replaced per item.
+    # --output-format json produces a structured envelope with `usage` so we
+    # can surface token consumption in the dashboard.
     command: list[str] = field(default_factory=lambda: [
         "claude", "-p", "{prompt}", "--dangerously-skip-permissions",
+        "--output-format", "json",
     ])
+    # Total context window in tokens (Opus 4.6 1M variant = 1_000_000;
+    # standard Opus = 200_000). Used to compute CTX% in the dashboard.
+    context_window: int = 200_000
+    # auto: daemon dispatches queued items as soon as a pool slot frees up.
+    # manual: items stay queued until a human approves the pickup via the UI.
+    pickup_mode: str = "auto"
     # Prompt sent to Claude. Placeholders: {title}, {body}, {source_file}.
     prompt_template: str = (
         "/caveman ultra\n"

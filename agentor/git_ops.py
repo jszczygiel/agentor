@@ -31,6 +31,12 @@ def worktree_remove(repo: Path, path: Path, force: bool = False) -> None:
     run(repo, *args, check=False)
 
 
+def worktree_prune(repo: Path) -> None:
+    """Drop stale worktree registrations (the directory was removed but
+    `.git/worktrees/<name>/` still exists). Idempotent."""
+    run(repo, "worktree", "prune", check=False)
+
+
 def worktree_list(repo: Path) -> list[dict]:
     cp = run(repo, "worktree", "list", "--porcelain")
     out: list[dict] = []

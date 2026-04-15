@@ -1,4 +1,5 @@
 import curses
+import json
 import time
 from collections import deque
 from pathlib import Path
@@ -9,7 +10,7 @@ from .git_ops import diff_vs_base
 from .models import ItemStatus
 from .store import Store, StoredItem
 
-ACTIONS = "[s]tatus  [l]ist  [r]eview  [log]  [q]uit"
+ACTIONS = "[s]tatus  [l]ist  [p]ickup  [r]eview  [q]uit"
 REFRESH_MS = 500
 
 
@@ -40,6 +41,9 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
             view = "list"
         elif k == "r":
             _review_mode(stdscr, cfg, store)
+            view = "main"
+        elif k == "p":
+            _pickup_mode(stdscr, cfg, store, daemon)
             view = "main"
         elif k == "\t":
             view = "list" if view == "main" else "main"
@@ -74,13 +78,14 @@ def _render(stdscr, cfg, store, daemon, log_ring, view):
     h, w = stdscr.getmaxyx()
     row = 0
 
-    # header
+    # header bar
     title = f" agentor — {cfg.project_name} "
-    stdscr.addnstr(row, 0, title.ljust(w), w, curses.A_BOLD | curses.A_REVERSE)
+    _safe_addstr(stdscr, row, 0, title.ljust(w), w,
+                 curses.A_BOLD | curses.A_REVERSE)
     row += 1
 
     # actions bar
-    stdscr.addnstr(row, 0, f" {ACTIONS}".ljust(w), w, curses.A_REVERSE)
+    _safe_addstr(stdscr, row, 0, f" {ACTIONS}".ljust(w), w, curses.A_REVERSE)
     row += 1
 
     # stats line
@@ -91,94 +96,203 @@ def _render(stdscr, cfg, store, daemon, log_ring, view):
         f"scans={s.scans}  dispatched={s.dispatched}  done={s.completed}  "
         f"failed={s.failed}"
     )
-    stdscr.addnstr(row, 0, stats_line, w)
-    row += 1
-    stdscr.addnstr(row, 0, "-" * w, w)
+    _safe_addstr(stdscr, row, 0, stats_line, w)
     row += 1
 
-    # counts
+    # current task panel — always visible
+    current = _pick_current(store)
+    elapsed = _elapsed_for(store, current.id) if current else None
+    if current:
+        line = (f" ▶ NOW  {current.id[:8]}  {_fmt_elapsed(elapsed)}  "
+                f"{current.title}")
+        _safe_addstr(stdscr, row, 0, line.ljust(w), w,
+                     curses.color_pair(_status_color(ItemStatus.WORKING))
+                     | curses.A_BOLD)
+    else:
+        _safe_addstr(stdscr, row, 0, " ▶ NOW  (no task running)".ljust(w), w,
+                     curses.A_DIM)
+    row += 1
+
+    # counts (one line)
     counts = {st: store.count_by_status(st) for st in ItemStatus}
-    stdscr.addnstr(row, 0, " counts:", w, curses.A_BOLD)
+    counts_line = (
+        f" queued={counts[ItemStatus.QUEUED]}  "
+        f"working={counts[ItemStatus.WORKING]}  "
+        f"awaiting={counts[ItemStatus.AWAITING_REVIEW]}  "
+        f"merged={counts[ItemStatus.MERGED]}  "
+        f"rejected={counts[ItemStatus.REJECTED]}"
+    )
+    _safe_addstr(stdscr, row, 0, counts_line, w)
     row += 1
-    for st, n in counts.items():
-        if n == 0 and st not in (ItemStatus.QUEUED, ItemStatus.WORKING,
-                                  ItemStatus.AWAITING_REVIEW):
-            continue
-        try:
-            stdscr.addnstr(row, 2, f"{st.value:<18} {n:>4}", w,
-                           curses.color_pair(_status_color(st)))
-        except curses.error:
-            pass
-        row += 1
+    _safe_addstr(stdscr, row, 0, "─" * w, w, curses.A_DIM)
     row += 1
 
-    # view body
+    # body table
     body_top = row
-    body_height = h - body_top - 2  # leave 2 lines for log + footer
-
+    body_height = h - body_top - 1  # leave 1 line for log
     if view == "main":
-        _render_main_body(stdscr, store, row, body_height, w)
+        _render_table(stdscr, store, body_top, body_height, w,
+                      [ItemStatus.WORKING, ItemStatus.AWAITING_REVIEW,
+                       ItemStatus.QUEUED, ItemStatus.REJECTED],
+                      cfg.agent.context_window)
     elif view == "list":
-        _render_list_body(stdscr, store, row, body_height, w)
+        _render_table(stdscr, store, body_top, body_height, w,
+                      list(ItemStatus), cfg.agent.context_window)
 
     # log tail
     log_row = h - 1
     latest = list(log_ring)[-1:] if log_ring else [""]
-    stdscr.addnstr(log_row, 0, (f" log: {latest[0]}" if latest[0] else
-                                 " log: (no events yet)").ljust(w), w,
-                   curses.A_DIM)
+    _safe_addstr(stdscr, log_row, 0,
+                 (f" log: {latest[0]}" if latest[0] else
+                  " log: (no events yet)").ljust(w), w, curses.A_DIM)
     stdscr.refresh()
 
 
-def _render_main_body(stdscr, store, start_row, height, w):
-    # show awaiting_review + working items prominently
-    rows_used = 0
-    for st in (ItemStatus.WORKING, ItemStatus.AWAITING_REVIEW, ItemStatus.QUEUED):
-        items = store.list_by_status(st)
-        if not items:
-            continue
-        if rows_used >= height:
-            break
-        try:
-            stdscr.addnstr(start_row + rows_used, 0, f" [{st.value}]".ljust(w), w,
-                           curses.color_pair(_status_color(st)) | curses.A_BOLD)
-        except curses.error:
-            pass
-        rows_used += 1
-        for it in items[:max(0, height - rows_used)]:
-            line = f"   {it.id[:8]}  {it.title}"
-            try:
-                stdscr.addnstr(start_row + rows_used, 0, line, w)
-            except curses.error:
-                pass
-            rows_used += 1
-            if rows_used >= height:
-                break
+def _safe_addstr(stdscr, y, x, s, w, attr=0):
+    try:
+        stdscr.addnstr(y, x, s, w, attr)
+    except curses.error:
+        pass
 
 
-def _render_list_body(stdscr, store, start_row, height, w):
-    rows_used = 0
-    for st in ItemStatus:
+def _pick_current(store: Store) -> StoredItem | None:
+    items = store.list_by_status(ItemStatus.WORKING)
+    return items[0] if items else None
+
+
+def _elapsed_for(store: Store, item_id: str) -> float | None:
+    """Seconds since the most recent transition INTO `working` for this item."""
+    for t in reversed(store.transitions_for(item_id)):
+        if t["to_status"] == ItemStatus.WORKING.value:
+            return max(0.0, time.time() - float(t["at"]))
+    return None
+
+
+def _fmt_elapsed(sec: float | None) -> str:
+    if sec is None:
+        return "—:—"
+    m, s = divmod(int(sec), 60)
+    if m >= 60:
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+# Table column layout. The TITLE column gets whatever width remains.
+_COL_ID = 9       # 8 chars + 1 pad
+_COL_STATE = 18   # widest status name + pad
+_COL_ELAPSED = 9
+_COL_CTX = 7
+_COL_SOURCE = 26
+
+
+def _ctx_pct(item: StoredItem, context_window: int) -> str:
+    """Return a short '12%' string from the agent's reported usage, or '—'
+    if no usage is recorded yet."""
+    if not item.result_json or context_window <= 0:
+        return "—"
+    try:
+        data = json.loads(item.result_json)
+    except json.JSONDecodeError:
+        return "—"
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return "—"
+    # Prefer total_tokens if the SDK provides it; otherwise sum the parts.
+    total = usage.get("total_tokens")
+    if total is None:
+        total = sum(int(usage.get(k, 0) or 0) for k in (
+            "input_tokens", "cache_creation_input_tokens",
+            "cache_read_input_tokens", "output_tokens",
+        ))
+    if not total:
+        return "—"
+    pct = 100.0 * total / context_window
+    return f"{pct:.0f}%"
+
+
+def _render_table(stdscr, store, top, height, w, statuses, context_window):
+    if height <= 0:
+        return
+    header = (f" {'ID':<{_COL_ID-1}}{'STATE':<{_COL_STATE}}"
+              f"{'ELAPSED':<{_COL_ELAPSED}}{'CTX':<{_COL_CTX}}"
+              f"{'SOURCE':<{_COL_SOURCE}}TITLE")
+    _safe_addstr(stdscr, top, 0, header.ljust(w), w,
+                 curses.A_BOLD | curses.A_UNDERLINE)
+    rows_used = 1
+    for st in statuses:
         items = store.list_by_status(st)
-        if not items:
-            continue
-        if rows_used >= height:
-            break
-        try:
-            stdscr.addnstr(start_row + rows_used, 0, f" [{st.value}]".ljust(w), w,
-                           curses.color_pair(_status_color(st)) | curses.A_BOLD)
-        except curses.error:
-            pass
-        rows_used += 1
         for it in items:
             if rows_used >= height:
-                break
-            line = f"   {it.id[:8]}  {it.title[:w - 16]}"
-            try:
-                stdscr.addnstr(start_row + rows_used, 0, line, w)
-            except curses.error:
-                pass
+                _safe_addstr(stdscr, top + rows_used - 1, 0,
+                             f" ... (more not shown)".ljust(w), w,
+                             curses.A_DIM)
+                return
+            elapsed = _elapsed_for(store, it.id) if st == ItemStatus.WORKING else None
+            elapsed_s = _fmt_elapsed(elapsed) if elapsed is not None else "—"
+            ctx_s = _ctx_pct(it, context_window)
+            src = it.source_file
+            if len(src) > _COL_SOURCE - 1:
+                src = "…" + src[-(_COL_SOURCE - 2):]
+            title_max = max(0, w - 1 - _COL_ID - _COL_STATE - _COL_ELAPSED
+                              - _COL_CTX - _COL_SOURCE)
+            title = it.title[:title_max]
+            line = (f" {it.id[:8]:<{_COL_ID-1}}{st.value:<{_COL_STATE}}"
+                    f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
+                    f"{src:<{_COL_SOURCE}}{title}")
+            attr = curses.color_pair(_status_color(st))
+            if st == ItemStatus.WORKING:
+                attr |= curses.A_BOLD
+            _safe_addstr(stdscr, top + rows_used, 0, line, w, attr)
             rows_used += 1
+
+
+def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
+    """Interactive picker over QUEUED items. For each, prompt y/n/skip/quit.
+    On 'y' the daemon dispatches that item."""
+    items = store.list_by_status(ItemStatus.QUEUED)
+    curses.endwin()
+    try:
+        if not items:
+            print("no queued items.")
+            input("(press enter to return)")
+            return
+        if cfg.agent.pickup_mode != "manual":
+            print(f"NOTE: pickup_mode is '{cfg.agent.pickup_mode}'. Daemon "
+                  f"may auto-dispatch alongside manual approvals.")
+            print()
+        print(f"{len(items)} queued item(s). y=dispatch  s=skip  q=quit pickup\n")
+        for it in items:
+            print("=" * 72)
+            print(f"id:     {it.id}")
+            print(f"title:  {it.title}")
+            print(f"source: {it.source_file}:{it.source_line}")
+            if it.body:
+                snippet = it.body.strip().splitlines()[0][:200]
+                print(f"body:   {snippet}")
+            print(f"attempts: {it.attempts} / {cfg.agent.max_attempts}")
+            choice = input("[y]es dispatch / [s]kip / [q]uit ? ").strip().lower()
+            if choice == "q":
+                break
+            if choice == "y":
+                ok = daemon.dispatch_specific(it.id)
+                if not ok:
+                    print("(could not dispatch — pool full or item gone)")
+                else:
+                    print("dispatched.")
+                # one-at-a-time when pool=1: stop so user can watch progress
+                if cfg.agent.pool_size == 1:
+                    print("\npool is 1 — returning to dashboard so you can "
+                          "watch this item.")
+                    input("(press enter to return)")
+                    return
+            else:
+                print("skipped.")
+            print()
+    finally:
+        stdscr.clear()
+        stdscr.refresh()
+        curses.doupdate()
 
 
 def _review_mode(stdscr, cfg: Config, store: Store) -> None:

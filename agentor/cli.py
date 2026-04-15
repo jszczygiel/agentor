@@ -211,9 +211,6 @@ def cmd_start(args: argparse.Namespace) -> int:
     log_path = cfg.project_root / ".agentor" / "agentor.log"
 
     ui = args.ui
-    if ui == "auto":
-        ui = "dashboard" if sys.stdout.isatty() else "repl"
-
     logger = _make_daemon_logger(log_path, log_ring, to_stdout=(ui == "repl"))
 
     daemon = Daemon(
@@ -234,7 +231,16 @@ def cmd_start(args: argparse.Namespace) -> int:
     t.start()
     try:
         if ui == "dashboard":
-            run_dashboard(cfg, store, daemon, log_ring)
+            try:
+                run_dashboard(cfg, store, daemon, log_ring)
+            except Exception as e:
+                # curses can't init (no TTY, weird terminfo, etc.) — fall back
+                # to the REPL with a one-line note.
+                print(f"dashboard unavailable ({e}); falling back to REPL.")
+                # daemon's logger was muted for dashboard mode — re-enable
+                # stdout so the REPL user sees activity.
+                daemon.log = _make_daemon_logger(log_path, log_ring, to_stdout=True)
+                _repl(cfg, store, daemon, log_ring)
         else:
             _repl(cfg, store, daemon, log_ring)
     finally:
@@ -317,8 +323,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("start", help="run daemon loop")
     sp.add_argument("--interval", type=float, default=5.0,
                     help="scan interval in seconds (default 5)")
-    sp.add_argument("--ui", choices=["auto", "dashboard", "repl"], default="auto",
-                    help="UI mode (default: auto — dashboard on tty, repl otherwise)")
+    sp.add_argument("--ui", choices=["dashboard", "repl"], default="dashboard",
+                    help="UI mode (default: dashboard; falls back to repl if "
+                         "curses can't init)")
     sp.set_defaults(func=cmd_start)
 
     sp = sub.add_parser("review", help="review items awaiting approval")

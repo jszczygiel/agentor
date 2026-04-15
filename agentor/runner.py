@@ -55,11 +55,14 @@ class Runner:
         branch = item.branch
         repo = self.config.project_root
 
+        # Pre-flight cleanup. Order matters: remove the worktree dir, then
+        # prune stale registrations (.git/worktrees/<name>/ left after a manual
+        # rm -rf), THEN delete the branch — git refuses to delete a branch
+        # while it is still associated with a (possibly ghost) worktree.
+        git_ops.worktree_remove(repo, wt_path, force=True)
         if wt_path.exists():
-            git_ops.worktree_remove(repo, wt_path, force=True)
-            if wt_path.exists():
-                shutil.rmtree(wt_path, ignore_errors=True)
-        # stale branch from a previous run blocks `worktree add -b`. Force-delete.
+            shutil.rmtree(wt_path, ignore_errors=True)
+        git_ops.worktree_prune(repo)
         if git_ops.branch_exists(repo, branch):
             git_ops.branch_delete(repo, branch, force=True)
 
@@ -108,6 +111,9 @@ class Runner:
             "files_changed": files_changed,
             "diff_len": len(diff),
         }
+        usage = getattr(self, "_last_usage", None)
+        if usage:
+            result["usage"] = usage
         self.store.transition(
             item.id, ItemStatus.AWAITING_REVIEW,
             result_json=json.dumps(result),
@@ -184,7 +190,38 @@ class ClaudeRunner(Runner):
 
         files = _list_changes(worktree, self.config.git.base_branch)
         summary = _derive_summary(worktree, cp.stdout, item.title)
+        usage = _parse_usage(cp.stdout)
+        # stash usage on the StoredItem-bound dict via a side-channel: write
+        # the result blob through the runner.py base's transition by stuffing
+        # it into a thread-local. Simpler: return via an attribute the base
+        # class will pick up. We use a per-runner mutable dict.
+        self._last_usage = usage
         return summary, files
+
+
+def _parse_usage(stdout: str) -> dict | None:
+    """Claude CLI with --output-format json emits a JSON object containing a
+    `usage` field. Parse defensively: stdout may be plain text if the flag
+    wasn't set, or trailing log noise may surround the JSON. Returns the
+    `usage` dict or None."""
+    text = stdout.strip()
+    if not text:
+        return None
+    # Fast path: whole stdout is JSON.
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        # Slow path: locate the last balanced JSON object in the stream.
+        last_open = text.rfind("{")
+        if last_open < 0:
+            return None
+        try:
+            obj = json.loads(text[last_open:])
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(obj, dict):
+        return None
+    return obj.get("usage") or obj.get("result", {}).get("usage")
 
 
 def _list_changes(worktree: Path, base_branch: str) -> list[str]:

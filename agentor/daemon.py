@@ -44,6 +44,35 @@ class Daemon:
         self.workers: set[threading.Thread] = set()
         self.stats = DaemonStats()
 
+    def dispatch_specific(self, item_id: str) -> bool:
+        """Manually approve a queued item for pickup. Returns True if it was
+        dispatched, False if it could not be (already claimed, no slot, gone)."""
+        if not self.store.pool_has_slot(self.config.agent.pool_size):
+            self.log(f"manual dispatch denied: pool full")
+            return False
+        item = self.store.get(item_id)
+        if item is None or item.status != ItemStatus.QUEUED:
+            self.log(f"manual dispatch denied: {item_id} not queued")
+            return False
+        wt_path, branch = plan_worktree(self.config, item)
+        # claim_next_queued returns oldest; we want THIS item. Transition by hand.
+        self.store.transition(
+            item.id, ItemStatus.WORKING,
+            worktree_path=str(wt_path), branch=branch,
+            attempts=item.attempts + 1,
+            note="manual pickup approval",
+        )
+        claimed = self.store.get(item.id)
+        runner = self.runner_factory(self.config, self.store)
+        self.stats.dispatched += 1
+        self.log(f"manual dispatch: {claimed.id} {claimed.title!r} -> {branch}")
+        t = threading.Thread(
+            target=self._run_worker, args=(runner, claimed), daemon=True,
+        )
+        self.workers.add(t)
+        t.start()
+        return True
+
     def _dispatch_one(self) -> bool:
         if not self.store.pool_has_slot(self.config.agent.pool_size):
             return False
@@ -119,14 +148,15 @@ class Daemon:
         if recovered:
             self.log(f"recovered {len(recovered)} items from crashed run")
 
+        manual = self.config.agent.pickup_mode == "manual"
         while not self.stop_event.is_set():
             result = scan_once(self.config, self.store)
             self.stats.scans += 1
             if result.new_items:
                 self.log(f"scan: {result.new_items} new items")
-            # dispatch as many as pool allows
-            while self._dispatch_one():
-                pass
+            if not manual:
+                while self._dispatch_one():
+                    pass
             self.stop_event.wait(self.scan_interval)
 
         # drain workers
