@@ -13,7 +13,7 @@ from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
 from agentor.models import ItemStatus
 from agentor.recovery import recover_on_startup
 from agentor.runner import (ClaudeRunner, CodexRunner, StubRunner,
-                            make_runner, plan_worktree)
+                            _mark_done_instruction, make_runner, plan_worktree)
 from agentor.store import Store
 from agentor.watcher import scan_once
 
@@ -32,13 +32,12 @@ def _init_project(root: Path) -> None:
 
 
 def _mk_config(root: Path, mode: str = "checkbox",
-               watch: list[str] | None = None,
-               mark_done: bool = True) -> Config:
+               watch: list[str] | None = None) -> Config:
     return Config(
         project_name=root.name,
         project_root=root,
         sources=SourcesConfig(
-            watch=watch or ["backlog.md"], exclude=[], mark_done=mark_done,
+            watch=watch or ["backlog.md"], exclude=[],
         ),
         parsing=ParsingConfig(mode=mode),
         agent=AgentConfig(pool_size=1),
@@ -123,7 +122,7 @@ class TestFrontmatterMarkDone(unittest.TestCase):
         _git(self.root, "commit", "-q", "-m", "add bug")
         self.cfg = _mk_config(
             self.root, mode="frontmatter",
-            watch=["docs/backlog/*.md"], mark_done=True,
+            watch=["docs/backlog/*.md"],
         )
         self.store = Store(self.root / ".agentor" / "state.db")
         scan_once(self.cfg, self.store)
@@ -147,6 +146,47 @@ class TestFrontmatterMarkDone(unittest.TestCase):
             cwd=self.root, capture_output=True, text=True,
         )
         self.assertNotEqual(cp.returncode, 0)
+
+
+class TestMarkDoneInstruction(unittest.TestCase):
+    """The agent's execute prompt should instruct it to delete the idea
+    markdown file in its final commit under frontmatter mode. Other modes
+    share a file across items, so whole-file deletion would take siblings
+    with it — the helper no-ops there."""
+
+    def _cfg(self, *, mode: str) -> Config:
+        return Config(
+            project_name="proj", project_root=Path("/tmp/proj"),
+            sources=SourcesConfig(watch=[], exclude=[]),
+            parsing=ParsingConfig(mode=mode),
+            agent=AgentConfig(), git=GitConfig(), review=ReviewConfig(),
+        )
+
+    def test_frontmatter_emits_instruction(self):
+        out = _mark_done_instruction(
+            self._cfg(mode="frontmatter"), "docs/ideas/foo.md",
+        )
+        self.assertIn("docs/ideas/foo.md", out)
+        self.assertIn("git rm", out)
+        self.assertIn("SAME final commit", out)
+
+    def test_checkbox_mode_emits_nothing(self):
+        self.assertEqual(
+            _mark_done_instruction(self._cfg(mode="checkbox"), "backlog.md"),
+            "",
+        )
+
+    def test_heading_mode_emits_nothing(self):
+        self.assertEqual(
+            _mark_done_instruction(self._cfg(mode="heading"), "ideas.md"),
+            "",
+        )
+
+    def test_missing_source_file_emits_nothing(self):
+        self.assertEqual(
+            _mark_done_instruction(self._cfg(mode="frontmatter"), ""),
+            "",
+        )
 
 
 def _write_fake_cli(bin_dir: Path, name: str, script: str) -> Path:
@@ -188,7 +228,7 @@ class TestClaudeRunner(unittest.TestCase):
         _write_fake_claude(bin_dir, script)
         cfg = Config(
             project_name=self.root.name, project_root=self.root,
-            sources=SourcesConfig(watch=["backlog.md"], exclude=[], mark_done=False),
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
             agent=AgentConfig(
                 runner="claude", pool_size=1, max_attempts=max_attempts,
@@ -275,7 +315,7 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"here is the plan",
         _write_fake_claude(bin_dir, script)
         cfg = Config(
             project_name=self.root.name, project_root=self.root,
-            sources=SourcesConfig(watch=["backlog.md"], exclude=[], mark_done=False),
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
             agent=AgentConfig(
                 runner="claude", pool_size=1, max_attempts=2,
@@ -338,6 +378,60 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"here is the plan",
         # any agent-side failure parks the item in ERRORED (no auto-retry)
         self.assertEqual(refreshed.status, ItemStatus.ERRORED)
 
+    def test_execute_prompt_includes_mark_done_instruction_in_frontmatter(self):
+        """Under frontmatter mode the execute phase prompt must carry the
+        `git rm <source_file>` instruction so the agent folds idea-file
+        deletion into its own commit."""
+        # Seed a frontmatter idea file rather than the checkbox backlog.md
+        # the TestClaudeRunner setUp prepared.
+        (self.root / "backlog.md").unlink()
+        idea_dir = self.root / "docs" / "ideas"
+        idea_dir.mkdir(parents=True)
+        idea_file = idea_dir / "bug-a.md"
+        idea_file.write_text(
+            "---\ntitle: Bug A\nstate: available\n---\nbody.\n"
+        )
+        _git(self.root, "add", ".")
+        _git(self.root, "commit", "-q", "-m", "add idea")
+        bin_dir = Path(self.td.name) / "bin"
+        prompt_log = Path(self.td.name) / "prompts.log"
+        # Fake CLI appends whatever prompt text it receives to prompt_log.
+        _write_fake_claude(bin_dir, f'printf "%s\\n---\\n" "$2" >> "{prompt_log}"\n')
+        cfg = Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(
+                watch=["docs/ideas/*.md"], exclude=[],
+            ),
+            parsing=ParsingConfig(mode="frontmatter"),
+            agent=AgentConfig(
+                runner="claude", pool_size=1, max_attempts=1,
+                command=[str(bin_dir / "claude"), "-p", "{prompt}"],
+                plan_prompt_template="PLAN: {title}",
+                execute_prompt_template="EXEC: {title}\nplan={plan}",
+                timeout_seconds=10,
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        runner = make_runner(cfg, self.store)
+        runner.run(claimed)  # plan phase — no instruction expected
+        fresh = self.store.get(claimed.id)
+        self.assertEqual(fresh.status, ItemStatus.AWAITING_PLAN_REVIEW)
+        approve_plan(self.store, fresh)
+        wt2, br2 = plan_worktree(cfg, fresh)
+        claimed2 = self.store.claim_next_queued(str(wt2), br2)
+        runner.run(claimed2)
+        prompts = prompt_log.read_text()
+        plan_block, _, exec_block = prompts.partition("\n---\n")
+        self.assertNotIn("Source-file removal", plan_block,
+                         "plan phase is read-only; no deletion instruction")
+        self.assertIn("Source-file removal", exec_block)
+        self.assertIn("docs/ideas/bug-a.md", exec_block)
+
     def test_claude_runner_timeout(self):
         # sleep > timeout
         script = "sleep 5\n"
@@ -345,7 +439,7 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"here is the plan",
         _write_fake_claude(bin_dir, script)
         cfg = Config(
             project_name=self.root.name, project_root=self.root,
-            sources=SourcesConfig(watch=["backlog.md"], exclude=[], mark_done=False),
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
             agent=AgentConfig(
                 runner="claude", pool_size=1, max_attempts=1,
@@ -382,7 +476,7 @@ class TestCodexRunner(unittest.TestCase):
         _write_fake_codex(bin_dir, script)
         cfg = Config(
             project_name=self.root.name, project_root=self.root,
-            sources=SourcesConfig(watch=["backlog.md"], exclude=[], mark_done=False),
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
             agent=AgentConfig(
                 runner="codex", model="gpt-5-codex", pool_size=1,
@@ -558,7 +652,7 @@ class TestDaemonPickupModes(unittest.TestCase):
     def _cfg(self, pickup_mode: str) -> Config:
         return Config(
             project_name="t", project_root=self.root,
-            sources=SourcesConfig(watch=["backlog.md"], exclude=[], mark_done=False),
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
             agent=AgentConfig(runner="stub", pool_size=1, max_attempts=1,
                               pickup_mode=pickup_mode),
@@ -872,8 +966,7 @@ class TestFailureLandsInErrored(unittest.TestCase):
         (self.root / "backlog.md").write_text("- [ ] failing task\n")
         self.cfg = Config(
             project_name="t", project_root=self.root,
-            sources=SourcesConfig(watch=["backlog.md"], exclude=[],
-                                  mark_done=False),
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
             agent=AgentConfig(runner="stub", pool_size=1, max_attempts=3),
             git=GitConfig(base_branch="main", branch_prefix="agent/"),
@@ -917,8 +1010,7 @@ class TestRunnerRecordsFailures(unittest.TestCase):
         (self.root / "backlog.md").write_text("- [ ] one\n")
         self.cfg = Config(
             project_name="t", project_root=self.root,
-            sources=SourcesConfig(watch=["backlog.md"], exclude=[],
-                                  mark_done=False),
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
             agent=AgentConfig(runner="stub", pool_size=1, max_attempts=3),
             git=GitConfig(base_branch="main", branch_prefix="agent/"),
@@ -958,8 +1050,7 @@ class TestDaemonPause(unittest.TestCase):
         (self.root / "backlog.md").write_text("- [ ] task\n")
         self.cfg = Config(
             project_name="t", project_root=self.root,
-            sources=SourcesConfig(watch=["backlog.md"], exclude=[],
-                                  mark_done=False),
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
             agent=AgentConfig(runner="stub", pool_size=1, max_attempts=3,
                               pickup_mode="auto"),

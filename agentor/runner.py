@@ -460,6 +460,7 @@ class ClaudeRunner(Runner):
             title=item.title, body=item.body, source_file=item.source_file,
             plan=plan,
         )
+        prompt += _mark_done_instruction(self.config, item.source_file)
         prompt = self._prepend_feedback(item, prompt, phase="execute")
         summary, stdout = self._invoke_claude(item, worktree, prompt)
         files = _list_changes(worktree, self.config.git.base_branch)
@@ -785,6 +786,7 @@ class CodexRunner(Runner):
             title=item.title, body=item.body, source_file=item.source_file,
             plan=plan,
         )
+        prompt += _mark_done_instruction(self.config, item.source_file)
         prompt = self._prepend_feedback(item, prompt, phase="execute")
         output_path = self._last_message_path(item, "execute")
         summary, stdout = self._invoke_codex(item, worktree, prompt, output_path)
@@ -1271,6 +1273,22 @@ def _default_codex_resume_command() -> list[str]:
         "-o", "{output_path}",
         "{prompt}",
     ]
+
+
+def _mark_done_instruction(config: Config, source_file: str) -> str:
+    """Idea-file housekeeping. Frontmatter mode only — in checkbox/heading
+    modes the source is a shared list and whole-file deletion would take
+    sibling items with it. Returns an empty string when not applicable so
+    the caller can append unconditionally."""
+    if not (config.parsing.mode == "frontmatter" and source_file):
+        return ""
+    return (
+        "\n\nSource-file removal (mandatory):\n"
+        f"This item originates from `{source_file}`. Delete that source "
+        f"markdown when the item is done — include `git rm {source_file}` "
+        "(or equivalent delete + `git add`) in the SAME final commit as "
+        "your implementation, one commit, not a trailing cleanup commit.\n"
+    )
 
 
 def _list_changes(worktree: Path, base_branch: str) -> list[str]:

@@ -31,7 +31,7 @@ def _mk_config(
     return Config(
         project_name=root.name,
         project_root=root,
-        sources=SourcesConfig(watch=["backlog.md"], exclude=[], mark_done=False),
+        sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
         parsing=ParsingConfig(mode="checkbox"),
         agent=AgentConfig(pool_size=1),
         git=GitConfig(base_branch="main", branch_prefix="agent/",

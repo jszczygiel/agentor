@@ -7,7 +7,6 @@ watch = [
   "docs/backlog.md",
   "docs/ideas.md",
 ]
-mark_done = true
 
 [parsing]
 mode = "checkbox"

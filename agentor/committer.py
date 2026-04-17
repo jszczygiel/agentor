@@ -39,7 +39,7 @@ def approve_and_commit(
     wt = Path(item.worktree_path)
     repo = config.project_root
 
-    if config.sources.mark_done and config.parsing.mode == "frontmatter":
+    if config.parsing.mode == "frontmatter":
         src_in_wt = wt / item.source_file
         if src_in_wt.exists():
             src_in_wt.unlink()

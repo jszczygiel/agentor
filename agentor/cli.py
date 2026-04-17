@@ -54,7 +54,6 @@ def cmd_init(args: argparse.Namespace) -> int:
         '[sources]\n'
         'watch = ["docs/backlog.md", "docs/ideas.md"]\n'
         'exclude = []\n'
-        'mark_done = true\n'
         '\n'
         '[parsing]\n'
         'mode = "checkbox"\n'
