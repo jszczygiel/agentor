@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from agentor.committer import approve_and_commit, retry_merge
+from agentor.committer import approve_and_commit, retry, retry_merge
 from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
                             ReviewConfig, SourcesConfig)
 from agentor.models import ItemStatus
@@ -25,9 +25,7 @@ def _init_project(root: Path) -> None:
     _git(root, "commit", "-q", "-m", "init")
 
 
-def _mk_config(
-    root: Path, *, auto_merge: bool, merge_mode: str = "merge",
-) -> Config:
+def _mk_config(root: Path, *, merge_mode: str = "merge") -> Config:
     return Config(
         project_name=root.name,
         project_root=root,
@@ -35,7 +33,7 @@ def _mk_config(
         parsing=ParsingConfig(mode="checkbox"),
         agent=AgentConfig(pool_size=1),
         git=GitConfig(base_branch="main", branch_prefix="agent/",
-                      auto_merge=auto_merge, merge_mode=merge_mode),
+                      merge_mode=merge_mode),
         review=ReviewConfig(),
     )
 
@@ -64,7 +62,7 @@ class TestAutoMerge(unittest.TestCase):
         (self.root / "backlog.md").write_text(
             "- [ ] Touch a file\n  details\n"
         )
-        self.cfg = _mk_config(self.root, auto_merge=True)
+        self.cfg = _mk_config(self.root)
         self.store = Store(self.root / ".agentor" / "state.db")
         scan_once(self.cfg, self.store)
 
@@ -129,43 +127,6 @@ class TestAutoMerge(unittest.TestCase):
                       "conflict summary should name the clashing file")
 
 
-class TestNoAutoMerge(unittest.TestCase):
-    """Confirm the legacy path (auto_merge=False) still commits on the
-    feature branch and transitions MERGED without touching base."""
-
-    def setUp(self):
-        self.td = TemporaryDirectory()
-        self.root = Path(self.td.name)
-        _init_project(self.root)
-        (self.root / "backlog.md").write_text(
-            "- [ ] Touch a file\n  details\n"
-        )
-        self.cfg = _mk_config(self.root, auto_merge=False)
-        self.store = Store(self.root / ".agentor" / "state.db")
-        scan_once(self.cfg, self.store)
-
-    def tearDown(self):
-        self.store.close()
-        self.td.cleanup()
-
-    def test_commit_stays_on_feature_branch(self):
-        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
-        wt, br = plan_worktree(self.cfg, item)
-        claimed = self.store.claim_next_queued(str(wt), br)
-        StubRunner(self.cfg, self.store).run(claimed)
-        item = self.store.get(claimed.id)
-        base_before = _main_sha(self.root)
-
-        approve_and_commit(self.cfg, self.store, item, "stub note")
-
-        final = self.store.get(claimed.id)
-        self.assertEqual(final.status, ItemStatus.MERGED)
-        self.assertEqual(_main_sha(self.root), base_before,
-                         "main must not advance when auto_merge=False")
-        self.assertTrue(_branch_exists(self.root, item.branch),
-                        "feature branch must be kept for manual merge")
-
-
 class TestRebaseMode(unittest.TestCase):
     """merge_mode="rebase" — linear history, no merge commits."""
 
@@ -176,7 +137,7 @@ class TestRebaseMode(unittest.TestCase):
         (self.root / "backlog.md").write_text(
             "- [ ] Touch a file\n  details\n"
         )
-        self.cfg = _mk_config(self.root, auto_merge=True, merge_mode="rebase")
+        self.cfg = _mk_config(self.root, merge_mode="rebase")
         self.store = Store(self.root / ".agentor" / "state.db")
         scan_once(self.cfg, self.store)
 
@@ -249,7 +210,7 @@ class TestRetryMerge(unittest.TestCase):
         (self.root / "backlog.md").write_text(
             "- [ ] Touch a file\n  details\n"
         )
-        self.cfg = _mk_config(self.root, auto_merge=True)
+        self.cfg = _mk_config(self.root)
         self.store = Store(self.root / ".agentor" / "state.db")
         scan_once(self.cfg, self.store)
 
@@ -303,6 +264,37 @@ class TestRetryMerge(unittest.TestCase):
         self.assertEqual(final.status, ItemStatus.CONFLICTED)
         self.assertTrue(Path(item.worktree_path).exists())
         self.assertTrue(_branch_exists(self.root, item.branch))
+
+
+class TestRetryErrored(unittest.TestCase):
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] Task\n")
+        self.cfg = _mk_config(self.root)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        scan_once(self.cfg, self.store)
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def test_errored_requeues_and_resets_attempts(self):
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(self.cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        self.store.transition(
+            claimed.id, ItemStatus.ERRORED,
+            attempts=2, last_error="do_work: claude timed out after 1800s",
+        )
+
+        retry(self.store, self.store.get(claimed.id))
+
+        final = self.store.get(claimed.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        self.assertIsNone(final.last_error)
+        self.assertEqual(final.attempts, 0)
 
 
 if __name__ == "__main__":

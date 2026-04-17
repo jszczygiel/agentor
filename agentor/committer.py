@@ -1,10 +1,17 @@
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 from . import git_ops
 from .config import Config
 from .models import ItemStatus
 from .store import Store, StoredItem
+
+ProgressCb = Callable[[str], None]
+
+
+def _noop(_msg: str) -> None:
+    pass
 
 
 def _has_uncommitted(wt: Path) -> bool:
@@ -16,25 +23,22 @@ def _has_uncommitted(wt: Path) -> bool:
 
 
 def approve_and_commit(
-    config: Config, store: Store, item: StoredItem, message: str
+    config: Config, store: Store, item: StoredItem, message: str,
+    *, progress: ProgressCb | None = None,
 ) -> str:
     """Approve the agent's work. Commit any pending changes in the worktree,
-    then (optionally) merge the feature branch into `git.base_branch`.
+    then merge the feature branch into `git.base_branch` via an ephemeral
+    detached worktree. Clean merge → remove feature worktree and branch,
+    transition MERGED. Conflicts → keep the feature worktree and branch
+    intact, transition CONFLICTED with the conflict summary stored in
+    `last_error` for the inspect view.
 
-    Behavior depends on `config.git.auto_merge`:
-      - False (default): commit on the feature branch, remove the worktree,
-        transition MERGED. The feature branch stays; user merges by hand.
-      - True: commit, then try `git merge --no-ff` into base via an
-        ephemeral detached worktree. Clean merge → remove feature worktree
-        and branch, transition MERGED. Conflicts → keep the feature
-        worktree and branch intact, transition CONFLICTED with the
-        conflict summary stored in `last_error` for the inspect view.
-
-    Returns the feature-branch commit SHA (not the merge commit) either
-    way, so callers can always address the agent's work directly."""
+    Returns the feature-branch commit SHA (not the merge commit), so
+    callers can always address the agent's work directly."""
     assert item.status == ItemStatus.AWAITING_REVIEW, \
         f"commit expects AWAITING_REVIEW, got {item.status}"
     assert item.worktree_path
+    p = progress or _noop
 
     wt = Path(item.worktree_path)
     repo = config.project_root
@@ -45,23 +49,17 @@ def approve_and_commit(
             src_in_wt.unlink()
 
     if _has_uncommitted(wt):
+        p("committing agent work")
         sha = git_ops.commit_all(wt, message)
         note_prefix = "committed"
     else:
         sha = git_ops.run(wt, "rev-parse", "HEAD").stdout.strip()
         note_prefix = "recorded existing commit"
 
-    if not config.git.auto_merge:
-        git_ops.worktree_remove(repo, wt, force=False)
-        store.transition(
-            item.id, ItemStatus.MERGED,
-            note=f"{note_prefix} {sha[:8]} on {item.branch} "
-                 f"(no auto-merge; merge into {config.git.base_branch} by hand)",
-        )
-        return sha
-
     tmp_root = repo / ".agentor" / "merge-tmp"
     mode = config.git.merge_mode
+    verb = "rebasing onto" if mode == "rebase" else "merging into"
+    p(f"{verb} {config.git.base_branch}")
     merge_sha, conflict = git_ops.merge_feature_into_base(
         repo, item.branch, config.git.base_branch,
         message=f"Merge branch '{item.branch}' into {config.git.base_branch}"
@@ -79,6 +77,7 @@ def approve_and_commit(
         )
         return sha
 
+    p("cleaning up worktree and branch")
     git_ops.worktree_remove(repo, wt, force=False)
     git_ops.branch_delete(repo, item.branch, force=True)
     store.transition(
@@ -91,6 +90,7 @@ def approve_and_commit(
 
 def retry_merge(
     config: Config, store: Store, item: StoredItem,
+    *, progress: ProgressCb | None = None,
 ) -> tuple[bool, str]:
     """Re-attempt the auto-merge for a CONFLICTED item after the user has
     resolved conflicts in the feature worktree (or otherwise made the
@@ -107,15 +107,19 @@ def retry_merge(
     assert item.status == ItemStatus.CONFLICTED, \
         f"retry_merge expects CONFLICTED, got {item.status}"
     assert item.worktree_path and item.branch
+    p = progress or _noop
 
     wt = Path(item.worktree_path)
     repo = config.project_root
 
     if _has_uncommitted(wt):
+        p("committing conflict resolution")
         git_ops.commit_all(wt, "resolve merge conflicts")
 
     tmp_root = repo / ".agentor" / "merge-tmp"
     mode = config.git.merge_mode
+    verb = "rebasing onto" if mode == "rebase" else "merging into"
+    p(f"{verb} {config.git.base_branch} (retry)")
     merge_sha, conflict = git_ops.merge_feature_into_base(
         repo, item.branch, config.git.base_branch,
         message=f"Merge branch '{item.branch}' into {config.git.base_branch}"
@@ -130,6 +134,7 @@ def retry_merge(
         )
         return False, f"still conflicted: {conflict.splitlines()[0] if conflict else '?'}"
 
+    p("cleaning up worktree and branch")
     git_ops.worktree_remove(repo, wt, force=False)
     git_ops.branch_delete(repo, item.branch, force=True)
     store.transition(
@@ -216,9 +221,16 @@ def approve_plan(store: Store, item: StoredItem) -> None:
 
 
 def retry(store: Store, item: StoredItem) -> None:
-    """Re-queue a rejected item for another attempt. Keeps the existing worktree."""
-    assert item.status == ItemStatus.REJECTED
-    store.transition(item.id, ItemStatus.QUEUED, note="retry after rejection")
+    """Re-queue a rejected or errored item for another attempt. Keeps the
+    existing worktree and session_id so the runner can --resume if still live.
+    Clears last_error and resets the attempt counter — human-driven retry
+    shouldn't consume the agent's own retry budget."""
+    assert item.status in (ItemStatus.REJECTED, ItemStatus.ERRORED)
+    store.transition(
+        item.id, ItemStatus.QUEUED,
+        last_error=None, attempts=0,
+        note=f"retry after {item.status.value}",
+    )
 
 
 def delete_idea(store: Store, item: StoredItem) -> None:

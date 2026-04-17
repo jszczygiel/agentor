@@ -156,12 +156,11 @@ class AgentConfig:
 class GitConfig:
     base_branch: str = "main"
     branch_prefix: str = "agent/"
-    auto_merge: bool = False
-    # How to integrate the feature branch into `base_branch` when auto_merge
-    # is on. "merge" (default) creates a --no-ff merge commit. "rebase"
-    # replays the feature commits onto base for a linear history — if the
-    # rebase conflicts, the feature worktree is left in its pre-rebase
-    # state and the item is parked in CONFLICTED.
+    # How to integrate the feature branch into `base_branch` on approval.
+    # "merge" (default) creates a --no-ff merge commit. "rebase" replays
+    # the feature commits onto base for a linear history — if the rebase
+    # conflicts, the feature worktree is left in its pre-rebase state and
+    # the item is parked in CONFLICTED.
     merge_mode: str = "merge"
 
 

@@ -1,10 +1,13 @@
 import curses
 import json
 import os
+import queue
 import subprocess
+import threading
 import time
 from collections import deque
 from pathlib import Path
+from typing import Callable
 
 from .config import Config
 from .daemon import Daemon
@@ -794,6 +797,8 @@ def _inspect_render(stdscr, cfg: Config, store: Store, item: StoredItem) -> None
                 "auto-refresh 1s "
                 + ("· [m]retry merge " if item.status == ItemStatus.CONFLICTED
                    else "")
+                + ("· [r]retry " if item.status == ItemStatus.ERRORED
+                   else "")
             )
             _show_item_screen(
                 stdscr, header, lines, footer, content_scroll=scroll,
@@ -811,7 +816,11 @@ def _inspect_render(stdscr, cfg: Config, store: Store, item: StoredItem) -> None
             if k == "m" and item.status == ItemStatus.CONFLICTED:
                 from .committer import retry_merge
                 try:
-                    _, msg = retry_merge(cfg, store, item)
+                    ok_msg = _run_with_progress(
+                        stdscr, f"  retry merge · {item.title}",
+                        lambda p: retry_merge(cfg, store, item, progress=p),
+                    )
+                    _, msg = ok_msg  # type: ignore[misc]
                 except Exception as e:  # git or state errors
                     msg = f"retry failed: {e}"
                 _flash(stdscr, msg)
@@ -819,6 +828,17 @@ def _inspect_render(stdscr, cfg: Config, store: Store, item: StoredItem) -> None
                 # longer conflicted so there's nothing more to inspect.
                 refreshed = store.get(item.id)
                 if refreshed and refreshed.status != ItemStatus.CONFLICTED:
+                    return
+            if k == "r" and item.status == ItemStatus.ERRORED:
+                from .committer import retry
+                try:
+                    retry(store, item)
+                    msg = f"retry: {item.id[:8]} → queued"
+                except Exception as e:
+                    msg = f"retry failed: {e}"
+                _flash(stdscr, msg)
+                refreshed = store.get(item.id)
+                if refreshed and refreshed.status != ItemStatus.ERRORED:
                     return
     finally:
         # Restore the main loop's refresh cadence.
@@ -1059,7 +1079,14 @@ def _review_code_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
             return "quit"
         if k == "a":
             msg = _build_commit_message(fresh)
-            approve_and_commit(cfg, store, fresh, msg)
+            try:
+                _run_with_progress(
+                    stdscr, f"  approve + merge · {fresh.title}",
+                    lambda p: approve_and_commit(
+                        cfg, store, fresh, msg, progress=p),
+                )
+            except Exception as e:  # git/state errors shouldn't kill UI
+                _flash(stdscr, f"merge failed: {e}")
             return ""
         if k == "r":
             _handle_reject_flow(stdscr, store, fresh, "code")
@@ -1119,6 +1146,75 @@ def _flash(stdscr, msg: str) -> None:
                  curses.A_BOLD | curses.A_REVERSE)
     stdscr.refresh()
     curses.napms(1200)
+
+
+def _run_with_progress(
+    stdscr, title: str, work: Callable[[Callable[[str], None]], object],
+) -> object:
+    """Run `work(progress)` on a background thread while repainting a
+    centered progress overlay with the latest progress message and an
+    elapsed-seconds counter. Keeps curses responsive during slow git
+    operations (commit, worktree add, merge/rebase) that would otherwise
+    leave the dashboard looking frozen.
+
+    Only the main thread touches curses; the worker posts strings via a
+    queue. Propagates exceptions raised by `work`."""
+    msgs: queue.Queue[str] = queue.Queue()
+    result: dict[str, object] = {}
+
+    def progress(msg: str) -> None:
+        msgs.put(msg)
+
+    def target() -> None:
+        try:
+            result["ok"] = work(progress)
+        except BaseException as e:  # noqa: BLE001 — re-raised below
+            result["err"] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+
+    current = "starting…"
+    started = time.monotonic()
+    stdscr.nodelay(True)
+    stdscr.timeout(150)
+    spinner = "|/-\\"
+    tick = 0
+    try:
+        while t.is_alive() or not msgs.empty():
+            try:
+                current = msgs.get_nowait()
+            except queue.Empty:
+                pass
+            elapsed = time.monotonic() - started
+            h, w = stdscr.getmaxyx()
+            stdscr.erase()
+            _safe_addstr(stdscr, 0, 0, title.ljust(w), w,
+                         curses.A_BOLD | curses.A_REVERSE)
+            body = [
+                "",
+                f"  {spinner[tick % 4]}  {current}",
+                f"     ({elapsed:.1f}s elapsed)",
+                "",
+                "  this can take a few seconds on large repos —",
+                "  git worktree add + merge/rebase runs here.",
+            ]
+            for i, ln in enumerate(body):
+                _safe_addstr(stdscr, 2 + i, 0, ln[:w], w)
+            _safe_addstr(stdscr, h - 1, 0,
+                         " working… keystrokes ignored ".ljust(w), w,
+                         curses.A_DIM | curses.A_REVERSE)
+            stdscr.refresh()
+            stdscr.getch()  # drain; timeout returns -1
+            tick += 1
+            if not t.is_alive():
+                break
+    finally:
+        stdscr.timeout(REFRESH_MS)
+
+    if "err" in result:
+        raise result["err"]  # type: ignore[misc]
+    return result.get("ok")
 
 
 def _show_item_screen(

@@ -22,7 +22,6 @@ test_cmd = "./gradlew test"
 [git]
 base_branch = "main"
 branch_prefix = "agent/"
-auto_merge = false
 
 [review]
 port = 7777

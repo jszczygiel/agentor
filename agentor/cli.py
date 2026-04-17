@@ -67,7 +67,6 @@ def cmd_init(args: argparse.Namespace) -> int:
         '[git]\n'
         'base_branch = "main"\n'
         'branch_prefix = "agent/"\n'
-        'auto_merge = false\n'
         '\n'
         '[review]\n'
         'port = 7777\n'
