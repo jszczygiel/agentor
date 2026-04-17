@@ -7,12 +7,21 @@ Usage:
 Defaults to $AGENTOR_PROJECT_ROOT/.agentor/transcripts when the env var
 is set. Pass a directory explicitly for ad-hoc analysis of another
 project's transcripts."""
-import json
 import os
 import statistics
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from agentor.transcript import (  # noqa: E402
+    AssistantUsage,
+    RunResult,
+    ToolCall,
+    ToolResult,
+    iter_events,
+)
 
 
 if len(sys.argv) > 1:
@@ -35,27 +44,7 @@ OPUS_CACHE_WRITE = 18.75
 OPUS_CACHE_READ = 1.50
 
 
-def parse_file(path: Path):
-    """Return dict with parsed events from a transcript."""
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        raw = f.read()
-
-    # Transcripts store a header, then "stdout:\n<JSONL>\n\nstderr:\n..."
-    # Just extract the JSONL lines (anything starting with `{`)
-    events = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or not line.startswith("{"):
-            continue
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return events
-
-
 def analyze_run(path: Path):
-    events = parse_file(path)
     stem = path.stem  # e.g. 07340a3f34a9.execute or 07340a3f34a9 (single)
     parts = stem.split(".")
     item_id = parts[0]
@@ -67,9 +56,7 @@ def analyze_run(path: Path):
     total_cache_read = 0
     tool_uses = Counter()
     reads_by_file = Counter()
-    tool_result_sizes = []  # (bytes, preview, tool_use_id)
-    tool_use_by_id = {}  # id -> (tool_name, input_dict)
-    num_turns = 0
+    tool_result_sizes = []  # (bytes, tool_name, tool_input)
     result_cost = None
     result_usage = None
     result_duration_ms = None
@@ -78,61 +65,32 @@ def analyze_run(path: Path):
     stop_reason = None
     file_size = path.stat().st_size
 
-    for ev in events:
-        t = ev.get("type")
-        if t == "assistant":
-            msg = ev.get("message", {})
-            usage = msg.get("usage") or {}
-            if usage:
-                # stream-json emits usage per assistant message
-                total_input += usage.get("input_tokens", 0) or 0
-                total_output += usage.get("output_tokens", 0) or 0
-                total_cache_create += usage.get("cache_creation_input_tokens", 0) or 0
-                total_cache_read += usage.get("cache_read_input_tokens", 0) or 0
-            stop_reason = msg.get("stop_reason") or stop_reason
-            # Count tool uses
-            content = msg.get("content") or []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    name = block.get("name", "?")
-                    tool_uses[name] += 1
-                    tool_input = block.get("input") or {}
-                    tool_use_by_id[block.get("id")] = (name, tool_input)
-                    if name == "Read":
-                        fp = tool_input.get("file_path") or "?"
-                        reads_by_file[fp] += 1
-        elif t == "user":
-            # tool_result blocks
-            msg = ev.get("message", {})
-            content = msg.get("content") or []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    use_id = block.get("tool_use_id")
-                    result_content = block.get("content")
-                    if isinstance(result_content, list):
-                        parts_text = []
-                        for sub in result_content:
-                            if isinstance(sub, dict) and sub.get("type") == "text":
-                                parts_text.append(sub.get("text", ""))
-                        text = "".join(parts_text)
-                    elif isinstance(result_content, str):
-                        text = result_content
-                    else:
-                        text = ""
-                    sz = len(text.encode("utf-8", errors="replace"))
-                    tname, tinput = tool_use_by_id.get(use_id, ("?", {}))
-                    tool_result_sizes.append((sz, tname, tinput))
-        elif t == "result":
-            result_cost = ev.get("total_cost_usd")
-            result_usage = ev.get("usage")
-            result_duration_ms = ev.get("duration_ms")
-            result_num_turns = ev.get("num_turns")
-            subtype = ev.get("subtype")
-            if subtype and "turn" in str(subtype).lower():
+    for ev in iter_events(path):
+        if isinstance(ev, AssistantUsage):
+            usage = ev.usage
+            total_input += usage.get("input_tokens", 0) or 0
+            total_output += usage.get("output_tokens", 0) or 0
+            total_cache_create += usage.get("cache_creation_input_tokens", 0) or 0
+            total_cache_read += usage.get("cache_read_input_tokens", 0) or 0
+            stop_reason = ev.stop_reason or stop_reason
+        elif isinstance(ev, ToolCall):
+            name = ev.name or "?"
+            tool_uses[name] += 1
+            if name == "Read":
+                reads_by_file[ev.input.get("file_path") or "?"] += 1
+        elif isinstance(ev, ToolResult):
+            sz = len(ev.text.encode("utf-8", errors="replace"))
+            tname = ev.tool_name or "?"
+            tool_result_sizes.append((sz, tname, ev.tool_input))
+        elif isinstance(ev, RunResult):
+            result_cost = ev.total_cost_usd
+            result_usage = ev.usage
+            result_duration_ms = ev.duration_ms
+            result_num_turns = ev.num_turns
+            if ev.subtype and "turn" in ev.subtype.lower():
                 hit_turn_limit = True
-            if ev.get("is_error"):
-                # sometimes turn-limit surfaces as error
-                err_txt = str(ev.get("result", "")).lower()
+            if ev.is_error:
+                err_txt = str(ev.result or "").lower()
                 if "turn" in err_txt and "limit" in err_txt:
                     hit_turn_limit = True
 
