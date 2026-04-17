@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from . import __version__ as AGENTOR_VERSION
 from .models import Item, ItemStatus
 
 
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS items (
     feedback      TEXT,
     result_json   TEXT,
     session_id    TEXT,
+    agentor_version TEXT,
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL
 );
@@ -65,6 +67,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE items ADD COLUMN session_id TEXT")
     if "feedback" not in cols:
         conn.execute("ALTER TABLE items ADD COLUMN feedback TEXT")
+    if "agentor_version" not in cols:
+        conn.execute("ALTER TABLE items ADD COLUMN agentor_version TEXT")
 
 
 @dataclass
@@ -83,6 +87,7 @@ class StoredItem:
     feedback: str | None
     result_json: str | None
     session_id: str | None
+    agentor_version: str | None
     created_at: float
     updated_at: float
 
@@ -103,6 +108,7 @@ def _row_to_stored(row: sqlite3.Row) -> StoredItem:
         feedback=row["feedback"],
         result_json=row["result_json"],
         session_id=row["session_id"],
+        agentor_version=row["agentor_version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -252,9 +258,11 @@ class Store:
             c.execute(
                 """UPDATE items
                    SET status = ?, worktree_path = ?, branch = ?,
-                       attempts = attempts + 1, updated_at = ?
+                       attempts = attempts + 1, agentor_version = ?,
+                       updated_at = ?
                    WHERE id = ? AND status = ?""",
-                (ItemStatus.WORKING.value, worktree_path, branch, now,
+                (ItemStatus.WORKING.value, worktree_path, branch,
+                 AGENTOR_VERSION, now,
                  item_id, ItemStatus.QUEUED.value),
             )
             c.execute(

@@ -804,6 +804,7 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
     out.append(f"worktree: {item.worktree_path or '—'}")
     out.append(f"session:  {item.session_id or '—'}")
     out.append(f"attempts: {item.attempts} / {cfg.agent.max_attempts}")
+    out.append(f"agentor:  {item.agentor_version or '—'}")
     elapsed = _elapsed_for(store, item.id)
     if elapsed is not None:
         out.append(f"elapsed:  {_fmt_elapsed(elapsed)} (since enter WORKING)")
