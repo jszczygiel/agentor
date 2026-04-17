@@ -300,14 +300,25 @@ def approve_backlog(
     )
 
 
-def approve_plan(store: Store, item: StoredItem) -> None:
+def approve_plan(
+    store: Store, item: StoredItem, feedback: str | None = None,
+) -> None:
     """User approved the agent's development plan. Push the item back to QUEUED
     so the daemon re-claims it; the runner sees the persisted plan in
-    result_json and runs the execute phase (resumes the same claude session)."""
+    result_json and runs the execute phase (resumes the same claude session).
+
+    Optional `feedback` is persisted and consumed once by the runner's
+    `_prepend_feedback` on the execute phase — same path as reject_and_retry
+    and approve_backlog."""
     assert item.status == ItemStatus.AWAITING_PLAN_REVIEW
+    fields: dict[str, object] = {}
+    if feedback:
+        fields["feedback"] = feedback
     store.transition(
         item.id, ItemStatus.QUEUED,
-        note="plan approved — execute phase queued",
+        note="plan approved — execute phase queued"
+        + (" with feedback" if feedback else ""),
+        **fields,
     )
 
 
