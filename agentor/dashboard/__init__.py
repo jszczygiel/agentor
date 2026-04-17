@@ -14,8 +14,8 @@ from .render import (
 )
 from .modes import (
     _deferred_mode,
+    _enter_action,
     _inspect_mode,
-    _inspect_render,
     _new_issue_mode,
     _pickup_mode,
     _review_mode,
@@ -120,7 +120,12 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
             if ch in (10, 13, curses.KEY_ENTER) and rendered and selected_id:
                 sel = store.get(selected_id)
                 if sel is not None:
-                    _inspect_render(stdscr, cfg, store, sel)
+                    # Route by status: BACKLOG/DEFERRED → pickup screen,
+                    # AWAITING_PLAN_REVIEW/AWAITING_REVIEW → review screens,
+                    # everything else → live inspect. `i` still opens the
+                    # prefix-prompt inspect as a backward-compatible escape
+                    # hatch.
+                    _enter_action(stdscr, cfg, store, daemon, sel)
                     # Flush any keys typed while the sub-screen was
                     # tearing down — a double-tap of 'q' to close
                     # inspect would otherwise bubble up and exit the app.
