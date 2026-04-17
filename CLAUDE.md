@@ -44,7 +44,7 @@ Key modules:
 - `agentor/runner.py` — `Runner` base class + `StubRunner`, `ClaudeRunner`, `CodexRunner`. Two-phase flow: `plan` (read-only; stops at AWAITING_PLAN_REVIEW) → human approves via `approve_plan` → `execute` resumes the same session (`--resume <session_id>` for claude, `thread_id` for codex) and commits. `single_phase=true` skips plan and goes straight to execute.
 - `agentor/committer.py` — handles AWAITING_REVIEW → MERGED. `approve_and_commit` commits any uncommitted work on the feature branch, then integrates into `git.base_branch` via an ephemeral detached worktree (`merge` → `--no-ff`, `rebase` → `rebase <base>`-then-CAS-fast-forward). Conflicts transition to CONFLICTED with the summary in `last_error`; `retry_merge` re-runs the integration after the user resolves in the feature worktree.
 - `agentor/recovery.py` — runs at daemon startup. WORKING items with a live `session_id` + worktree go back into resumable; everything else reverts to its previous settled status. Also clears benign stale `last_error` markers.
-- `agentor/dashboard.py` — curses UI. Main table auto-refreshes at `REFRESH_MS=500`; modes: pickup `p`, review `r`, deferred `d`, inspect `i`. Inspect auto-refreshes every 1s and parses the claude stream-json transcript into a session-activity feed; `[m]` retries merge for CONFLICTED items.
+- `agentor/dashboard/` — curses UI package. `render.py` owns screens/prompts, `modes.py` owns actions (pickup/review/deferred/inspect), `formatters.py` formats table cells, `transcript.py` parses the claude stream-json session feed. Main table auto-refreshes at `REFRESH_MS=500`; modes: pickup `p`, review `r`, deferred `d`, inspect `i`. Inspect auto-refreshes every 1s; `[m]` retries merge for CONFLICTED items.
 
 Design invariants to preserve:
 
@@ -55,6 +55,18 @@ Design invariants to preserve:
 - **Worktrees start from the current tip of `git.base_branch`** — `worktree_add` passes the branch name, so git resolves the sha at dispatch time. Resumed worktrees (plan → review → execute) run `fast_forward_to_base` before `do_work` to pull in any base-branch commits that landed during the review gap; if the feature has diverged (agent committed during plan), ff refuses and we fall through silently so the final integration step handles the divergence.
 - **Auto-merge never touches the user's checkout of base_branch** — `merge_feature_into_base` always works in a `--detach`ed temp worktree and CAS-advances the ref via `update-ref OLD NEW`.
 - **Feedback is consumed once**: the runner's `_prepend_feedback` reads `item.feedback`, injects it into the next prompt, and clears the column so a future run starts clean.
+
+## Gotchas from prior runs
+
+Hard-won traps future agents keep rediscovering. Promote additional durable lessons from `docs/agent-logs/` here when they recur.
+
+- **Stale `file:line` refs in backlog items** — the codebase moves; `agentor/dashboard.py` is now the `agentor/dashboard/` package. Grep stable symbols, not filenames, before trusting any path cited in a ticket.
+- **`last_error` is capped at 4000 chars** — `Store.transition` stores whatever you hand it, but the inspect view and downstream consumers truncate at 4000. When composing structured summaries (see `committer._build_conflict_summary`), pre-cap each section independently (`_BODY_CAP=2000`, `_RAW_CAP=1500`) so the trailing mechanics block survives; a single outer `[:4000]` silently amputates whatever came last.
+- **Status SQLite boundary is centralized** — `_encode_status` / `_decode_status` in `store.py` are the only place `ItemStatus` ↔ string crosses the DB. Don't sprinkle `.value` at new callsites; route through the helpers. Also: `Store.transitions_for` returns `Transition` dataclasses with `from_status`, `to_status`, `note`, `at` — not dicts, and the status fields are already decoded enums.
+- **`tools/` scripts run as files, not modules** — importing from `agentor` requires `sys.path.insert(0, str(Path(__file__).resolve().parent.parent))` at the top (see `tools/analyze_transcripts.py`). Don't add a `__init__.py` to `tools/` — keep scripts runnable as `python3 tools/foo.py` from the repo root.
+- **Lazy `..committer` imports in `dashboard/modes.py`** — action functions do `from ..committer import …` inside the function body, not at module top, to sidestep a circular import via `store`. Preserve the pattern when wiring new actions; a top-level import will break dashboard startup.
+- **Python version pinning is load-bearing** — `requires-python = ">=3.11"`. Nested f-strings reusing the same quote char are PEP 701 (3.12+) and will `SyntaxError` on 3.11 CI. Keep ruff `target-version = "py311"` and mypy `python_version = "3.11"` in `pyproject.toml` so devs on 3.13 get the error locally instead of in CI.
+- **Merge shortcut for cosmetic-vs-semantic conflicts** — when `main` lands a cosmetic refactor (reorders, banners, rename sweeps) while the branch edits the same functions, prefer `git checkout --theirs -- <file>` then manually re-apply the semantic deltas. Git's recursive merge has silently corrupted `store.py` past the conflict markers in the past; trust the three-way resolution less than your own re-application of a small diff.
 
 ## No-deps policy
 
