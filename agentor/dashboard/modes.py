@@ -85,8 +85,10 @@ def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
                     if f.status == ItemStatus.DEFERRED:
                         restored = restore_deferred(store, f)
                         if restored == ItemStatus.BACKLOG:
+                            refreshed = store.get(f.id)
+                            assert refreshed is not None
                             approve_backlog(
-                                store, store.get(f.id), feedback=feedback,
+                                store, refreshed, feedback=feedback,
                             )
                     elif f.status == ItemStatus.BACKLOG:
                         approve_backlog(store, f, feedback=feedback)
@@ -342,9 +344,11 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
         for f in failures:
             when = time.strftime("%Y-%m-%d %H:%M:%S",
                                  time.localtime(float(f["at"])))
+            dur_ms = f["duration_ms"]
+            dur = f"{dur_ms/1000:.1f}s" if dur_ms else "—"
             header = (f"#{f['attempt']} {f['phase'] or '—'}  {when}"
                       f"  turns={f['num_turns'] or '—'}"
-                      f"  dur={f['duration_ms'] and f'{f['duration_ms']/1000:.1f}s' or '—'}")
+                      f"  dur={dur}")
             out.append(header)
             err = (f["error"] or "").strip()
             # Keep each failure compact: first line, up to 3 wrapped lines.
@@ -395,7 +399,7 @@ def _review_plan_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
                         item: StoredItem) -> str:
     """Plan review as a single-item curses screen. Returns "quit" if the user
     pressed q, else "" to continue walking."""
-    from ..committer import approve_plan, defer, reject, reject_and_retry
+    from ..committer import approve_plan, defer
     data = _result_data(item) or {}
     plan_text = data.get("plan") or data.get("summary") or "(no plan text)"
     scroll = 0
@@ -442,7 +446,7 @@ def _review_plan_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
 def _review_code_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
                         item: StoredItem) -> str:
     """Code review (post-commit) as a single-item curses screen."""
-    from ..committer import approve_and_commit, defer, reject, reject_and_retry
+    from ..committer import approve_and_commit, defer
     data = _result_data(item) or {}
     summary = data.get("summary") or "(no summary)"
     files = data.get("files_changed") or []

@@ -68,8 +68,9 @@ def _extract_checkbox(text: str, source_file: str) -> list[Item]:
         j = i + 1
         while j < len(lines):
             nxt = lines[j]
-            if CHECKBOX_RE.match(nxt):
-                nxt_indent = len(CHECKBOX_RE.match(nxt).group(1))
+            nxt_m = CHECKBOX_RE.match(nxt)
+            if nxt_m:
+                nxt_indent = len(nxt_m.group(1))
                 if nxt_indent <= indent:
                     break
             if HEADING_RE.match(nxt):

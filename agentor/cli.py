@@ -4,6 +4,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from typing import Callable
 
 from .committer import approve_and_commit, reject
 from .config import Config, load
@@ -129,7 +130,7 @@ REPL_HELP = """commands:
 """
 
 
-def _make_daemon_logger(log_path: Path, ring: deque, to_stdout: bool) -> callable:
+def _make_daemon_logger(log_path: Path, ring: deque, to_stdout: bool) -> Callable[[str], None]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("a", buffering=1)
 
@@ -361,6 +362,7 @@ def _review_one(cfg: Config, store: Store, item) -> None:
     elif choice == "r":
         fb = input("feedback for agent (empty = terminal reject): ").strip()
         fresh = store.get(item.id)
+        assert fresh is not None
         if fb:
             from .committer import reject_and_retry
             reject_and_retry(store, fresh, fb)
