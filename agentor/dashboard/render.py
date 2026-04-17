@@ -20,8 +20,8 @@ from .formatters import (
 )
 
 
-ACTIONS = ("[p]ickup  [r]eview  [d]eferred  [i]nspect  "
-           "[tab]filter  [+/-]pool  [m]ode  [u]npause  [q]uit")
+ACTIONS = ("[enter]open  [j/k]move  [p]ickup  [r]eview  [d]eferred  "
+           "[i]nspect  [tab]filter  [+/-]pool  [m]ode  [u]npause  [q]uit")
 
 # Filter views: ordered list cycled by Tab. Each entry maps a filter name
 # to the statuses to display (None = all).
@@ -89,7 +89,10 @@ def _status_color(status: ItemStatus) -> int:
     }.get(status, 0)
 
 
-def _render(stdscr, cfg, store, daemon, log_ring, filter_idx):
+def _render(stdscr, cfg, store, daemon, log_ring, filter_idx, selected_idx):
+    """Draw one full frame and return the ordered items list that was
+    rendered, so the caller can map `selected_idx` back to an item for
+    enter-key dispatch."""
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     row = 0
@@ -152,8 +155,11 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx):
     body_height = h - body_top - 1  # leave 1 line for log
     _filter_name_cur, filter_statuses = FILTERS[filter_idx]
     statuses = filter_statuses if filter_statuses is not None else list(ItemStatus)
-    _render_table(stdscr, store, body_top, body_height, w, statuses,
-                  cfg.agent.context_window)
+    # Build the ordered items list once so the caller and the renderer agree
+    # on exactly which item `selected_idx` points to.
+    items = [it for st in statuses for it in store.list_by_status(st)]
+    _render_table(stdscr, store, body_top, body_height, w, items,
+                  cfg.agent.context_window, selected_idx)
 
     # log tail
     log_row = h - 1
@@ -172,6 +178,7 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx):
         f"B{counts[ItemStatus.BACKLOG]} "
         f"R{reviews}"
     )
+    return items
 
 
 def _safe_addstr(stdscr, y, x, s, w, attr=0):
@@ -181,7 +188,8 @@ def _safe_addstr(stdscr, y, x, s, w, attr=0):
         pass
 
 
-def _render_table(stdscr, store, top, height, w, statuses, context_window):
+def _render_table(stdscr, store, top, height, w, items, context_window,
+                  selected_idx):
     if height <= 0:
         return
     header = (f" {'ID':<{_COL_ID-1}}{'STATE':<{_COL_STATE}}"
@@ -190,48 +198,51 @@ def _render_table(stdscr, store, top, height, w, statuses, context_window):
     _safe_addstr(stdscr, top, 0, header.ljust(w), w,
                  curses.A_BOLD | curses.A_UNDERLINE)
     rows_used = 1
-    for st in statuses:
-        items = store.list_by_status(st)
-        for it in items:
-            has_err = bool(it.last_error)
-            if rows_used >= height:
-                _safe_addstr(stdscr, top + rows_used - 1, 0,
-                             " ... (more not shown)".ljust(w), w,
-                             curses.A_DIM)
-                return
-            elapsed = _elapsed_for(store, it.id) if st == ItemStatus.WORKING else None
-            elapsed_s = _fmt_elapsed(elapsed) if elapsed is not None else "—"
-            ctx_s = _ctx_fill_pct(it, context_window)
-            src = it.source_file
-            if len(src) > _COL_SOURCE - 1:
-                src = "…" + src[-(_COL_SOURCE - 2):]
-            title_max = max(0, w - 1 - _COL_ID - _COL_STATE - _COL_ELAPSED
-                              - _COL_CTX - _COL_SOURCE)
-            # `!` marker on the state column when the item carries an
-            # unresolved error — makes sticky problems visible in the
-            # default view without needing the errors filter.
-            marker = "!" if has_err else " "
-            state_label = st.value
+    for idx, it in enumerate(items):
+        has_err = bool(it.last_error)
+        if rows_used >= height:
+            _safe_addstr(stdscr, top + rows_used - 1, 0,
+                         " ... (more not shown)".ljust(w), w,
+                         curses.A_DIM)
+            return
+        st = it.status
+        elapsed = _elapsed_for(store, it.id) if st == ItemStatus.WORKING else None
+        elapsed_s = _fmt_elapsed(elapsed) if elapsed is not None else "—"
+        ctx_s = _ctx_fill_pct(it, context_window)
+        src = it.source_file
+        if len(src) > _COL_SOURCE - 1:
+            src = "…" + src[-(_COL_SOURCE - 2):]
+        title_max = max(0, w - 1 - _COL_ID - _COL_STATE - _COL_ELAPSED
+                          - _COL_CTX - _COL_SOURCE)
+        # `!` marker on the state column when the item carries an
+        # unresolved error — makes sticky problems visible in the
+        # default view without needing the errors filter.
+        marker = "!" if has_err else " "
+        state_label = st.value
+        if st == ItemStatus.WORKING:
+            phase = _phase_for(it)
+            if not phase:
+                phase = "execute" if it.session_id else "plan"
+            state_label = f"{state_label}·{'plan' if phase == 'plan' else 'exec'}"
+        state_cell = f"{marker}{state_label}"[: _COL_STATE]
+        title = it.title[:title_max]
+        line = (f" {it.id[:8]:<{_COL_ID-1}}{state_cell:<{_COL_STATE}}"
+                f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
+                f"{src:<{_COL_SOURCE}}{title}")
+        if has_err:
+            # Red for rows that need the user's attention; overrides
+            # the status-based color so the error is unmistakable.
+            attr = curses.color_pair(4) | curses.A_BOLD
+        else:
+            attr = curses.color_pair(_status_color(st))
             if st == ItemStatus.WORKING:
-                phase = _phase_for(it)
-                if not phase:
-                    phase = "execute" if it.session_id else "plan"
-                state_label = f"{state_label}·{'plan' if phase == 'plan' else 'exec'}"
-            state_cell = f"{marker}{state_label}"[: _COL_STATE]
-            title = it.title[:title_max]
-            line = (f" {it.id[:8]:<{_COL_ID-1}}{state_cell:<{_COL_STATE}}"
-                    f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
-                    f"{src:<{_COL_SOURCE}}{title}")
-            if has_err:
-                # Red for rows that need the user's attention; overrides
-                # the status-based color so the error is unmistakable.
-                attr = curses.color_pair(4) | curses.A_BOLD
-            else:
-                attr = curses.color_pair(_status_color(st))
-                if st == ItemStatus.WORKING:
-                    attr |= curses.A_BOLD
-            _safe_addstr(stdscr, top + rows_used, 0, line, w, attr)
-            rows_used += 1
+                attr |= curses.A_BOLD
+        if idx == selected_idx:
+            # XOR A_REVERSE onto the existing attr so the selection highlight
+            # doesn't destroy the status color — keeps the error-red visible.
+            attr ^= curses.A_REVERSE
+        _safe_addstr(stdscr, top + rows_used, 0, line, w, attr)
+        rows_used += 1
 
 
 def _show_item_screen(

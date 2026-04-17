@@ -39,7 +39,6 @@ from .transcript import (
 def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
     """Curses-native, one-item-per-screen pickup over BACKLOG + DEFERRED.
     Approving promotes BACKLOG → QUEUED; the daemon dispatches on its own."""
-    from ..committer import approve_backlog, defer, delete_idea, restore_deferred
     items = (store.list_by_status(ItemStatus.BACKLOG)
              + store.list_by_status(ItemStatus.DEFERRED))
     if not items:
@@ -51,61 +50,111 @@ def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
             fresh = store.get(it.id)
             if fresh is None:
                 continue
-            scroll = 0
-            while True:
-                h, w = stdscr.getmaxyx()
-                header = [
-                    f"  pickup · {fresh.status.value} · {fresh.title}",
-                    f"  id {fresh.id[:8]}  source {fresh.source_file}:"
-                    f"{fresh.source_line}  attempts "
-                    f"{fresh.attempts}/{cfg.agent.max_attempts}",
-                ]
-                body = _wrap(fresh.body or "(no description)", w - 2)
-                _show_item_screen(
-                    stdscr, header, body,
-                    " [a]approve  [s]defer  [x]delete  [n]leave  [q]uit "
-                    " · [j/k]scroll ",
-                    content_scroll=scroll,
-                )
-                ch = stdscr.getch()
-                new_scroll = _scroll_key(ch, scroll, len(body), max(1, h - 6))
-                if new_scroll >= 0:
-                    scroll = new_scroll
-                    continue
-                k = chr(ch).lower() if 0 < ch < 256 else ""
-                if k == "q":
-                    return
-                if k == "a":
-                    f = store.get(fresh.id)
-                    if f is None:
-                        break
-                    feedback = _prompt_text(
-                        stdscr, "feedback for agent (empty = none): "
-                    ) or None
-                    if f.status == ItemStatus.DEFERRED:
-                        restored = restore_deferred(store, f)
-                        if restored == ItemStatus.BACKLOG:
-                            refreshed = store.get(f.id)
-                            assert refreshed is not None
-                            approve_backlog(
-                                store, refreshed, feedback=feedback,
-                            )
-                    elif f.status == ItemStatus.BACKLOG:
-                        approve_backlog(store, f, feedback=feedback)
-                    daemon.try_fill_pool()
-                    break
-                if k == "s":
-                    f = store.get(fresh.id)
-                    if f and f.status != ItemStatus.DEFERRED:
-                        defer(store, f)
-                    break
-                if k == "x":
-                    f = store.get(fresh.id)
-                    if f and _prompt_yn(stdscr, "delete this idea?"):
-                        delete_idea(store, f)
-                    break
-                if k in ("n", ""):
-                    break
+            if _pickup_one_screen(stdscr, cfg, store, daemon, fresh) == "quit":
+                return
+    finally:
+        stdscr.nodelay(True)
+
+
+def _pickup_one_screen(stdscr, cfg: Config, store: Store, daemon: Daemon,
+                       fresh: StoredItem) -> str:
+    """Single pickup screen for one BACKLOG/DEFERRED item. Returns "quit" on
+    q, else "" when the user advances (a/s/x/n). Caller owns nodelay state."""
+    from ..committer import approve_backlog, defer, delete_idea, restore_deferred
+    scroll = 0
+    while True:
+        h, w = stdscr.getmaxyx()
+        header = [
+            f"  pickup · {fresh.status.value} · {fresh.title}",
+            f"  id {fresh.id[:8]}  source {fresh.source_file}:"
+            f"{fresh.source_line}  attempts "
+            f"{fresh.attempts}/{cfg.agent.max_attempts}",
+        ]
+        body = _wrap(fresh.body or "(no description)", w - 2)
+        _show_item_screen(
+            stdscr, header, body,
+            " [a]approve  [s]defer  [x]delete  [n]leave  [q]uit "
+            " · [j/k]scroll ",
+            content_scroll=scroll,
+        )
+        ch = stdscr.getch()
+        new_scroll = _scroll_key(ch, scroll, len(body), max(1, h - 6))
+        if new_scroll >= 0:
+            scroll = new_scroll
+            continue
+        k = chr(ch).lower() if 0 < ch < 256 else ""
+        if k == "q":
+            return "quit"
+        if k == "a":
+            f = store.get(fresh.id)
+            if f is None:
+                return ""
+            feedback = _prompt_text(
+                stdscr, "feedback for agent (empty = none): "
+            ) or None
+            if f.status == ItemStatus.DEFERRED:
+                restored = restore_deferred(store, f)
+                if restored == ItemStatus.BACKLOG:
+                    refreshed = store.get(f.id)
+                    assert refreshed is not None
+                    approve_backlog(
+                        store, refreshed, feedback=feedback,
+                    )
+            elif f.status == ItemStatus.BACKLOG:
+                approve_backlog(store, f, feedback=feedback)
+            daemon.try_fill_pool()
+            return ""
+        if k == "s":
+            f = store.get(fresh.id)
+            if f and f.status != ItemStatus.DEFERRED:
+                defer(store, f)
+            return ""
+        if k == "x":
+            f = store.get(fresh.id)
+            if f and _prompt_yn(stdscr, "delete this idea?"):
+                delete_idea(store, f)
+            return ""
+        if k in ("n", ""):
+            return ""
+
+
+_ENTER_ROUTES = {
+    ItemStatus.BACKLOG: "pickup",
+    ItemStatus.DEFERRED: "pickup",
+    ItemStatus.AWAITING_PLAN_REVIEW: "plan_review",
+    ItemStatus.AWAITING_REVIEW: "code_review",
+}
+
+
+def _enter_route(status: ItemStatus) -> str:
+    """Pure router: dashboard status → action key for enter.
+    QUEUED is past pickup (already claimed by the scheduler), so it falls
+    through to inspect along with WORKING/MERGED/ERRORED/CONFLICTED/etc."""
+    return _ENTER_ROUTES.get(status, "inspect")
+
+
+def _enter_action(stdscr, cfg: Config, store: Store, daemon: Daemon,
+                  items: list[StoredItem], idx: int) -> None:
+    """Handle enter on the selected row. Re-fetches the item before acting
+    (status may have changed since the last render) and dispatches to the
+    matching single-item screen."""
+    if not items or idx < 0 or idx >= len(items):
+        return
+    fresh = store.get(items[idx].id)
+    if fresh is None:
+        _flash(stdscr, "item no longer exists.")
+        return
+    route = _enter_route(fresh.status)
+    stdscr.nodelay(False)
+    try:
+        if route == "pickup":
+            _pickup_one_screen(stdscr, cfg, store, daemon, fresh)
+        elif route == "plan_review":
+            _review_plan_curses(stdscr, cfg, store, daemon, fresh)
+        elif route == "code_review":
+            _review_code_curses(stdscr, cfg, store, daemon, fresh)
+        else:
+            _inspect_render(stdscr, cfg, store, fresh)
     finally:
         stdscr.nodelay(True)
 

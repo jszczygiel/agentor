@@ -14,6 +14,7 @@ from .render import (
 )
 from .modes import (
     _deferred_mode,
+    _enter_action,
     _inspect_mode,
     _pickup_mode,
     _review_mode,
@@ -36,10 +37,20 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
     _init_colors()
 
     filter_idx = 0  # index into FILTERS
+    selected_idx = 0  # row cursor inside the rendered items list
+    items: list = []
     try:
         while True:
             try:
-                _render(stdscr, cfg, store, daemon, log_ring, filter_idx)
+                items = _render(stdscr, cfg, store, daemon, log_ring,
+                                filter_idx, selected_idx)
+                # Clamp selection against the freshly-rendered list: items
+                # move between status buckets as the daemon works, and the
+                # cursor shouldn't dangle past the end.
+                if items:
+                    selected_idx = max(0, min(selected_idx, len(items) - 1))
+                else:
+                    selected_idx = 0
                 ch = stdscr.getch()
             except KeyboardInterrupt:
                 # ctrl-c in the dashboard should exit cleanly, not crash
@@ -52,6 +63,19 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
             k = chr(ch).lower() if 0 < ch < 256 else ""
             if k == "q":
                 return
+            if ch in (10, 13, curses.KEY_ENTER):
+                # Route enter by the selected row's status — pickup for
+                # backlog/deferred, review for the awaiting states, inspect
+                # for everything else.
+                _enter_action(stdscr, cfg, store, daemon, items, selected_idx)
+                continue
+            if ch in (curses.KEY_DOWN, ord("j")):
+                if items:
+                    selected_idx = min(selected_idx + 1, len(items) - 1)
+                continue
+            if ch in (curses.KEY_UP, ord("k")):
+                selected_idx = max(0, selected_idx - 1)
+                continue
             if k == "r":
                 _review_mode(stdscr, cfg, store, daemon)
             elif k == "p":
@@ -84,5 +108,6 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
                 daemon.clear_alert()
             elif k == "\t":
                 filter_idx = (filter_idx + 1) % len(FILTERS)
+                selected_idx = 0  # filter change rebuilds the list
     finally:
         _set_terminal_title(f"agentor[{cfg.project_name}] stopped")
