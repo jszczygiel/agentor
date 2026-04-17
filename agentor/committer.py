@@ -304,8 +304,8 @@ def restore_deferred(store: Store, item: StoredItem) -> ItemStatus:
     history = store.transitions_for(item.id)
     prior = ItemStatus.QUEUED  # default if history somehow has nothing
     for t in reversed(history):
-        if t["from_status"] and t["from_status"] != ItemStatus.DEFERRED.value:
-            prior = ItemStatus(t["from_status"])
+        if t.from_status and t.from_status != ItemStatus.DEFERRED:
+            prior = t.from_status
             break
     store.transition(item.id, prior, note=f"restored from deferred -> {prior.value}")
     return prior
