@@ -9,3 +9,8 @@ the current task's scope.
   `ParsingConfig`, `SourcesConfig` on lines 9-10). CI runs `ruff check` so these
   should already be failing the workflow — check whether the CI config ignores
   these or whether the suite was pre-broken before ruff was wired in.
+- When `git.auto_resolve_conflicts` chains a CONFLICTED item back into QUEUED,
+  the dashboard inspect view shows no explicit signal that the re-queue was
+  automatic. Consider tagging the transition note (or surfacing an auto-resolve
+  badge in the main table) so operators can distinguish a human `[e]` resubmit
+  from a committer-driven one.
