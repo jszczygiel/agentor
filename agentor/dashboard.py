@@ -18,10 +18,12 @@ ACTIONS = ("[p]ickup  [r]eview  [d]eferred  [i]nspect  "
 # to the statuses to display (None = all).
 FILTERS: list[tuple[str, list[ItemStatus] | None]] = [
     ("all", [ItemStatus.WORKING, ItemStatus.AWAITING_PLAN_REVIEW,
-             ItemStatus.AWAITING_REVIEW, ItemStatus.QUEUED,
-             ItemStatus.BACKLOG, ItemStatus.ERRORED, ItemStatus.REJECTED,
-             ItemStatus.MERGED, ItemStatus.CANCELLED, ItemStatus.DEFERRED]),
+             ItemStatus.AWAITING_REVIEW, ItemStatus.CONFLICTED,
+             ItemStatus.QUEUED, ItemStatus.BACKLOG, ItemStatus.ERRORED,
+             ItemStatus.REJECTED, ItemStatus.MERGED, ItemStatus.CANCELLED,
+             ItemStatus.DEFERRED]),
     ("errored", [ItemStatus.ERRORED]),
+    ("conflicted", [ItemStatus.CONFLICTED]),
     ("backlog", [ItemStatus.BACKLOG]),
     ("queued", [ItemStatus.QUEUED]),
     ("working", [ItemStatus.WORKING]),
@@ -114,6 +116,7 @@ def _status_color(status: ItemStatus) -> int:
         ItemStatus.AWAITING_PLAN_REVIEW: 1,
         ItemStatus.AWAITING_REVIEW: 1,
         ItemStatus.MERGED: 2,
+        ItemStatus.CONFLICTED: 4,
         ItemStatus.REJECTED: 4,
         ItemStatus.CANCELLED: 4,
     }.get(status, 0)
@@ -161,7 +164,8 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx):
         f" {cfg.agent.runner}  pool={cfg.agent.pool_size}  "
         f"mode={cfg.agent.pickup_mode}  "
         f"workers={len(daemon.workers)}  "
-        f"done={s.completed}  errored={counts[ItemStatus.ERRORED]}  │  "
+        f"done={s.completed}  errored={counts[ItemStatus.ERRORED]}  "
+        f"conflicted={counts[ItemStatus.CONFLICTED]}  │  "
         f"backlog={counts[ItemStatus.BACKLOG]}  "
         f"queued={counts[ItemStatus.QUEUED]}  "
         f"working={counts[ItemStatus.WORKING]}  "
@@ -284,6 +288,109 @@ def _tail_lines(path: Path, limit: int = 12) -> list[str]:
     except FileNotFoundError:
         return []
     return lines[-limit:]
+
+
+def _one_line(text: str, width: int) -> str:
+    s = " ".join((text or "").split())
+    return s[: width - 1] + "…" if len(s) > width else s
+
+
+def _brief_tool_input(name: str, inp: object) -> str:
+    """Pick the most informative field of a tool_use input and render it in one
+    line. Keeps `Bash(git status)` and `Read(/path/file.py)` recognisable
+    without dumping full JSON."""
+    if not isinstance(inp, dict):
+        return ""
+    priority = {
+        "Bash": ("command",),
+        "Read": ("file_path",),
+        "Write": ("file_path",),
+        "Edit": ("file_path",),
+        "Glob": ("pattern",),
+        "Grep": ("pattern",),
+        "WebFetch": ("url",),
+        "WebSearch": ("query",),
+    }
+    for key in priority.get(name, ()):
+        val = inp.get(key)
+        if val:
+            return _one_line(str(val), 80)
+    for key in ("command", "file_path", "path", "pattern", "query", "url",
+                "description"):
+        val = inp.get(key)
+        if val:
+            return _one_line(str(val), 80)
+    try:
+        return _one_line(json.dumps(inp, ensure_ascii=False), 80)
+    except Exception:
+        return ""
+
+
+def _tool_result_preview(body: object) -> str:
+    if isinstance(body, list):
+        parts = []
+        for b in body:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(str(b.get("text") or ""))
+            elif isinstance(b, str):
+                parts.append(b)
+        body = "\n".join(parts)
+    if not isinstance(body, str):
+        body = str(body)
+    return _one_line(body, 120) or "(empty)"
+
+
+def _session_activity(path: Path, limit: int = 25) -> list[str]:
+    """Parse the claude stream-json transcript into a compact activity feed:
+    assistant text, tool_use calls, tool_result summaries. Skips non-JSON
+    header lines and malformed events — a live transcript always ends mid-
+    write so robust-by-default matters."""
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return []
+    out: list[str] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or not s.startswith("{"):
+            continue
+        try:
+            ev = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        etype = ev.get("type")
+        if etype == "system" and ev.get("subtype") == "init":
+            out.append("·  session init")
+        elif etype == "assistant":
+            msg = ev.get("message") or {}
+            for block in msg.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    text = (block.get("text") or "").strip()
+                    if text:
+                        out.append(f"·  {_one_line(text, 160)}")
+                elif btype == "tool_use":
+                    name = block.get("name") or "tool"
+                    brief = _brief_tool_input(name, block.get("input"))
+                    out.append(f">  {name}({brief})" if brief else f">  {name}")
+        elif etype == "user":
+            msg = ev.get("message") or {}
+            for block in msg.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") != "tool_result":
+                    continue
+                snippet = _tool_result_preview(block.get("content"))
+                tag = "!" if block.get("is_error") else "<"
+                out.append(f"{tag}  {snippet}")
+        elif etype == "result":
+            rr = ev.get("result") or ev.get("stop_reason") or "done"
+            out.append(f"=  {_one_line(str(rr), 160)}")
+    return out[-limit:]
 
 
 def _tokens_for_model(mu_entry: dict) -> int:
@@ -467,7 +574,13 @@ def _render_table(stdscr, store, top, height, w, statuses, context_window):
             # unresolved error — makes sticky problems visible in the
             # default view without needing the errors filter.
             marker = "!" if has_err else " "
-            state_cell = f"{marker}{st.value}"[: _COL_STATE]
+            state_label = st.value
+            if st == ItemStatus.WORKING:
+                phase = _phase_for(it)
+                if not phase:
+                    phase = "execute" if it.session_id else "plan"
+                state_label = f"{state_label}·{'plan' if phase == 'plan' else 'exec'}"
+            state_cell = f"{marker}{state_label}"[: _COL_STATE]
             title = it.title[:title_max]
             line = (f" {it.id[:8]:<{_COL_ID-1}}{state_cell:<{_COL_STATE}}"
                     f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
@@ -511,7 +624,7 @@ def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
                 body = _wrap(fresh.body or "(no description)", w - 2)
                 _show_item_screen(
                     stdscr, header, body,
-                    " [y]approve  [s]defer  [x]delete  [n]leave  [q]uit "
+                    " [a]approve  [s]defer  [x]delete  [n]leave  [q]uit "
                     " · [j/k]scroll ",
                     content_scroll=scroll,
                 )
@@ -523,16 +636,21 @@ def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
                 k = chr(ch).lower() if 0 < ch < 256 else ""
                 if k == "q":
                     return
-                if k == "y":
+                if k == "a":
                     f = store.get(fresh.id)
                     if f is None:
                         break
+                    feedback = _prompt_text(
+                        stdscr, "feedback for agent (empty = none): "
+                    ) or None
                     if f.status == ItemStatus.DEFERRED:
                         restored = restore_deferred(store, f)
                         if restored == ItemStatus.BACKLOG:
-                            approve_backlog(store, store.get(f.id))
+                            approve_backlog(
+                                store, store.get(f.id), feedback=feedback,
+                            )
                     elif f.status == ItemStatus.BACKLOG:
-                        approve_backlog(store, f)
+                        approve_backlog(store, f, feedback=feedback)
                     daemon.try_fill_pool()
                     break
                 if k == "s":
@@ -621,27 +739,56 @@ def _inspect_mode(stdscr, cfg: Config, store: Store) -> None:
 
 
 def _inspect_render(stdscr, cfg: Config, store: Store, item: StoredItem) -> None:
-    lines = _build_detail_lines(cfg, store, item)
+    """Render inspect as a live view. Re-fetches the item and rebuilds the
+    detail block on every tick so an in-flight agent's activity feed updates
+    in place. Uses `timeout(1000)` so getch returns -1 once per second and
+    drives a redraw even without keypresses."""
     scroll = 0
-    while True:
-        h, w = stdscr.getmaxyx()
-        header = [
-            f"  inspect · {item.title}",
-            f"  id {item.id[:8]}  status {item.status.value}",
-        ]
-        _show_item_screen(
-            stdscr, header, lines,
-            " [q/enter]close · [j/k]scroll · [space/pgdn]page ",
-            content_scroll=scroll,
-        )
-        ch = stdscr.getch()
-        new_scroll = _scroll_key(ch, scroll, len(lines), max(1, h - 4))
-        if new_scroll >= 0:
-            scroll = new_scroll
-            continue
-        k = chr(ch).lower() if 0 < ch < 256 else ""
-        if k == "q" or ch in (10, 13, 27):
-            return
+    stdscr.timeout(1000)
+    try:
+        while True:
+            fresh = store.get(item.id) or item
+            item = fresh
+            lines = _build_detail_lines(cfg, store, item)
+            h, w = stdscr.getmaxyx()
+            header = [
+                f"  inspect · {item.title}",
+                f"  id {item.id[:8]}  status {item.status.value}",
+            ]
+            footer = (
+                " [q/enter]close · [j/k]scroll · [space/pgdn]page · "
+                "auto-refresh 1s "
+                + ("· [m]retry merge " if item.status == ItemStatus.CONFLICTED
+                   else "")
+            )
+            _show_item_screen(
+                stdscr, header, lines, footer, content_scroll=scroll,
+            )
+            ch = stdscr.getch()
+            if ch == -1:
+                continue
+            new_scroll = _scroll_key(ch, scroll, len(lines), max(1, h - 4))
+            if new_scroll >= 0:
+                scroll = new_scroll
+                continue
+            k = chr(ch).lower() if 0 < ch < 256 else ""
+            if k == "q" or ch in (10, 13, 27):
+                return
+            if k == "m" and item.status == ItemStatus.CONFLICTED:
+                from .committer import retry_merge
+                try:
+                    _, msg = retry_merge(cfg, store, item)
+                except Exception as e:  # git or state errors
+                    msg = f"retry failed: {e}"
+                _flash(stdscr, msg)
+                # If it resolved, drop back to the list — the item is no
+                # longer conflicted so there's nothing more to inspect.
+                refreshed = store.get(item.id)
+                if refreshed and refreshed.status != ItemStatus.CONFLICTED:
+                    return
+    finally:
+        # Restore the main loop's refresh cadence.
+        stdscr.timeout(REFRESH_MS)
 
 
 def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str]:
@@ -678,11 +825,17 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
     if not data:
         out.append("")
         out.append("(no agent result yet — no token data)")
-        tail = _tail_lines(transcript_path)
-        if tail:
+        activity = _session_activity(transcript_path)
+        if activity:
             out.append("")
-            out.append("── transcript tail ──")
-            out.extend(tail)
+            out.append("── session activity ──")
+            out.extend(activity)
+        else:
+            tail = _tail_lines(transcript_path)
+            if tail:
+                out.append("")
+                out.append("── transcript tail ──")
+                out.extend(tail)
         return out
     out.append("")
     out.append("── agent run ──")
@@ -714,7 +867,14 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
         out.append("")
         out.append("── summary ──")
         out.extend(summary[:4000].splitlines())
-    if item.last_error:
+    if item.status == ItemStatus.CONFLICTED and item.last_error:
+        # Dedicated block for merge conflicts — keep the full summary (file
+        # list + git output) visible since the short `last_error:` line
+        # truncation hides exactly the part the user needs.
+        out.append("")
+        out.append("── merge conflict ──")
+        out.extend(item.last_error[:4000].splitlines())
+    elif item.last_error:
         out.append("")
         out.append(f"last_error: {item.last_error[:500]}")
     failures = store.list_failures(item.id, limit=10)
@@ -735,11 +895,17 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
                 out.append(f"  {ln[:300]}")
             if f.get("transcript_path"):
                 out.append(f"  transcript: {f['transcript_path']}")
-    tail = _tail_lines(transcript_path)
-    if tail:
+    activity = _session_activity(transcript_path)
+    if activity:
         out.append("")
-        out.append("── transcript tail ──")
-        out.extend(tail)
+        out.append("── session activity ──")
+        out.extend(activity)
+    else:
+        tail = _tail_lines(transcript_path)
+        if tail:
+            out.append("")
+            out.append("── transcript tail ──")
+            out.extend(tail)
     return out
 
 
@@ -969,16 +1135,16 @@ def _show_item_screen(
 
 
 def _prompt_yn(stdscr, message: str) -> bool:
-    """Overlay a yes/no confirmation on the bottom row. Returns True on 'y'."""
+    """Overlay a yes/no confirmation on the bottom row. Returns True on 'y'.
+    Leaves the window in blocking mode (nodelay=False) — callers run a
+    follow-up getch loop that must block. Top-level modes reset nodelay
+    themselves on exit."""
     h, w = stdscr.getmaxyx()
     _safe_addstr(stdscr, h - 1, 0, (" " + message + " [y/N] ").ljust(w), w,
                  curses.A_BOLD | curses.A_REVERSE)
     stdscr.refresh()
     stdscr.nodelay(False)
-    try:
-        ch = stdscr.getch()
-    finally:
-        stdscr.nodelay(True)
+    ch = stdscr.getch()
     k = chr(ch).lower() if 0 < ch < 256 else ""
     return k == "y"
 
@@ -997,7 +1163,7 @@ def _prompt_text(stdscr, message: str) -> str:
     finally:
         curses.noecho()
         curses.curs_set(0)
-        stdscr.nodelay(True)
+        # Leave nodelay=False; callers run blocking getch loops after this.
     try:
         return raw.decode("utf-8", errors="replace").strip()
     except Exception:

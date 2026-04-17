@@ -265,6 +265,20 @@ class Runner:
                         repo, wt_path, branch,
                         self.config.git.base_branch,
                     )
+                else:
+                    # Sync: pull any commits that landed on base while this
+                    # item was awaiting review. Fast-forward only — plan
+                    # phase is read-only so the feature should still be at
+                    # its fork point, and a successful ff guarantees no
+                    # rewrites and no conflicts. If the agent has somehow
+                    # committed during plan, ff will refuse; we skip the
+                    # sync silently rather than merging/rebasing here so
+                    # the integration path handles divergence uniformly
+                    # at the final commit step (where any conflict surfaces
+                    # as CONFLICTED with full recovery flow).
+                    git_ops.fast_forward_to_base(
+                        wt_path, self.config.git.base_branch,
+                    )
             except git_ops.GitError as e:
                 err = str(e)
                 self._record_failure(item, "setup", err)

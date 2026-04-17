@@ -1,4 +1,5 @@
 import subprocess
+import uuid
 from pathlib import Path
 
 
@@ -113,3 +114,142 @@ def commit_all(worktree: Path, message: str) -> str:
 def is_inside_repo(path: Path) -> bool:
     cp = run(path, "rev-parse", "--is-inside-work-tree", check=False)
     return cp.returncode == 0 and cp.stdout.strip() == "true"
+
+
+def fast_forward_to_base(
+    worktree: Path, base_branch: str,
+) -> tuple[bool, str | None]:
+    """Bring the worktree's checked-out branch up to the current tip of
+    `base_branch` via `git merge --ff-only`. Used on resume so an item
+    that waited through a long plan-review gap picks up any commits that
+    landed on base in the meantime, before the agent starts producing
+    commits that would otherwise be based on a stale fork point.
+
+    Returns:
+        (True, None)            — worktree was advanced (or was already at
+                                  base's tip; git reports no-op as success).
+        (False, reason)         — fast-forward refused because the feature
+                                  has diverged (unexpected at execute start
+                                  but possible if the agent committed
+                                  during plan). Caller decides whether to
+                                  escalate or proceed; state is untouched.
+    """
+    cp = run(worktree, "merge", "--ff-only", base_branch, check=False)
+    if cp.returncode == 0:
+        return True, None
+    return False, (cp.stdout + cp.stderr).strip() or "ff-only refused"
+
+
+def merge_feature_into_base(
+    repo: Path, feature_branch: str, base_branch: str, message: str,
+    tmp_root: Path, mode: str = "merge",
+) -> tuple[str | None, str | None]:
+    """Integrate `feature_branch` into `base_branch` without touching any
+    worktree the user might have checked out on base. All work happens in a
+    throwaway `--detach`ed worktree pinned to base's current tip; the final
+    step CAS-advances `refs/heads/<base_branch>` via `update-ref OLD NEW`
+    so a concurrent commit on base aborts us safely instead of overwriting
+    unseen work.
+
+    mode="merge" (default) — `git merge --no-ff`, produces a merge commit.
+    mode="rebase"          — `git rebase <base>` onto the temp worktree,
+                             then CAS-fast-forward base to the rebased tip
+                             for a linear history.
+
+    Returns (new_base_sha, None) on success, (None, summary) on conflict
+    or CAS loss. The temporary worktree is always cleaned up; feature
+    branch and its worktree are never mutated."""
+    if mode not in ("merge", "rebase"):
+        raise ValueError(f"unknown merge_mode: {mode!r}")
+    base_sha = run(
+        repo, "rev-parse", f"refs/heads/{base_branch}"
+    ).stdout.strip()
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    tmp_dir = tmp_root / f"merge-{uuid.uuid4().hex[:8]}"
+    run(repo, "worktree", "add", "--detach", str(tmp_dir), base_sha)
+    try:
+        if mode == "merge":
+            return _run_merge(repo, tmp_dir, feature_branch, base_branch,
+                              base_sha, message)
+        return _run_rebase(repo, tmp_dir, feature_branch, base_branch,
+                           base_sha)
+    finally:
+        run(repo, "worktree", "remove", "--force", str(tmp_dir), check=False)
+
+
+def _cas_update_base(
+    repo: Path, base_branch: str, new_sha: str, base_sha_before: str,
+) -> str | None:
+    """CAS-update base; returns a failure summary string or None on success."""
+    cp = run(
+        repo, "update-ref", f"refs/heads/{base_branch}", new_sha,
+        base_sha_before, check=False,
+    )
+    if cp.returncode != 0:
+        return (
+            f"base branch {base_branch} moved during merge "
+            "(update-ref CAS failed); retry when stable.\n"
+            f"{cp.stderr}"
+        )
+    return None
+
+
+def _conflict_paths(status_out: str) -> list[str]:
+    return [
+        ln[3:] for ln in status_out.splitlines()
+        if ln[:2] in ("UU", "AA", "DD", "AU", "UA", "DU", "UD")
+    ]
+
+
+def _summarize(conflicts: list[str], git_out: str, fallback: str) -> str:
+    parts: list[str] = []
+    if conflicts:
+        parts.append("conflicted files:")
+        parts.extend(f"  {c}" for c in conflicts)
+        parts.append("")
+    out = git_out.strip()
+    if out:
+        parts.append(out)
+    return "\n".join(parts) or fallback
+
+
+def _run_merge(
+    repo: Path, tmp_dir: Path, feature_branch: str, base_branch: str,
+    base_sha: str, message: str,
+) -> tuple[str | None, str | None]:
+    cp = run(
+        tmp_dir, "merge", "--no-ff", "-m", message, feature_branch,
+        check=False,
+    )
+    if cp.returncode == 0:
+        new_sha = run(tmp_dir, "rev-parse", "HEAD").stdout.strip()
+        err = _cas_update_base(repo, base_branch, new_sha, base_sha)
+        return (None, err) if err else (new_sha, None)
+    conflicts = _conflict_paths(
+        run(tmp_dir, "status", "--porcelain", check=False).stdout
+    )
+    run(tmp_dir, "merge", "--abort", check=False)
+    return None, _summarize(conflicts, cp.stdout + cp.stderr,
+                            "merge failed with unknown error")
+
+
+def _run_rebase(
+    repo: Path, tmp_dir: Path, feature_branch: str, base_branch: str,
+    base_sha: str,
+) -> tuple[str | None, str | None]:
+    """Rebase plays the feature's commits onto base in the temp worktree.
+    We check out the feature tip detached first so the feature branch ref
+    is never rewritten — only the temp HEAD moves — then CAS-advance base
+    to the rebased HEAD."""
+    run(tmp_dir, "checkout", "--detach", feature_branch)
+    cp = run(tmp_dir, "rebase", base_branch, check=False)
+    if cp.returncode == 0:
+        new_sha = run(tmp_dir, "rev-parse", "HEAD").stdout.strip()
+        err = _cas_update_base(repo, base_branch, new_sha, base_sha)
+        return (None, err) if err else (new_sha, None)
+    conflicts = _conflict_paths(
+        run(tmp_dir, "status", "--porcelain", check=False).stdout
+    )
+    run(tmp_dir, "rebase", "--abort", check=False)
+    return None, _summarize(conflicts, cp.stdout + cp.stderr,
+                            "rebase failed with unknown error")

@@ -13,6 +13,7 @@ class ItemStatus(str, Enum):
     REJECTED = "rejected"
     ERRORED = "errored"              # agent-side failure; operator must intervene
     MERGED = "merged"
+    CONFLICTED = "conflicted"       # auto-merge into base_branch hit conflicts
     CANCELLED = "cancelled"
     DEFERRED = "deferred"
 

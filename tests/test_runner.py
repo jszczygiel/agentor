@@ -1040,6 +1040,65 @@ class TestBranchCleanupHelpers(unittest.TestCase):
             git_ops.branch_checked_out_at(self.root, "agent/y"),
         )
 
+    def test_fast_forward_to_base_advances_worktree(self):
+        from agentor import git_ops
+        wt = self.root / "wt-ff"
+        git_ops.worktree_add(self.root, wt, "agent/ff", "main")
+        wt_sha_before = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=wt, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        # Advance main in the root checkout while feature sits at fork point.
+        (self.root / "new.md").write_text("new\n")
+        subprocess.run(["git", "add", "new.md"], cwd=self.root, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "advance"],
+                       cwd=self.root, check=True, capture_output=True)
+
+        advanced, note = git_ops.fast_forward_to_base(wt, "main")
+
+        self.assertTrue(advanced, note)
+        self.assertIsNone(note)
+        wt_sha_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=wt, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertNotEqual(wt_sha_after, wt_sha_before)
+        self.assertTrue((wt / "new.md").exists(),
+                        "fast-forward should pull the new file into the worktree")
+
+    def test_fast_forward_to_base_refuses_when_diverged(self):
+        from agentor import git_ops
+        wt = self.root / "wt-div"
+        git_ops.worktree_add(self.root, wt, "agent/div", "main")
+        # Feature commits.
+        (wt / "feat.md").write_text("feat\n")
+        subprocess.run(["git", "add", "feat.md"], cwd=wt, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "feat commit"],
+                       cwd=wt, check=True, capture_output=True)
+        # Main advances independently — histories diverge.
+        (self.root / "main.md").write_text("main\n")
+        subprocess.run(["git", "add", "main.md"], cwd=self.root, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "main commit"],
+                       cwd=self.root, check=True, capture_output=True)
+        feat_sha_before = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=wt, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+        advanced, note = git_ops.fast_forward_to_base(wt, "main")
+
+        self.assertFalse(advanced)
+        self.assertIsNotNone(note)
+        feat_sha_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=wt, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(feat_sha_after, feat_sha_before,
+                         "ff refusal must leave the worktree untouched")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,10 +18,20 @@ def _has_uncommitted(wt: Path) -> bool:
 def approve_and_commit(
     config: Config, store: Store, item: StoredItem, message: str
 ) -> str:
-    """Approve the agent's work. If there are uncommitted changes in the
-    worktree, commit them with `message`. If the agent already committed
-    (e.g. via /develop), just record the existing HEAD. Then remove the
-    worktree and transition to MERGED. Returns the commit SHA."""
+    """Approve the agent's work. Commit any pending changes in the worktree,
+    then (optionally) merge the feature branch into `git.base_branch`.
+
+    Behavior depends on `config.git.auto_merge`:
+      - False (default): commit on the feature branch, remove the worktree,
+        transition MERGED. The feature branch stays; user merges by hand.
+      - True: commit, then try `git merge --no-ff` into base via an
+        ephemeral detached worktree. Clean merge → remove feature worktree
+        and branch, transition MERGED. Conflicts → keep the feature
+        worktree and branch intact, transition CONFLICTED with the
+        conflict summary stored in `last_error` for the inspect view.
+
+    Returns the feature-branch commit SHA (not the merge commit) either
+    way, so callers can always address the agent's work directly."""
     assert item.status == ItemStatus.AWAITING_REVIEW, \
         f"commit expects AWAITING_REVIEW, got {item.status}"
     assert item.worktree_path
@@ -41,13 +51,93 @@ def approve_and_commit(
         sha = git_ops.run(wt, "rev-parse", "HEAD").stdout.strip()
         note_prefix = "recorded existing commit"
 
-    git_ops.worktree_remove(repo, wt, force=False)
+    if not config.git.auto_merge:
+        git_ops.worktree_remove(repo, wt, force=False)
+        store.transition(
+            item.id, ItemStatus.MERGED,
+            note=f"{note_prefix} {sha[:8]} on {item.branch} "
+                 f"(no auto-merge; merge into {config.git.base_branch} by hand)",
+        )
+        return sha
 
+    tmp_root = repo / ".agentor" / "merge-tmp"
+    mode = config.git.merge_mode
+    merge_sha, conflict = git_ops.merge_feature_into_base(
+        repo, item.branch, config.git.base_branch,
+        message=f"Merge branch '{item.branch}' into {config.git.base_branch}"
+                f"\n\n{message}",
+        tmp_root=tmp_root, mode=mode,
+    )
+    if conflict is not None:
+        # Keep the worktree and branch — user resolves by hand, then calls
+        # retry_merge (inspect [m]) once the conflict is fixed.
+        store.transition(
+            item.id, ItemStatus.CONFLICTED,
+            last_error=conflict[:4000],
+            note=f"{mode} into {config.git.base_branch} conflicted; "
+                 f"feature branch {item.branch} kept",
+        )
+        return sha
+
+    git_ops.worktree_remove(repo, wt, force=False)
+    git_ops.branch_delete(repo, item.branch, force=True)
     store.transition(
         item.id, ItemStatus.MERGED,
-        note=f"{note_prefix} {sha[:8]} on {item.branch}",
+        note=f"{note_prefix} {sha[:8]}, {mode}d {merge_sha[:8]} into "
+             f"{config.git.base_branch}",
     )
     return sha
+
+
+def retry_merge(
+    config: Config, store: Store, item: StoredItem,
+) -> tuple[bool, str]:
+    """Re-attempt the auto-merge for a CONFLICTED item after the user has
+    resolved conflicts in the feature worktree (or otherwise made the
+    branch merge-clean). Uses the same `merge_mode` as the original
+    approval.
+
+    Returns (ok, message). On success the item transitions MERGED and the
+    worktree + feature branch are removed. On continued conflict the item
+    stays CONFLICTED with an updated `last_error`.
+
+    Any still-uncommitted resolution edits in the feature worktree are
+    folded into a `resolved conflicts` commit first so the merge has a
+    clean tip to work with."""
+    assert item.status == ItemStatus.CONFLICTED, \
+        f"retry_merge expects CONFLICTED, got {item.status}"
+    assert item.worktree_path and item.branch
+
+    wt = Path(item.worktree_path)
+    repo = config.project_root
+
+    if _has_uncommitted(wt):
+        git_ops.commit_all(wt, "resolve merge conflicts")
+
+    tmp_root = repo / ".agentor" / "merge-tmp"
+    mode = config.git.merge_mode
+    merge_sha, conflict = git_ops.merge_feature_into_base(
+        repo, item.branch, config.git.base_branch,
+        message=f"Merge branch '{item.branch}' into {config.git.base_branch}"
+                f" (retry)",
+        tmp_root=tmp_root, mode=mode,
+    )
+    if conflict is not None:
+        store.transition(
+            item.id, ItemStatus.CONFLICTED,
+            last_error=conflict[:4000],
+            note=f"retry {mode} still conflicts on {config.git.base_branch}",
+        )
+        return False, f"still conflicted: {conflict.splitlines()[0] if conflict else '?'}"
+
+    git_ops.worktree_remove(repo, wt, force=False)
+    git_ops.branch_delete(repo, item.branch, force=True)
+    store.transition(
+        item.id, ItemStatus.MERGED,
+        last_error=None,
+        note=f"resolved — {mode}d {merge_sha[:8]} into {config.git.base_branch}",
+    )
+    return True, f"{mode}d {merge_sha[:8]} into {config.git.base_branch}"
 
 
 def reject(store: Store, item: StoredItem, feedback: str) -> None:
@@ -95,13 +185,22 @@ def reject_and_retry(store: Store, item: StoredItem, feedback: str) -> None:
         )
 
 
-def approve_backlog(store: Store, item: StoredItem) -> None:
+def approve_backlog(
+    store: Store, item: StoredItem, feedback: str | None = None
+) -> None:
     """Promote a backlog item to QUEUED so the daemon can dispatch it. Used
-    by the pickup UI when pickup_mode is 'manual'."""
+    by the pickup UI when pickup_mode is 'manual'. Optional `feedback` is
+    persisted and prepended to the agent's first plan prompt (consumed and
+    cleared after one use, same path as reject_and_retry)."""
     assert item.status == ItemStatus.BACKLOG
+    fields: dict[str, object] = {}
+    if feedback:
+        fields["feedback"] = feedback
     store.transition(
         item.id, ItemStatus.QUEUED,
-        note="approved by user (backlog → queued)",
+        note="approved by user (backlog → queued)"
+        + (" with feedback" if feedback else ""),
+        **fields,
     )
 
 
