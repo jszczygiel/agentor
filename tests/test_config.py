@@ -6,8 +6,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from agentor.config import (AgentConfig, GitConfig, ParsingConfig,
-                            ReviewConfig, SourcesConfig, _filter_known, load)
+from agentor.config import AgentConfig, GitConfig, _filter_known, load
 
 
 class TestFilterKnown(unittest.TestCase):
