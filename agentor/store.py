@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS items (
     result_json   TEXT,
     session_id    TEXT,
     agentor_version TEXT,
+    priority      INTEGER NOT NULL DEFAULT 0,
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL
 );
@@ -69,6 +70,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE items ADD COLUMN feedback TEXT")
     if "agentor_version" not in cols:
         conn.execute("ALTER TABLE items ADD COLUMN agentor_version TEXT")
+    if "priority" not in cols:
+        conn.execute(
+            "ALTER TABLE items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _encode_status(status: ItemStatus) -> str:
@@ -115,6 +120,7 @@ class StoredItem:
     result_json: str | None
     session_id: str | None
     agentor_version: str | None
+    priority: int
     created_at: float
     updated_at: float
 
@@ -136,6 +142,7 @@ def _row_to_stored(row: sqlite3.Row) -> StoredItem:
         result_json=row["result_json"],
         session_id=row["session_id"],
         agentor_version=row["agentor_version"],
+        priority=row["priority"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -222,7 +229,8 @@ class Store:
     def list_by_status(self, status: ItemStatus) -> list[StoredItem]:
         with self._lock:
             rows = self.conn.execute(
-                "SELECT * FROM items WHERE status = ? ORDER BY created_at",
+                """SELECT * FROM items WHERE status = ?
+                   ORDER BY priority DESC, created_at""",
                 (_encode_status(status),),
             ).fetchall()
         return [_row_to_stored(r) for r in rows]
@@ -262,7 +270,7 @@ class Store:
             row = c.execute(
                 """SELECT id FROM items
                    WHERE status = ?
-                   ORDER BY created_at
+                   ORDER BY priority DESC, created_at
                    LIMIT 1""",
                 (queued,),
             ).fetchone()
@@ -329,6 +337,25 @@ class Store:
                    VALUES (?, ?, ?, ?, ?)""",
                 (item_id, from_status, _encode_status(to), note, now),
             )
+
+    def bump_priority(self, item_id: str, delta: int) -> int:
+        """Adjust an item's priority by `delta`, clamped at 0. Returns the
+        new value. Deliberately writes no transitions row — the dashboard
+        keybinding can fire per-keystroke and spamming history would bury
+        genuine state changes."""
+        now = time.time()
+        with self.tx() as c:
+            row = c.execute(
+                "SELECT priority FROM items WHERE id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"no such item: {item_id}")
+            new_val = max(0, int(row["priority"]) + delta)
+            c.execute(
+                "UPDATE items SET priority = ?, updated_at = ? WHERE id = ?",
+                (new_val, now, item_id),
+            )
+        return new_val
 
     def update_result_json(self, item_id: str, blob: str) -> None:
         """Write a fresh result_json for an item WITHOUT recording a status

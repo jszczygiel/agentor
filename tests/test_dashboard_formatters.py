@@ -29,6 +29,7 @@ def _item(result_json: str | None) -> StoredItem:
         result_json=result_json,
         session_id=None,
         agentor_version=None,
+        priority=0,
         created_at=0.0,
         updated_at=0.0,
     )

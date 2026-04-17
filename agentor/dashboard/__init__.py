@@ -166,6 +166,20 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
                 # Acknowledge a system alert and resume dispatching. No-op
                 # when nothing is paused, so safe to spam.
                 daemon.clear_alert()
+            elif ch in (curses.KEY_SR, ord("P")) and selected_id:
+                # Shift+Up (KEY_SR) bumps priority on the selected row.
+                # `P` is the portable fallback — KEY_SR isn't emitted by
+                # every terminal/multiplexer combo. Higher priority wins
+                # in claim_next_queued's ORDER BY.
+                try:
+                    store.bump_priority(selected_id, 1)
+                except KeyError:
+                    pass  # row vanished between render and keystroke
+            elif ch in (curses.KEY_SF, ord("O")) and selected_id:
+                try:
+                    store.bump_priority(selected_id, -1)
+                except KeyError:
+                    pass
             elif k == "\t":
                 filter_idx = (filter_idx + 1) % len(FILTERS)
                 selected_id = None  # reset cursor to top of new filter

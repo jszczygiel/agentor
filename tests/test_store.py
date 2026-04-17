@@ -1,3 +1,5 @@
+import sqlite3
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -89,6 +91,57 @@ class TestStore(unittest.TestCase):
     def test_transition_unknown_item(self):
         with self.assertRaises(KeyError):
             self.store.transition("nope", ItemStatus.WORKING)
+
+    def test_claim_respects_priority(self):
+        # Seed older `a` (created first), then younger `b` with higher
+        # priority. FIFO alone would pick `a`; priority must flip it.
+        self._upsert_and_queue("a")
+        # Force a measurable created_at gap so the FIFO tie-break is
+        # deterministic if priority were ignored.
+        time.sleep(0.01)
+        self._upsert_and_queue("b")
+        self.store.bump_priority("b", 1)
+        claimed = self.store.claim_next_queued("/wt/b", "agent/b")
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.id, "b")
+        self.assertEqual(claimed.priority, 1)
+
+    def test_claim_same_priority_fifo(self):
+        self._upsert_and_queue("a")
+        time.sleep(0.01)
+        self._upsert_and_queue("b")
+        self.store.bump_priority("a", 2)
+        self.store.bump_priority("b", 2)
+        claimed = self.store.claim_next_queued("/wt/x", "agent/x")
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.id, "a")
+
+    def test_bump_priority_clamps_at_zero(self):
+        self._upsert_and_queue("a")
+        self.assertEqual(self.store.bump_priority("a", -1), 0)
+        self.assertEqual(self.store.bump_priority("a", -5), 0)
+        stored = self.store.get("a")
+        self.assertEqual(stored.priority, 0)
+        # Bump up then back down confirms clamp is not a hard-wire to 0.
+        self.assertEqual(self.store.bump_priority("a", 3), 3)
+        self.assertEqual(self.store.bump_priority("a", -1), 2)
+
+    def test_bump_priority_unknown_item_raises(self):
+        with self.assertRaises(KeyError):
+            self.store.bump_priority("nope", 1)
+
+    def test_list_by_status_sorted_by_priority_desc(self):
+        # Three queued items in insertion order a, b, c; bump c highest,
+        # b middle. Expect c, b, a in the listing.
+        self._upsert_and_queue("a")
+        time.sleep(0.01)
+        self._upsert_and_queue("b")
+        time.sleep(0.01)
+        self._upsert_and_queue("c")
+        self.store.bump_priority("b", 1)
+        self.store.bump_priority("c", 5)
+        ids = [it.id for it in self.store.list_by_status(ItemStatus.QUEUED)]
+        self.assertEqual(ids, ["c", "b", "a"])
 
     def test_persistence_across_reopen(self):
         item = _mk_item(id="persist")
@@ -338,6 +391,79 @@ class TestIdsWithErrors(unittest.TestCase):
                               last_error="err!")
         got = self.store.ids_with_errors([ItemStatus.QUEUED])
         self.assertEqual(got, {"a"})
+
+
+class TestMigratePriority(unittest.TestCase):
+    """Opening a DB that predates the `priority` column must heal the schema
+    via `_migrate`. Simulates an older install by dropping the column on a
+    sidecar connection between open cycles."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.db_path = Path(self.td.name) / "state.db"
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def test_missing_priority_column_heals_on_open(self):
+        store = Store(self.db_path)
+        store.upsert_discovered(_mk_item(id="pre"))
+        store.close()
+
+        # Sidecar conn: sqlite can't DROP COLUMN without full-rebuild gymnastics,
+        # so rebuild the table without the priority column to emulate the
+        # pre-migration schema.
+        raw = sqlite3.connect(self.db_path)
+        raw.row_factory = sqlite3.Row
+        cols = [r["name"] for r in raw.execute("PRAGMA table_info(items)")]
+        self.assertIn("priority", cols)
+        raw.executescript("""
+            BEGIN;
+            CREATE TABLE items_new (
+                id            TEXT PRIMARY KEY,
+                title         TEXT NOT NULL,
+                body          TEXT NOT NULL,
+                source_file   TEXT NOT NULL,
+                source_line   INTEGER NOT NULL,
+                tags_json     TEXT NOT NULL DEFAULT '{}',
+                status        TEXT NOT NULL,
+                worktree_path TEXT,
+                branch        TEXT,
+                attempts      INTEGER NOT NULL DEFAULT 0,
+                last_error    TEXT,
+                feedback      TEXT,
+                result_json   TEXT,
+                session_id    TEXT,
+                agentor_version TEXT,
+                created_at    REAL NOT NULL,
+                updated_at    REAL NOT NULL
+            );
+            INSERT INTO items_new
+                SELECT id, title, body, source_file, source_line, tags_json,
+                       status, worktree_path, branch, attempts, last_error,
+                       feedback, result_json, session_id, agentor_version,
+                       created_at, updated_at FROM items;
+            DROP TABLE items;
+            ALTER TABLE items_new RENAME TO items;
+            COMMIT;
+        """)
+        cols = [r["name"] for r in raw.execute("PRAGMA table_info(items)")]
+        self.assertNotIn("priority", cols)
+        raw.close()
+
+        # Reopening should run _migrate and re-add priority with default 0.
+        store = Store(self.db_path)
+        try:
+            stored = store.get("pre")
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.priority, 0)
+            # Downstream queries that order by priority must still work.
+            self.assertEqual(
+                [it.id for it in store.list_by_status(ItemStatus.BACKLOG)],
+                ["pre"],
+            )
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":
