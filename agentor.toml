@@ -1,6 +1,6 @@
 [project]
-name = "colorme"
-root = "../../colorme"
+name = "agentor"
+root = "."
 
 [sources]
 watch = [
@@ -13,15 +13,18 @@ mode = "checkbox"
 
 [agent]
 runner = "claude"
-model = "claude-opus-4-6"
+model = "claude-opus-4-7"
 max_attempts = 3
 pool_size = 0
-build_cmd = "./gradlew :app:assembleDebug"
-test_cmd = "./gradlew test"
+pickup_mode = "manual"   # meta project — approve each item before running
+context_window = 1_000_000
+single_phase = false
+test_cmd = "python3 -m unittest discover tests"
 
 [git]
 base_branch = "main"
 branch_prefix = "agent/"
+merge_mode = "merge"
 
 [review]
 port = 7777

@@ -19,7 +19,7 @@ class ParsingConfig:
 class AgentConfig:
     model: str = "claude-opus-4-6"
     max_attempts: int = 3
-    pool_size: int = 1  # max concurrent agents working on items
+    pool_size: int = 0  # max concurrent agents working on items
     runner: str = "stub"  # "stub" | "claude" | "codex"
     # Advanced override for the selected runner's base command template.
     # Normal configs should not need this; each runner has built-in Python

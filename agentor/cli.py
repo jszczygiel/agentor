@@ -62,7 +62,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         'runner = "claude"\n'
         'model = "claude-opus-4-6"\n'
         'max_attempts = 3\n'
-        'pool_size = 1\n'
+        'pool_size = 0\n'
         '\n'
         '[git]\n'
         'base_branch = "main"\n'
