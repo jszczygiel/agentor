@@ -6,7 +6,6 @@ import time
 from typing import Callable
 
 from ..models import ItemStatus
-from ..store import Store
 
 from .formatters import (
     _COL_CTX,
@@ -197,7 +196,7 @@ def _render_table(stdscr, store, top, height, w, statuses, context_window):
             has_err = bool(it.last_error)
             if rows_used >= height:
                 _safe_addstr(stdscr, top + rows_used - 1, 0,
-                             f" ... (more not shown)".ljust(w), w,
+                             " ... (more not shown)".ljust(w), w,
                              curses.A_DIM)
                 return
             elapsed = _elapsed_for(store, it.id) if st == ItemStatus.WORKING else None

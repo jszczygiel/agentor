@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dev tools
+        run: pip install ruff mypy
+      - name: Ruff
+        run: ruff check agentor tests
+      - name: Mypy
+        run: mypy agentor
+      - name: Unit tests
+        run: python -m unittest discover tests -v

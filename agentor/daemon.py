@@ -1,6 +1,5 @@
 import signal
 import threading
-import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -71,10 +70,10 @@ class Daemon:
         """Manually approve a queued item for pickup. Returns True if it was
         dispatched, False if it could not be (already claimed, no slot, gone)."""
         if self.paused:
-            self.log(f"manual dispatch denied: paused (system alert active)")
+            self.log("manual dispatch denied: paused (system alert active)")
             return False
         if not self.store.pool_has_slot(self.config.agent.pool_size):
-            self.log(f"manual dispatch denied: pool full")
+            self.log("manual dispatch denied: pool full")
             return False
         item = self.store.get(item_id)
         if item is None or item.status != ItemStatus.QUEUED:
@@ -89,6 +88,7 @@ class Daemon:
             note="manual pickup approval",
         )
         claimed = self.store.get(item.id)
+        assert claimed is not None
         runner = self._make_runner()
         self.stats.dispatched += 1
         self.log(f"manual dispatch: {claimed.id} {claimed.title!r} -> {branch}")
@@ -145,6 +145,7 @@ class Daemon:
                 note="re-planned worktree",
             )
             claimed = self.store.get(claimed.id)
+            assert claimed is not None
 
         runner = self._make_runner()
         self.stats.dispatched += 1
