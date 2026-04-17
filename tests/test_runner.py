@@ -755,8 +755,10 @@ class TestRecovery(unittest.TestCase):
         self.assertEqual(self.store.get(claimed.id).status, ItemStatus.QUEUED)
         self.assertIsNone(self.store.get(claimed.id).worktree_path)
 
-    def test_recovery_preserves_resumable_session(self):
-        """Item with session_id + live worktree → keep WORKING, mark resumable."""
+    def test_recovery_demotes_resumable_to_queued(self):
+        """Item with session_id + live worktree → demoted to QUEUED while
+        preserving session_id/worktree/branch so the normal dispatch loop
+        picks it up (and the runner detects the resumable state)."""
         item = self.store.list_by_status(ItemStatus.QUEUED)[0]
         wt, br = plan_worktree(self.cfg, item)
         claimed = self.store.claim_next_queued(str(wt), br)
@@ -769,9 +771,12 @@ class TestRecovery(unittest.TestCase):
         self.assertEqual(rec.requeued, [])
         self.assertEqual(len(rec.resumable), 1)
         self.assertEqual(rec.resumable[0].id, claimed.id)
-        self.assertEqual(
-            self.store.get(claimed.id).status, ItemStatus.WORKING,
-        )
+        final = self.store.get(claimed.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        self.assertEqual(final.session_id, "abcd-1234")
+        self.assertEqual(final.worktree_path, str(wt))
+        self.assertEqual(final.branch, br)
+        self.assertEqual(final.attempts, 0)
 
 
     def test_recovery_uses_previous_settled_state(self):
@@ -1103,6 +1108,106 @@ class TestDaemonPause(unittest.TestCase):
         d.clear_alert()
         self.assertIsNone(d.system_alert)
         self.assertFalse(d.paused)
+
+
+class TestResumePoolGate(unittest.TestCase):
+    """Resuming WORKING items at daemon startup must respect pool_size, so
+    that an operator who dropped the pool to 0 to halt work doesn't see
+    in-flight sessions silently revived on the next restart."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] one\n- [ ] two\n")
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _cfg(self, pool_size: int) -> Config:
+        return Config(
+            project_name="t", project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(runner="stub", pool_size=pool_size,
+                              max_attempts=1, pickup_mode="auto"),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+
+    def _seed_resumable(self, cfg: Config, n: int) -> list[str]:
+        """Create n WORKING items with session_id + live worktree dir so the
+        recovery sweep returns them as resumable."""
+        scan_once(cfg, self.store)
+        ids: list[str] = []
+        for q in self.store.list_by_status(ItemStatus.QUEUED)[:n]:
+            wt, br = plan_worktree(cfg, q)
+            claimed = self.store.claim_next_queued(str(wt), br)
+            wt.mkdir(parents=True, exist_ok=True)
+            self.store.transition(
+                claimed.id, ItemStatus.WORKING,
+                session_id=f"sess-{claimed.id[:6]}",
+                note="test: resumable session",
+            )
+            ids.append(claimed.id)
+        return ids
+
+    def _inert_factory(self):
+        """Runner whose `.run` is a no-op — exercises the dispatch path
+        without hitting git worktree machinery."""
+        def factory(cfg, store):
+            r = StubRunner(cfg, store)
+
+            def noop(item):
+                from agentor.runner import RunResult
+                return RunResult(
+                    item.id, Path(item.worktree_path or "/tmp"),
+                    item.branch or "br", "noop", [], "",
+                )
+            r.run = noop
+            return r
+        return factory
+
+    def test_pool_zero_skips_all_resumes(self):
+        """With pool_size=0 the daemon can't claim anything, so resumable
+        items sit in QUEUED waiting for the pool to open. Nothing is
+        dispatched; session_id + worktree are preserved for later pickup."""
+        from agentor.daemon import Daemon
+        cfg = self._cfg(pool_size=0)
+        ids = self._seed_resumable(cfg, 2)
+        d = Daemon(cfg, self.store, self._inert_factory(), scan_interval=0.05,
+                   log=lambda m: None, install_signals=False)
+        import threading as _t, time as _tm
+        t = _t.Thread(target=d.run, daemon=True)
+        t.start()
+        _tm.sleep(0.2)
+        d.stop_event.set()
+        t.join(timeout=5)
+        self.assertEqual(d.stats.dispatched, 0)
+        for i in ids:
+            it = self.store.get(i)
+            self.assertEqual(it.status, ItemStatus.QUEUED)
+            self.assertTrue(it.session_id)
+            self.assertTrue(it.worktree_path)
+
+    def test_pool_one_resumes_resumable_items(self):
+        """With pool_size=1 the dispatch loop claims resumable items one
+        at a time. Because the noop runner returns immediately, both items
+        get through over the 0.2s window."""
+        from agentor.daemon import Daemon
+        cfg = self._cfg(pool_size=1)
+        self._seed_resumable(cfg, 2)
+        d = Daemon(cfg, self.store, self._inert_factory(), scan_interval=0.05,
+                   log=lambda m: None, install_signals=False)
+        import threading as _t, time as _tm
+        t = _t.Thread(target=d.run, daemon=True)
+        t.start()
+        _tm.sleep(0.2)
+        d.stop_event.set()
+        t.join(timeout=5)
+        self.assertGreaterEqual(d.stats.dispatched, 1)
 
 
 class TestBranchCleanupHelpers(unittest.TestCase):

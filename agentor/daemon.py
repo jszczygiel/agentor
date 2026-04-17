@@ -203,26 +203,12 @@ class Daemon:
         if rec.auto_recovered:
             self.log(f"auto-recovered {len(rec.auto_recovered)} items "
                      f"with benign last_error (shutdown/cap/stale session)")
-        # Resume dispatch respects pool_size: an operator who set pool=0 to
-        # halt work wants in-flight sessions frozen too. Skipped items stay
-        # WORKING with session_id intact — a later start (with a bigger pool)
-        # picks them up as resumable again.
-        pool_size = self.config.agent.pool_size
-        to_resume = rec.resumable[:pool_size]
-        skipped = len(rec.resumable) - len(to_resume)
-        if skipped:
-            self.log(f"resume skipped for {skipped} WORKING item(s): "
-                     f"pool_size={pool_size}")
-        for item in to_resume:
-            runner = self._make_runner()
-            self.stats.dispatched += 1
-            self.log(f"resume: {item.id} {item.title!r} "
-                     f"(session {item.session_id[:8]})")
-            t = threading.Thread(
-                target=self._run_worker, args=(runner, item), daemon=True,
-            )
-            self.workers.add(t)
-            t.start()
+        if rec.resumable:
+            # Resumable items are now demoted to QUEUED by recovery; the
+            # normal dispatch loop claims them when a pool slot opens, and
+            # the runner picks up the stored session via --resume.
+            self.log(f"queued {len(rec.resumable)} resumable item(s) "
+                     f"for dispatch")
 
         while not self.stop_event.is_set():
             # scan_once reads pickup_mode itself and promotes BACKLOG → QUEUED

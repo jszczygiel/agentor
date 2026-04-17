@@ -57,12 +57,23 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
     """Handle items left in WORKING from a prior run.
 
     If the item has a persisted session_id AND its worktree still exists on
-    disk, leave it WORKING and return it as resumable — the caller re-invokes
-    claude with `--resume <session_id>`. Otherwise nuke its worktree and
-    revert the item to its previous settled state — typically QUEUED for a
-    fresh item, but AWAITING_PLAN_REVIEW or AWAITING_REVIEW for items that
-    had reached a user-checkpoint before the crash. Without this revert,
-    user-visible progress would be silently lost on every restart."""
+    disk, demote it to QUEUED while preserving `session_id`, `worktree_path`,
+    `branch`, and `result_json` — the normal dispatch loop will claim it
+    when a pool slot opens, and the runner detects the resumable state via
+    `session_id + worktree exists` and calls claude with `--resume`.
+    Resetting attempts to 0 keeps the operator-driven resume from eating
+    the item's retry budget.
+
+    If the item cannot be resumed (no session, worktree gone), nuke its
+    worktree and revert to its previous settled state — typically QUEUED
+    for a fresh item, but AWAITING_PLAN_REVIEW or AWAITING_REVIEW for
+    items that had reached a user-checkpoint before the crash. Without
+    this revert, user-visible progress would be silently lost on every
+    restart.
+
+    Returns the list of demoted resumable items for logging — the daemon
+    no longer needs a separate startup dispatch loop; `_dispatch_one`
+    handles everything uniformly."""
     stuck = store.list_by_status(ItemStatus.WORKING)
     requeued: list[str] = []
     resumable: list[StoredItem] = []
@@ -71,7 +82,12 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
         wt = Path(item.worktree_path) if item.worktree_path else None
         can_resume = bool(item.session_id and wt and wt.exists())
         if can_resume:
-            resumable.append(item)
+            store.transition(
+                item.id, ItemStatus.QUEUED,
+                attempts=0,
+                note="resumable session demoted to QUEUED for dispatch",
+            )
+            resumable.append(store.get(item.id))
             continue
         if wt is not None:
             git_ops.worktree_remove(repo, wt, force=True)
