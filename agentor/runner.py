@@ -414,6 +414,116 @@ class StubRunner(Runner):
         return summary, [str(note_path.relative_to(worktree))]
 
 
+def _run_stream_json_subprocess(
+    *,
+    args: list[str],
+    cwd: Path,
+    timeout_seconds: int,
+    transcript_path: Path,
+    proc_registry: ProcRegistry | None,
+    item_key: str,
+    fnfe_hint: str,
+    on_event,
+) -> tuple[str, str, int | None, bool, str | None]:
+    """Spawn a subprocess that emits line-delimited JSON on stdout, stream
+    each event through `on_event`, and return once the child exits (or a
+    cap/timeout triggers).
+
+    `on_event(ev)` is called for every dict-shaped JSON line. If it returns
+    a truthy string, the child is killed and that string is surfaced as
+    `cap_reason` so callers can raise a descriptive error.
+
+    Returns (stdout_text, stderr_text, returncode, timed_out, cap_reason).
+    Caller is responsible for the final shutdown-event / returncode checks —
+    this helper just owns the subprocess lifecycle and byte plumbing."""
+    try:
+        # start_new_session=True puts the child (and anything it spawns)
+        # in its own process group so the daemon can SIGTERM the whole
+        # tree on shutdown via os.killpg.
+        p = subprocess.Popen(
+            args, cwd=cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1, start_new_session=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(fnfe_hint)
+    if proc_registry is not None:
+        proc_registry.register(item_key, p)
+
+    timed_out = threading.Event()
+
+    def _on_timeout():
+        timed_out.set()
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+    timer = threading.Timer(timeout_seconds, _on_timeout)
+    timer.daemon = True
+    timer.start()
+
+    # Drain stderr on a background thread so the child can't deadlock
+    # writing to a full stderr buffer.
+    stderr_chunks: list[str] = []
+
+    def _drain_stderr():
+        try:
+            for line in iter(p.stderr.readline, ""):
+                stderr_chunks.append(line)
+        except Exception:
+            pass
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    stdout_buf: list[str] = []
+    cap_reason: str | None = None
+    transcript_path.write_text(f"args: {args}\n\nstdout:\n")
+    try:
+        for line in iter(p.stdout.readline, ""):
+            stdout_buf.append(line)
+            with transcript_path.open("a") as fh:
+                fh.write(line)
+            stripped = line.strip()
+            if stripped:
+                try:
+                    ev = json.loads(stripped)
+                except json.JSONDecodeError:
+                    ev = None
+                if isinstance(ev, dict):
+                    reason = on_event(ev)
+                    if reason and not cap_reason:
+                        cap_reason = reason
+            if cap_reason:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                break
+        p.wait(timeout=5)
+    finally:
+        timer.cancel()
+        if proc_registry is not None:
+            proc_registry.unregister(item_key)
+        try:
+            p.stdout.close()
+        except Exception:
+            pass
+        stderr_thread.join(timeout=2)
+        try:
+            p.stderr.close()
+        except Exception:
+            pass
+
+    stdout_text = "".join(stdout_buf)
+    stderr_text = "".join(stderr_chunks)
+    with transcript_path.open("a") as fh:
+        fh.write(f"\n\nstderr:\n{stderr_text}\n")
+        fh.write(f"\nexit: {p.returncode}\n")
+    return stdout_text, stderr_text, p.returncode, timed_out.is_set(), cap_reason
+
+
 class ClaudeRunner(Runner):
     """Spawns a headless `claude -p` subprocess inside the worktree. Runs in
     two phases tied together by session_id:
@@ -606,119 +716,36 @@ class ClaudeRunner(Runner):
     ) -> tuple[str, str]:
         """Launch claude with Popen, read stdout line-by-line, parse each
         stream-json event, and publish live usage/iterations to the store."""
-        import threading
-        try:
-            # start_new_session=True puts claude (and anything it spawns)
-            # in its own process group so the daemon can SIGTERM the whole
-            # tree on shutdown via os.killpg. Without this, killing the
-            # Popen leaves grand-children (sub-agents, bash, git) running.
-            p = subprocess.Popen(
-                args, cwd=worktree,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, bufsize=1,
-                start_new_session=True,
-            )
-        except FileNotFoundError:
-            raise RuntimeError(
-                f"claude CLI not found. First arg was: {args[0]!r}. "
-                f"Install claude or set agent.command in agentor.toml."
-            )
-        if self.proc_registry is not None:
-            self.proc_registry.register(item.id, p)
-
-        # Kill the child on timeout. Timer fires from its own thread; using
-        # p.kill() (SIGKILL) is safe because the main loop will detect EOF
-        # on stdout and exit cleanly.
-        timed_out = threading.Event()
-
-        def _on_timeout():
-            timed_out.set()
-            try:
-                p.kill()
-            except Exception:
-                pass
-
-        timer = threading.Timer(
-            self.config.agent.timeout_seconds, _on_timeout,
-        )
-        timer.daemon = True
-        timer.start()
-
-        # Drain stderr on a background thread so the child can't deadlock
-        # writing to a full stderr buffer. Accumulate into a list for the
-        # transcript.
-        stderr_chunks: list[str] = []
-
-        def _drain_stderr():
-            try:
-                for line in iter(p.stderr.readline, ""):
-                    stderr_chunks.append(line)
-            except Exception:
-                pass
-
-        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-        stderr_thread.start()
-
         state = _StreamState(item_id=item.id, phase=phase_tag)
-        stdout_buf: list[str] = []
-        cap_reason: str | None = None
         max_turns = int(self.config.agent.max_turns or 0)
-        transcript_lines = [f"args: {args}\n", "stdout:\n"]
-        transcript_path.write_text("".join(transcript_lines))
-        try:
-            for line in iter(p.stdout.readline, ""):
-                stdout_buf.append(line)
-                with transcript_path.open("a") as fh:
-                    fh.write(line)
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    ev = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(ev, dict):
-                    continue
-                state.ingest(ev)
-                # Publish to DB on every assistant turn and on the final
-                # result event. Cheaper than per-line, enough for live UX.
-                if ev.get("type") in ("assistant", "result"):
-                    self._publish_live(item.id, state)
-                # Runaway guard — stop if the agent is looping past its
-                # turn budget. No cost cap: a user-level subscription
-                # makes mid-stream dollar accounting misleading, and
-                # max_turns already bounds runaway behaviour effectively.
-                if max_turns and state.num_turns >= max_turns:
-                    cap_reason = (
-                        f"max_turns={max_turns} hit ({state.num_turns} turns)"
-                    )
-                if cap_reason:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
-                    break
-            p.wait(timeout=5)
-        finally:
-            timer.cancel()
-            if self.proc_registry is not None:
-                self.proc_registry.unregister(item.id)
-            try:
-                p.stdout.close()
-            except Exception:
-                pass
-            stderr_thread.join(timeout=2)
-            try:
-                p.stderr.close()
-            except Exception:
-                pass
 
-        stdout_text = "".join(stdout_buf)
-        stderr_text = "".join(stderr_chunks)
-        with transcript_path.open("a") as fh:
-            fh.write(f"\n\nstderr:\n{stderr_text}\n")
-            fh.write(f"\nexit: {p.returncode}\n")
-        if timed_out.is_set():
+        def on_event(ev: dict) -> str | None:
+            state.ingest(ev)
+            # Publish on every assistant turn and the final result event —
+            # cheaper than per-line, enough for live dashboard UX.
+            if ev.get("type") in ("assistant", "result"):
+                self._publish_live(item.id, state)
+            # Runaway guard. No cost cap — subscription-billed plans make
+            # mid-stream dollar accounting misleading; max_turns is enough.
+            if max_turns and state.num_turns >= max_turns:
+                return f"max_turns={max_turns} hit ({state.num_turns} turns)"
+            return None
+
+        stdout_text, stderr_text, returncode, timed_out, cap_reason = (
+            _run_stream_json_subprocess(
+                args=args, cwd=worktree,
+                timeout_seconds=self.config.agent.timeout_seconds,
+                transcript_path=transcript_path,
+                proc_registry=self.proc_registry,
+                item_key=item.id,
+                fnfe_hint=(
+                    f"claude CLI not found. First arg was: {args[0]!r}. "
+                    f"Install claude or set agent.command in agentor.toml."
+                ),
+                on_event=on_event,
+            )
+        )
+        if timed_out:
             raise RuntimeError(
                 f"claude timed out after {self.config.agent.timeout_seconds}s"
             )
@@ -726,9 +753,9 @@ class ClaudeRunner(Runner):
             raise RuntimeError(f"claude killed: {cap_reason}")
         if self.stop_event is not None and self.stop_event.is_set():
             raise RuntimeError("claude killed: agentor shutdown")
-        if p.returncode not in (0, None):
+        if returncode not in (0, None):
             tail = (stderr_text or stdout_text)[-500:].strip()
-            raise RuntimeError(f"claude exited {p.returncode}: {tail}")
+            raise RuntimeError(f"claude exited {returncode}: {tail}")
         self._last_usage = state.envelope()
         summary = _derive_summary(worktree, stdout_text, item.title)
         return summary, stdout_text
@@ -865,100 +892,47 @@ class CodexRunner(Runner):
         self, item: StoredItem, args: list[str], worktree: Path,
         transcript_path: Path, output_path: Path, phase_tag: str,
     ) -> tuple[str, str]:
-        try:
-            p = subprocess.Popen(
-                args, cwd=worktree,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, bufsize=1, start_new_session=True,
-            )
-        except FileNotFoundError:
-            raise RuntimeError(
-                f"codex CLI not found. First arg was: {args[0]!r}. "
-                f"Install codex or set agent.command/agent.resume_command in agentor.toml."
-            )
-        if self.proc_registry is not None:
-            self.proc_registry.register(item.id, p)
-
-        timed_out = threading.Event()
-
-        def _on_timeout():
-            timed_out.set()
-            try:
-                p.kill()
-            except Exception:
-                pass
-
-        timer = threading.Timer(self.config.agent.timeout_seconds, _on_timeout)
-        timer.daemon = True
-        timer.start()
-
-        stderr_chunks: list[str] = []
-
-        def _drain_stderr():
-            try:
-                for line in iter(p.stderr.readline, ""):
-                    stderr_chunks.append(line)
-            except Exception:
-                pass
-
-        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-        stderr_thread.start()
-
         state = _CodexStreamState(item_id=item.id, phase=phase_tag)
-        stdout_buf: list[str] = []
-        transcript_path.write_text(f"args: {args}\n\nstdout:\n")
-        try:
-            for line in iter(p.stdout.readline, ""):
-                stdout_buf.append(line)
-                with transcript_path.open("a") as fh:
-                    fh.write(line)
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    ev = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(ev, dict):
-                    continue
-                state.ingest(ev)
-                if state.session_id and state.session_id != item.session_id:
-                    self.store.transition(
-                        item.id, ItemStatus.WORKING,
-                        session_id=state.session_id,
-                        note="session id assigned",
-                    )
-                    item = self.store.get(item.id)
-                self._publish_live(item.id, state)
-            p.wait(timeout=5)
-        finally:
-            timer.cancel()
-            if self.proc_registry is not None:
-                self.proc_registry.unregister(item.id)
-            try:
-                p.stdout.close()
-            except Exception:
-                pass
-            stderr_thread.join(timeout=2)
-            try:
-                p.stderr.close()
-            except Exception:
-                pass
+        # Mutable holder so the callback can swap in a refreshed StoredItem
+        # after persisting the thread_id mid-stream.
+        item_ref = [item]
 
-        stdout_text = "".join(stdout_buf)
-        stderr_text = "".join(stderr_chunks)
-        with transcript_path.open("a") as fh:
-            fh.write(f"\n\nstderr:\n{stderr_text}\n")
-            fh.write(f"\nexit: {p.returncode}\n")
-        if timed_out.is_set():
+        def on_event(ev: dict) -> str | None:
+            state.ingest(ev)
+            cur = item_ref[0]
+            if state.session_id and state.session_id != cur.session_id:
+                self.store.transition(
+                    cur.id, ItemStatus.WORKING,
+                    session_id=state.session_id,
+                    note="session id assigned",
+                )
+                item_ref[0] = self.store.get(cur.id)
+            self._publish_live(item_ref[0].id, state)
+            return None
+
+        stdout_text, stderr_text, returncode, timed_out, _ = (
+            _run_stream_json_subprocess(
+                args=args, cwd=worktree,
+                timeout_seconds=self.config.agent.timeout_seconds,
+                transcript_path=transcript_path,
+                proc_registry=self.proc_registry,
+                item_key=item.id,
+                fnfe_hint=(
+                    f"codex CLI not found. First arg was: {args[0]!r}. "
+                    f"Install codex or set agent.command/agent.resume_command in agentor.toml."
+                ),
+                on_event=on_event,
+            )
+        )
+        if timed_out:
             raise RuntimeError(
                 f"codex timed out after {self.config.agent.timeout_seconds}s"
             )
         if self.stop_event is not None and self.stop_event.is_set():
             raise RuntimeError("codex killed: agentor shutdown")
-        if p.returncode not in (0, None):
+        if returncode not in (0, None):
             tail = (stderr_text or stdout_text)[-500:].strip()
-            raise RuntimeError(f"codex exited {p.returncode}: {tail}")
+            raise RuntimeError(f"codex exited {returncode}: {tail}")
         result_text = _read_output_message(output_path) or _extract_codex_result(stdout_text)
         self._last_usage = state.envelope(result_text=result_text)
         return result_text or "", stdout_text

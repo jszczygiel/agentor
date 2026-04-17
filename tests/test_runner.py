@@ -1191,5 +1191,141 @@ class TestBranchCleanupHelpers(unittest.TestCase):
                          "ff refusal must leave the worktree untouched")
 
 
+class TestRunStreamJsonSubprocess(unittest.TestCase):
+    """Direct coverage for the shared stream-json subprocess helper."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.transcript = self.root / "transcript.log"
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _fake_cli(self, script: str) -> Path:
+        return _write_fake_cli(self.root / "bin", "fakecli", script)
+
+    def test_dispatches_events_and_writes_transcript(self):
+        from agentor.runner import _run_stream_json_subprocess
+
+        cli = self._fake_cli(
+            r"""printf '%s\n' '{"type":"hello","id":1}'
+printf '%s\n' '{"type":"hello","id":2}'
+printf '%s\n' 'not-json-should-be-ignored'
+"""
+        )
+        events: list[dict] = []
+
+        def on_event(ev: dict) -> None:
+            events.append(ev)
+            return None
+
+        stdout, stderr, rc, timed_out, cap = _run_stream_json_subprocess(
+            args=[str(cli)],
+            cwd=self.root,
+            timeout_seconds=5,
+            transcript_path=self.transcript,
+            proc_registry=None,
+            item_key="k",
+            fnfe_hint="missing",
+            on_event=on_event,
+        )
+        self.assertEqual(rc, 0)
+        self.assertFalse(timed_out)
+        self.assertIsNone(cap)
+        self.assertEqual([e["id"] for e in events], [1, 2])
+        body = self.transcript.read_text()
+        self.assertIn('"type":"hello"', body)
+        self.assertIn("exit: 0", body)
+
+    def test_cap_reason_kills_child_and_is_returned(self):
+        from agentor.runner import _run_stream_json_subprocess
+
+        # Emit one event then sleep long enough that the helper must kill
+        # us to finish — proves cap_reason short-circuits the loop.
+        cli = self._fake_cli(
+            r"""printf '%s\n' '{"type":"first"}'
+sleep 3
+"""
+        )
+
+        def on_event(ev: dict) -> str | None:
+            return "stop-now" if ev.get("type") == "first" else None
+
+        stdout, stderr, rc, timed_out, cap = _run_stream_json_subprocess(
+            args=[str(cli)],
+            cwd=self.root,
+            timeout_seconds=5,
+            transcript_path=self.transcript,
+            proc_registry=None,
+            item_key="k",
+            fnfe_hint="missing",
+            on_event=on_event,
+        )
+        self.assertEqual(cap, "stop-now")
+        self.assertFalse(timed_out)
+        self.assertNotEqual(rc, 0)
+
+    def test_timeout_sets_flag_and_kills(self):
+        from agentor.runner import _run_stream_json_subprocess
+
+        cli = self._fake_cli("sleep 3\n")
+
+        def on_event(ev: dict) -> None:
+            return None
+
+        stdout, stderr, rc, timed_out, cap = _run_stream_json_subprocess(
+            args=[str(cli)],
+            cwd=self.root,
+            timeout_seconds=1,
+            transcript_path=self.transcript,
+            proc_registry=None,
+            item_key="k",
+            fnfe_hint="missing",
+            on_event=on_event,
+        )
+        self.assertTrue(timed_out)
+        self.assertIsNone(cap)
+
+    def test_fnfe_raises_hint(self):
+        from agentor.runner import _run_stream_json_subprocess
+
+        with self.assertRaises(RuntimeError) as cm:
+            _run_stream_json_subprocess(
+                args=[str(self.root / "nope" / "does-not-exist")],
+                cwd=self.root,
+                timeout_seconds=1,
+                transcript_path=self.transcript,
+                proc_registry=None,
+                item_key="k",
+                fnfe_hint="this is the hint",
+                on_event=lambda ev: None,
+            )
+        self.assertIn("this is the hint", str(cm.exception))
+
+    def test_registers_and_unregisters_with_proc_registry(self):
+        from agentor.runner import ProcRegistry, _run_stream_json_subprocess
+
+        cli = self._fake_cli('printf "%s\\n" "{}"\n')
+        reg = ProcRegistry()
+
+        def on_event(ev: dict) -> None:
+            return None
+
+        _run_stream_json_subprocess(
+            args=[str(cli)],
+            cwd=self.root,
+            timeout_seconds=5,
+            transcript_path=self.transcript,
+            proc_registry=reg,
+            item_key="item-abc",
+            fnfe_hint="missing",
+            on_event=on_event,
+        )
+        # After the helper returns, the process must be unregistered —
+        # nothing to kill on a subsequent shutdown sweep.
+        self.assertEqual(reg.kill_all(log=lambda m: None), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
