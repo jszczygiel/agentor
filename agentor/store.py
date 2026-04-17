@@ -122,6 +122,8 @@ class Store:
     shareable across threads by default).
     """
 
+    # --- lifecycle ---
+
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(
@@ -148,6 +150,8 @@ class Store:
             except Exception:
                 self.conn.execute("ROLLBACK")
                 raise
+
+    # --- ingestion ---
 
     def upsert_discovered(self, item: Item) -> bool:
         """Insert an item seen in a source file if not already present.
@@ -179,6 +183,8 @@ class Store:
             )
         return True
 
+    # --- reads ---
+
     def get(self, item_id: str) -> StoredItem | None:
         with self._lock:
             row = self.conn.execute(
@@ -200,6 +206,61 @@ class Store:
                 "SELECT COUNT(*) AS n FROM items WHERE status = ?", (status.value,)
             ).fetchone()
         return row["n"]
+
+    def ids_with_errors(self, statuses: list[ItemStatus] | None = None,
+                        ) -> set[str]:
+        """Return the set of item ids where `last_error` is non-null,
+        optionally filtered to a subset of statuses. Used by the dashboard
+        error filter and the `!` marker in rows."""
+        params: list[object] = []
+        sql = "SELECT id FROM items WHERE last_error IS NOT NULL"
+        if statuses:
+            placeholders = ",".join("?" * len(statuses))
+            sql += f" AND status IN ({placeholders})"
+            params.extend(s.value for s in statuses)
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return {r["id"] for r in rows}
+
+    # --- queue / dispatch ---
+
+    def claim_next_queued(self, worktree_path: str, branch: str) -> StoredItem | None:
+        """Atomically pick the oldest queued item and mark it working.
+        Returns the claimed item or None if the queue is empty.
+        Caller enforces the pool cap via pool_has_slot()."""
+        with self.tx() as c:
+            row = c.execute(
+                """SELECT id FROM items
+                   WHERE status = ?
+                   ORDER BY created_at
+                   LIMIT 1""",
+                (ItemStatus.QUEUED.value,),
+            ).fetchone()
+            if row is None:
+                return None
+            item_id = row["id"]
+            now = time.time()
+            c.execute(
+                """UPDATE items
+                   SET status = ?, worktree_path = ?, branch = ?,
+                       attempts = attempts + 1, agentor_version = ?,
+                       updated_at = ?
+                   WHERE id = ? AND status = ?""",
+                (ItemStatus.WORKING.value, worktree_path, branch,
+                 AGENTOR_VERSION, now,
+                 item_id, ItemStatus.QUEUED.value),
+            )
+            c.execute(
+                """INSERT INTO transitions (item_id, from_status, to_status, at)
+                   VALUES (?, ?, ?, ?)""",
+                (item_id, ItemStatus.QUEUED.value, ItemStatus.WORKING.value, now),
+            )
+        return self.get(item_id)
+
+    def pool_has_slot(self, pool_size: int) -> bool:
+        return self.count_by_status(ItemStatus.WORKING) < pool_size
+
+    # --- transitions ---
 
     def transition(
         self,
@@ -239,42 +300,6 @@ class Store:
                 (item_id, from_status, to.value, note, now),
             )
 
-    def claim_next_queued(self, worktree_path: str, branch: str) -> StoredItem | None:
-        """Atomically pick the oldest queued item and mark it working.
-        Returns the claimed item or None if the queue is empty.
-        Caller enforces the pool cap via pool_has_slot()."""
-        with self.tx() as c:
-            row = c.execute(
-                """SELECT id FROM items
-                   WHERE status = ?
-                   ORDER BY created_at
-                   LIMIT 1""",
-                (ItemStatus.QUEUED.value,),
-            ).fetchone()
-            if row is None:
-                return None
-            item_id = row["id"]
-            now = time.time()
-            c.execute(
-                """UPDATE items
-                   SET status = ?, worktree_path = ?, branch = ?,
-                       attempts = attempts + 1, agentor_version = ?,
-                       updated_at = ?
-                   WHERE id = ? AND status = ?""",
-                (ItemStatus.WORKING.value, worktree_path, branch,
-                 AGENTOR_VERSION, now,
-                 item_id, ItemStatus.QUEUED.value),
-            )
-            c.execute(
-                """INSERT INTO transitions (item_id, from_status, to_status, at)
-                   VALUES (?, ?, ?, ?)""",
-                (item_id, ItemStatus.QUEUED.value, ItemStatus.WORKING.value, now),
-            )
-        return self.get(item_id)
-
-    def pool_has_slot(self, pool_size: int) -> bool:
-        return self.count_by_status(ItemStatus.WORKING) < pool_size
-
     def update_result_json(self, item_id: str, blob: str) -> None:
         """Write a fresh result_json for an item WITHOUT recording a status
         transition. Used by the streaming claude runner to publish live
@@ -287,6 +312,8 @@ class Store:
                 (blob, now, item_id),
             )
 
+    # --- history ---
+
     def transitions_for(self, item_id: str) -> list[dict]:
         with self._lock:
             rows = self.conn.execute(
@@ -295,6 +322,52 @@ class Store:
                 (item_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def recent_failure_notes(self, item_id: str, n: int = 3) -> list[str]:
+        """Return the most recent N transition notes whose from_status was
+        WORKING and to_status was QUEUED — i.e. the "bounce back after a
+        do_work failure" transitions. Used by the runner to detect when
+        the same error has fired multiple attempts in a row (a loop) so
+        it can auto-revert instead of reject."""
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT note FROM transitions
+                   WHERE item_id = ? AND from_status = ? AND to_status = ?
+                   ORDER BY id DESC LIMIT ?""",
+                (item_id, ItemStatus.WORKING.value,
+                 ItemStatus.QUEUED.value, n),
+            ).fetchall()
+        return [r["note"] or "" for r in rows]
+
+    def previous_settled_status(self, item_id: str) -> ItemStatus | None:
+        """Find the most recent "settled" status this item was in, other
+        than the current one. Settled = anything except WORKING (which is
+        a transient in-flight state). Returns None if no prior settled
+        state exists.
+
+        Used by the manual revert command and by crash recovery to restore
+        an item without losing user-visible progress — e.g. an item that
+        had reached AWAITING_PLAN_REVIEW, then was re-queued for execute,
+        then crashed mid-work, gets restored to QUEUED (the execute-phase
+        wait, with the approved plan still in result_json) rather than
+        starting from BACKLOG. For a fresh first-time crash, this returns
+        QUEUED. For a rejection cascade, it skips the WORKING bounces and
+        returns the QUEUED state that preceded them."""
+        rows = self.transitions_for(item_id)
+        if len(rows) < 2:
+            return None
+        current = rows[-1]["to_status"]
+        for row in reversed(rows[:-1]):
+            to = row["to_status"]
+            if not to or to == ItemStatus.WORKING.value or to == current:
+                continue
+            try:
+                return ItemStatus(to)
+            except ValueError:
+                continue
+        return None
+
+    # --- failures ---
 
     def record_failure(
         self,
@@ -342,78 +415,6 @@ class Store:
             ).fetchone()
         return row["n"] if row else 0
 
-    def clear_error_and_reset_attempts(self, item_id: str) -> None:
-        """Clear last_error and zero the attempts counter without moving
-        status. Used by the startup auto-recovery sweep for items whose
-        error is known benign (operator ^C, obsolete cap, recoverable
-        session loss) — they should re-enter normal dispatch as if fresh."""
-        now = time.time()
-        with self._lock:
-            self.conn.execute(
-                "UPDATE items SET last_error = NULL, attempts = 0, "
-                "updated_at = ? WHERE id = ?",
-                (now, item_id),
-            )
-
-    def ids_with_errors(self, statuses: list[ItemStatus] | None = None,
-                        ) -> set[str]:
-        """Return the set of item ids where `last_error` is non-null,
-        optionally filtered to a subset of statuses. Used by the dashboard
-        error filter and the `!` marker in rows."""
-        params: list[object] = []
-        sql = "SELECT id FROM items WHERE last_error IS NOT NULL"
-        if statuses:
-            placeholders = ",".join("?" * len(statuses))
-            sql += f" AND status IN ({placeholders})"
-            params.extend(s.value for s in statuses)
-        with self._lock:
-            rows = self.conn.execute(sql, params).fetchall()
-        return {r["id"] for r in rows}
-
-    def recent_failure_notes(self, item_id: str, n: int = 3) -> list[str]:
-        """Return the most recent N transition notes whose from_status was
-        WORKING and to_status was QUEUED — i.e. the "bounce back after a
-        do_work failure" transitions. Used by the runner to detect when
-        the same error has fired multiple attempts in a row (a loop) so
-        it can auto-revert instead of reject."""
-        with self._lock:
-            rows = self.conn.execute(
-                """SELECT note FROM transitions
-                   WHERE item_id = ? AND from_status = ? AND to_status = ?
-                   ORDER BY id DESC LIMIT ?""",
-                (item_id, ItemStatus.WORKING.value,
-                 ItemStatus.QUEUED.value, n),
-            ).fetchall()
-        return [r["note"] or "" for r in rows]
-
-    def previous_settled_status(self, item_id: str) -> ItemStatus | None:
-        """Find the most recent "settled" status this item was in, other
-        than the current one. Settled = anything except WORKING (which is
-        a transient in-flight state). Returns None if no prior settled
-        state exists.
-
-        Used by the manual revert command and by crash recovery to restore
-        an item without losing user-visible progress — e.g. an item that
-        had reached AWAITING_PLAN_REVIEW, then was re-queued for execute,
-        then crashed mid-work, gets restored to QUEUED (the execute-phase
-        wait, with the approved plan still in result_json) rather than
-        starting from BACKLOG. For a fresh first-time crash, this returns
-        QUEUED. For a rejection cascade, it skips the WORKING bounces and
-        returns the QUEUED state that preceded them."""
-        rows = self.transitions_for(item_id)
-        if len(rows) < 2:
-            return None
-        current = rows[-1]["to_status"]
-        for row in reversed(rows[:-1]):
-            to = row["to_status"]
-            if not to or to == ItemStatus.WORKING.value or to == current:
-                continue
-            try:
-                return ItemStatus(to)
-            except ValueError:
-                continue
-        return None
-
     def note_infra_failure(self, item_id: str, err: str) -> None:
         """Record an infrastructure-level failure (broken worktree, missing
         repo, etc.) without changing item status or charging an attempt.
@@ -442,4 +443,19 @@ class Store:
                    (item_id, from_status, to_status, note, at)
                    VALUES (?, ?, ?, ?, ?)""",
                 (item_id, cur_status, cur_status, note, now),
+            )
+
+    # --- recovery ---
+
+    def clear_error_and_reset_attempts(self, item_id: str) -> None:
+        """Clear last_error and zero the attempts counter without moving
+        status. Used by the startup auto-recovery sweep for items whose
+        error is known benign (operator ^C, obsolete cap, recoverable
+        session loss) — they should re-enter normal dispatch as if fresh."""
+        now = time.time()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE items SET last_error = NULL, attempts = 0, "
+                "updated_at = ? WHERE id = ?",
+                (now, item_id),
             )
