@@ -5,11 +5,14 @@ Usage:
     python3 tools/analyze_waste.py [TRANSCRIPTS_DIR]
 
 Defaults to $AGENTOR_PROJECT_ROOT/.agentor/transcripts when set."""
-import json
 import os
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from agentor.transcript import ToolResult, iter_events  # noqa: E402
 
 
 if len(sys.argv) > 1:
@@ -26,82 +29,40 @@ else:
     TRANS_DIR = Path(root) / ".agentor" / "transcripts"
 
 
-def parse_file(path):
-    events = []
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return events
-
-
 def main():
     bash_cmd_sizes = []  # (bytes, cmd, item_id)
     grep_sizes = []  # (bytes, pattern, head_limit, output_mode, item_id)
     read_sizes = []  # (bytes, fp, item_id)
     glob_sizes = []
     bash_cmd_counts = Counter()
-    system_prompt_samples = []
 
     for logpath in sorted(TRANS_DIR.glob("*.log")):
         item_id = logpath.stem
-        events = parse_file(logpath)
-        tool_use_by_id = {}
-        for ev in events:
-            if ev.get("type") == "assistant":
-                msg = ev.get("message", {})
-                for block in msg.get("content") or []:
-                    if isinstance(block, dict) and block.get("type") == "tool_use":
-                        tool_use_by_id[block.get("id")] = (
-                            block.get("name"),
-                            block.get("input") or {},
-                        )
-            elif ev.get("type") == "system" and ev.get("subtype") == "init":
-                # system prompts go here sometimes
-                pass
-            elif ev.get("type") == "user":
-                msg = ev.get("message", {})
-                for block in msg.get("content") or []:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        use_id = block.get("tool_use_id")
-                        content = block.get("content")
-                        if isinstance(content, list):
-                            text = "".join(
-                                sub.get("text", "")
-                                for sub in content
-                                if isinstance(sub, dict) and sub.get("type") == "text"
-                            )
-                        elif isinstance(content, str):
-                            text = content
-                        else:
-                            text = ""
-                        sz = len(text.encode("utf-8", errors="replace"))
-                        tname, tinput = tool_use_by_id.get(use_id, (None, {}))
-                        if tname == "Bash":
-                            cmd = tinput.get("command", "")
-                            bash_cmd_sizes.append((sz, cmd, item_id))
-                            # normalize first token for common-command counting
-                            first = cmd.strip().split()[0] if cmd.strip() else "?"
-                            bash_cmd_counts[first] += 1
-                        elif tname == "Grep":
-                            grep_sizes.append(
-                                (
-                                    sz,
-                                    tinput.get("pattern", ""),
-                                    tinput.get("head_limit"),
-                                    tinput.get("output_mode", "files_with_matches"),
-                                    item_id,
-                                )
-                            )
-                        elif tname == "Read":
-                            read_sizes.append((sz, tinput.get("file_path", ""), item_id))
-                        elif tname == "Glob":
-                            glob_sizes.append((sz, tinput.get("pattern", ""), item_id))
+        for ev in iter_events(logpath):
+            if not isinstance(ev, ToolResult):
+                continue
+            sz = len(ev.text.encode("utf-8", errors="replace"))
+            tname = ev.tool_name
+            tinput = ev.tool_input
+            if tname == "Bash":
+                cmd = tinput.get("command", "")
+                bash_cmd_sizes.append((sz, cmd, item_id))
+                first = cmd.strip().split()[0] if cmd.strip() else "?"
+                bash_cmd_counts[first] += 1
+            elif tname == "Grep":
+                grep_sizes.append(
+                    (
+                        sz,
+                        tinput.get("pattern", ""),
+                        tinput.get("head_limit"),
+                        tinput.get("output_mode", "files_with_matches"),
+                        item_id,
+                    )
+                )
+            elif tname == "Read":
+                read_sizes.append((sz, tinput.get("file_path", ""), item_id))
+            elif tname == "Glob":
+                glob_sizes.append((sz, tinput.get("pattern", ""), item_id))
 
     print("--- TOP 20 BASH OUTPUTS ---")
     for sz, cmd, item in sorted(bash_cmd_sizes, key=lambda x: -x[0])[:20]:
