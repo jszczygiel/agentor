@@ -126,6 +126,19 @@ class TestAutoMerge(unittest.TestCase):
                          "main must not advance when the merge conflicts")
         self.assertIn("README.md", final.last_error or "",
                       "conflict summary should name the clashing file")
+        # Feature context leads; merge-mechanics trail.
+        err = final.last_error or ""
+        self.assertIn(f"Feature: {item.title}", err)
+        self.assertIn(f"Branch:  {item.branch}", err)
+        self.assertLess(
+            err.index(item.title), err.index("── merge conflict"),
+            "feature context must appear before the merge-conflict block",
+        )
+        self.assertLess(
+            err.index("── merge conflict"), err.index("README.md"),
+            "conflicted-files mechanics must appear in the trailing block",
+        )
+        self.assertIn("merge into main", err)
 
 
 class TestRebaseMode(unittest.TestCase):
@@ -200,6 +213,14 @@ class TestRebaseMode(unittest.TestCase):
         self.assertNotEqual(
             cp.returncode, 0,
             "rebase must not rewrite feature branch to include base",
+        )
+        err = final.last_error or ""
+        self.assertIn(f"Feature: {item.title}", err)
+        self.assertIn(f"Branch:  {item.branch}", err)
+        self.assertIn("rebase into main", err)
+        self.assertLess(
+            err.index(item.title), err.index("── merge conflict"),
+            "feature context must appear before the merge-conflict block",
         )
 
 
@@ -291,6 +312,72 @@ class TestRetryMerge(unittest.TestCase):
         self.assertTrue(_branch_exists(self.root, original_branch))
         self.assertIn("conflict", (final.feedback or "").lower())
         self.assertIn("main", final.feedback or "")
+
+
+class TestConflictSummaryFormat(unittest.TestCase):
+    """Feature-context framing of the CONFLICTED `last_error`."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text(
+            "- [ ] Reshape README intro\n"
+            "  line one of intent\n"
+            "  line two describing why\n"
+            "  line three tying it back\n"
+        )
+        self.cfg = _mk_config(self.root)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        scan_once(self.cfg, self.store)
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _to_conflicted(self):
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(self.cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        StubRunner(self.cfg, self.store).run(claimed)
+        item = self.store.get(claimed.id)
+        wt = Path(item.worktree_path)
+        (wt / "README.md").write_text("# project\n\nFEAT\n")
+        _git(wt, "add", "README.md")
+        _git(wt, "commit", "-q", "-m", "feat readme")
+        (self.root / "README.md").write_text("# project\n\nMAIN\n")
+        _git(self.root, "add", "README.md")
+        _git(self.root, "commit", "-q", "-m", "main readme")
+        approve_and_commit(self.cfg, self.store, item, "stub commit")
+        return self.store.get(item.id)
+
+    def test_summary_includes_body_before_trailing_mechanics(self):
+        item = self._to_conflicted()
+        err = item.last_error or ""
+        for line in ("line one of intent",
+                     "line two describing why",
+                     "line three tying it back"):
+            self.assertIn(line, err, f"item body line missing: {line!r}")
+        marker = "── merge conflict"
+        # Body sits between the header and the trailing mechanics block.
+        self.assertLess(err.index("line one of intent"), err.index(marker))
+        self.assertLess(err.index("line three tying it back"),
+                        err.index(marker))
+        # The trailing block is actually short — conflicted files + a
+        # short git-output tail, no feature material below it.
+        tail = err[err.index(marker):]
+        self.assertIn("README.md", tail)
+        self.assertNotIn("line one of intent", tail)
+
+    def test_retry_summary_marks_retry(self):
+        item = self._to_conflicted()
+        # No resolution — retry hits the same clash.
+        ok, _ = retry_merge(self.cfg, self.store, item)
+        self.assertFalse(ok)
+        err = self.store.get(item.id).last_error or ""
+        self.assertIn("Feature: Reshape README intro", err)
+        self.assertIn("merge into main, retry", err,
+                      "retry trailing block should be labeled 'retry'")
 
 
 class TestRetryErrored(unittest.TestCase):
