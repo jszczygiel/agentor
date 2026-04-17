@@ -6,13 +6,17 @@ from pathlib import Path
 
 @dataclass
 class SourcesConfig:
-    watch: list[str] = field(default_factory=list)
-    exclude: list[str] = field(default_factory=list)
+    watch: list[str] = field(
+        default_factory=lambda: ["docs/backlog/*.md", "docs/ideas/*.md"]
+    )
+    exclude: list[str] = field(
+        default_factory=lambda: ["**/README.md"]
+    )
 
 
 @dataclass
 class ParsingConfig:
-    mode: str = "checkbox"  # "checkbox" | "heading"
+    mode: str = "frontmatter"  # "checkbox" | "heading" | "frontmatter"
 
 
 @dataclass
