@@ -21,7 +21,7 @@ from .formatters import (
 
 
 ACTIONS = ("[p]ickup  [r]eview  [d]eferred  [i]nspect  "
-           "[tab]filter  [+/-]pool  [m]ode  [u]npause  [q]uit")
+           "[tab]filter  [+/-]pool  [m]ode  [q]uit")
 
 # Filter views: ordered list cycled by Tab. Each entry maps a filter name
 # to the statuses to display (None = all).
