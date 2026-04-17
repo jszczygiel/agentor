@@ -1,3 +1,4 @@
+import subprocess
 import time
 from pathlib import Path
 
@@ -5,7 +6,9 @@ from ..config import Config
 from ..daemon import Daemon
 from ..git_ops import diff_vs_base
 from ..models import ItemStatus
+from ..slug import slugify
 from ..store import Store, StoredItem
+from ..watcher import scan_once
 
 from .formatters import (
     _build_commit_message,
@@ -134,13 +137,11 @@ def _enter_route(status: ItemStatus) -> str:
 
 
 def _enter_action(stdscr, cfg: Config, store: Store, daemon: Daemon,
-                  items: list[StoredItem], idx: int) -> None:
+                  item: StoredItem) -> None:
     """Handle enter on the selected row. Re-fetches the item before acting
     (status may have changed since the last render) and dispatches to the
     matching single-item screen."""
-    if not items or idx < 0 or idx >= len(items):
-        return
-    fresh = store.get(items[idx].id)
+    fresh = store.get(item.id)
     if fresh is None:
         _flash(stdscr, "item no longer exists.")
         return
@@ -248,8 +249,8 @@ def _inspect_render(stdscr, cfg: Config, store: Store, item: StoredItem) -> None
             footer = (
                 " [q/enter]close · [j/k]scroll · [space/pgdn]page · "
                 "auto-refresh 1s "
-                + ("· [m]retry merge " if item.status == ItemStatus.CONFLICTED
-                   else "")
+                + ("· [m]retry merge · [e]resubmit to agent "
+                   if item.status == ItemStatus.CONFLICTED else "")
                 + ("· [r]retry " if item.status == ItemStatus.ERRORED
                    else "")
             )
@@ -272,6 +273,7 @@ def _inspect_render(stdscr, cfg: Config, store: Store, item: StoredItem) -> None
                     ok_msg = _run_with_progress(
                         stdscr, f"  retry merge · {item.title}",
                         lambda p: retry_merge(cfg, store, item, progress=p),
+                        hint="git worktree add + merge/rebase runs here.",
                     )
                     _, msg = ok_msg  # type: ignore[misc]
                 except Exception as e:  # git or state errors
@@ -279,6 +281,18 @@ def _inspect_render(stdscr, cfg: Config, store: Store, item: StoredItem) -> None
                 _flash(stdscr, msg)
                 # If it resolved, drop back to the list — the item is no
                 # longer conflicted so there's nothing more to inspect.
+                refreshed = store.get(item.id)
+                if refreshed and refreshed.status != ItemStatus.CONFLICTED:
+                    return
+            if k == "e" and item.status == ItemStatus.CONFLICTED:
+                from ..committer import resubmit_conflicted
+                try:
+                    resubmit_conflicted(cfg, store, item)
+                    msg = (f"resubmitted: {item.id[:8]} → queued "
+                           f"(agent will resolve)")
+                except Exception as e:
+                    msg = f"resubmit failed: {e}"
+                _flash(stdscr, msg)
                 refreshed = store.get(item.id)
                 if refreshed and refreshed.status != ItemStatus.CONFLICTED:
                     return
@@ -539,6 +553,7 @@ def _review_code_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
                     stdscr, f"  approve + merge · {fresh.title}",
                     lambda p: approve_and_commit(
                         cfg, store, fresh, msg, progress=p),
+                    hint="git worktree add + merge/rebase runs here.",
                 )
             except Exception as e:  # git/state errors shouldn't kill UI
                 _flash(stdscr, f"merge failed: {e}")
@@ -569,3 +584,199 @@ def _handle_reject_flow(stdscr, store: Store, item: StoredItem,
     if not feedback:
         return
     reject_and_retry(store, item, feedback)
+
+
+_NEW_ISSUE_PROMPT_FRONTMATTER = (
+    "You're receiving a quick backlog-capture note from an operator "
+    "using the `agentor` tool. Convert it into a single markdown file "
+    "whose contents will be written directly to disk as one agentor "
+    "work item parsed via frontmatter mode.\n\n"
+    "Output format (produce EXACTLY this, nothing before or after, no "
+    "code fences):\n\n"
+    "---\n"
+    "title: <5-10 word imperative title, no quotes>\n"
+    "state: available\n"
+    "category: <bug | idea | feature | polish | chore>\n"
+    "---\n\n"
+    "<2-6 sentence body. Expand the note into an actionable item. If "
+    "the raw note references a filename or concept visible in this "
+    "repo, ground the body in what's actually there — but do NOT "
+    "invent file paths or APIs. If something is unclear, say so "
+    "rather than making it up.>\n\n"
+    "Raw operator note:\n```\n{note}\n```\n"
+)
+
+
+_NEW_ISSUE_PROMPT_CHECKBOX = (
+    "You're receiving a quick backlog-capture note from an operator "
+    "using the `agentor` tool. Convert it into a single checkbox "
+    "item to APPEND to an existing markdown backlog file.\n\n"
+    "Output format (produce EXACTLY this, nothing before or after, no "
+    "code fences, no heading):\n\n"
+    "- [ ] <5-10 word imperative title>\n"
+    "  <2-6 sentence body. Expand the note into an actionable item. "
+    "If the raw note references a filename or concept visible in this "
+    "repo, ground the body in what's actually there — but do NOT "
+    "invent file paths or APIs. If something is unclear, say so rather "
+    "than making it up. Body lines MUST be indented with exactly two "
+    "spaces so the agentor checkbox parser associates them with the "
+    "item above.>\n\n"
+    "Raw operator note:\n```\n{note}\n```\n"
+)
+
+
+def _new_issue_target(cfg: Config) -> tuple[Path, str] | None:
+    """Resolve where a new-issue note should land based on the FIRST
+    `sources.watch` entry plus `parsing.mode`. Returns (path, kind):
+      (file, "file") — append to this watched markdown file (checkbox/
+        heading mode or any non-glob watch entry).
+      (dir,  "dir")  — write a new `.md` inside this dir (frontmatter
+        mode with a directory-glob watch entry).
+    Creates parents on first use. Returns None only when
+    `sources.watch` is empty."""
+    if not cfg.sources.watch:
+        return None
+    first = cfg.sources.watch[0]
+    p = Path(first)
+    is_glob = any(c in first for c in "*?[")
+    mode = cfg.parsing.mode
+    if mode == "frontmatter" and is_glob:
+        parent = p.parent
+        full = parent if parent.is_absolute() else (cfg.project_root / parent)
+        full.mkdir(parents=True, exist_ok=True)
+        return full, "dir"
+    full = p if p.is_absolute() else (cfg.project_root / p)
+    full.parent.mkdir(parents=True, exist_ok=True)
+    return full, "file"
+
+
+def _expand_note_via_claude(
+    note: str, cfg: Config, kind: str, timeout: float,
+) -> str:
+    """One-shot claude call. `kind` is 'frontmatter' or 'checkbox' and
+    selects the output-format prompt. Runs with `cwd=project_root` so
+    the model can Read/Grep the repo for grounding. Returns the raw
+    text; raises RuntimeError on any failure."""
+    tmpl = (_NEW_ISSUE_PROMPT_FRONTMATTER if kind == "frontmatter"
+            else _NEW_ISSUE_PROMPT_CHECKBOX)
+    prompt = tmpl.format(note=note)
+    cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
+    try:
+        cp = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            cwd=str(cfg.project_root),
+        )
+    except FileNotFoundError:
+        raise RuntimeError("claude CLI not found on PATH")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"claude timed out after {timeout:.0f}s")
+    if cp.returncode != 0:
+        err = (cp.stderr or cp.stdout).strip() or "claude exited nonzero"
+        raise RuntimeError(err.splitlines()[-1][:200])
+    out = (cp.stdout or "").strip()
+    if not out:
+        raise RuntimeError("claude returned empty output")
+    if out.startswith("```"):
+        lines = out.splitlines()
+        if lines[0].lstrip("`").strip() in ("", "markdown", "md"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        out = "\n".join(lines).strip()
+    if kind == "frontmatter" and not out.startswith("---"):
+        raise RuntimeError("response missing frontmatter; refusing to write")
+    if kind == "checkbox" and not out.lstrip().startswith("- [ ]"):
+        raise RuntimeError("response missing `- [ ]`; refusing to write")
+    return out
+
+
+def _frontmatter_title(md: str) -> str | None:
+    """Pull `title:` out of the top frontmatter block so we can slug-name
+    the output file. Returns None if the block is malformed or missing."""
+    lines = md.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for ln in lines[1:25]:
+        if ln.strip() == "---":
+            return None
+        if ":" in ln:
+            k, _, v = ln.partition(":")
+            if k.strip().lower() == "title":
+                return v.strip().strip('"').strip("'") or None
+    return None
+
+
+def _unique_md_path(dirpath: Path, slug: str) -> Path:
+    """`<dir>/<slug>.md`, or `<slug>-2.md`, `<slug>-3.md`, … if it exists.
+    Prevents silently overwriting an earlier capture."""
+    path = dirpath / f"{slug}.md"
+    i = 2
+    while path.exists():
+        path = dirpath / f"{slug}-{i}.md"
+        i += 1
+    return path
+
+
+def _append_checkbox_block(file_path: Path, block: str) -> None:
+    """Append `block` to `file_path`, guaranteeing exactly one blank
+    line between prior content and the new item. Creates the file if
+    missing."""
+    existing = file_path.read_text() if file_path.exists() else ""
+    prefix = ""
+    if existing:
+        existing = existing.rstrip() + "\n"
+        prefix = "\n"
+    file_path.write_text(existing + prefix + block.rstrip() + "\n")
+
+
+def _new_issue_mode(
+    stdscr, cfg: Config, store: Store, daemon: Daemon,
+) -> None:
+    """Capture a quick bug/idea note, expand it via a one-shot claude
+    call, write the result to the first watched source per parsing mode,
+    then scan_once so the item shows up in the table immediately.
+
+    Routing:
+      - `checkbox`/`heading` mode OR a single-file watch entry → append
+        the expanded item to the watched file.
+      - `frontmatter` mode with a directory-glob watch entry → write a
+        new `<slug>.md` inside the glob's dir."""
+    target = _new_issue_target(cfg)
+    if target is None:
+        _flash(stdscr, "no sources.watch configured")
+        return
+    dest, kind = target
+    mode = cfg.parsing.mode
+    expand_kind = "frontmatter" if (mode == "frontmatter" and kind == "dir") \
+        else "checkbox"
+    note = _prompt_text(
+        stdscr, "bug/idea note (enter=submit, empty=cancel): ",
+    )
+    if not note:
+        return
+    try:
+        content = _run_with_progress(
+            stdscr, f"  expanding note → {dest.name}…",
+            lambda p: (p("calling claude to expand note"),
+                       _expand_note_via_claude(
+                           note, cfg, expand_kind, timeout=180.0))[-1],
+            hint="one-shot claude call; may take 10-60s.",
+        )
+    except Exception as e:
+        _flash(stdscr, f"expand failed: {e}")
+        return
+    if not isinstance(content, str):
+        _flash(stdscr, "expand returned no text")
+        return
+    if kind == "dir":
+        title = _frontmatter_title(content) or note
+        path = _unique_md_path(dest, slugify(title))
+        path.write_text(content + ("" if content.endswith("\n") else "\n"))
+        saved_msg = path.name
+    else:
+        _append_checkbox_block(dest, content)
+        saved_msg = f"appended to {dest.name}"
+    result = scan_once(cfg, store)
+    if result.new_items:
+        daemon.try_fill_pool()
+    _flash(stdscr, f"saved: {saved_msg} ({result.new_items} new)")

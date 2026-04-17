@@ -296,7 +296,7 @@ fi
         self.assertEqual(sha, pre_sha)
         final = self.store.get(claimed.id)
         self.assertEqual(final.status, ItemStatus.MERGED)
-        notes = [t["note"] for t in self.store.transitions_for(claimed.id) if t["note"]]
+        notes = [t.note for t in self.store.transitions_for(claimed.id) if t.note]
         self.assertTrue(any("recorded existing commit" in n for n in notes),
                         f"expected 'recorded existing commit' note, got {notes}")
         self.assertFalse(wt.exists())

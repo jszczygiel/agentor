@@ -72,14 +72,14 @@ class TestStore(unittest.TestCase):
         self.assertEqual(stored.status, ItemStatus.AWAITING_REVIEW)
         self.assertEqual(stored.result_json, '{"files": ["x.py"]}')
         history = self.store.transitions_for("a")
-        statuses = [(t["from_status"], t["to_status"]) for t in history]
+        statuses = [(t.from_status, t.to_status) for t in history]
         self.assertEqual(statuses, [
-            (None, "backlog"),
-            ("backlog", "queued"),
-            ("queued", "working"),
-            ("working", "awaiting_review"),
+            (None, ItemStatus.BACKLOG),
+            (ItemStatus.BACKLOG, ItemStatus.QUEUED),
+            (ItemStatus.QUEUED, ItemStatus.WORKING),
+            (ItemStatus.WORKING, ItemStatus.AWAITING_REVIEW),
         ])
-        self.assertEqual(history[-1]["note"], "build passed")
+        self.assertEqual(history[-1].note, "build passed")
 
     def test_transition_rejects_unknown_field(self):
         self.store.upsert_discovered(_mk_item(id="a"))
@@ -98,6 +98,54 @@ class TestStore(unittest.TestCase):
         stored = self.store.get("persist")
         self.assertIsNotNone(stored)
         self.assertEqual(stored.title, "A thing")
+
+
+class TestStatusRoundTrip(unittest.TestCase):
+    """Every ItemStatus value must survive a write-then-read through the store
+    without drift. Catches any future enum-rename that forgets to migrate the
+    serializer (encode/decode) — a `.value` that doesn't match the DB column
+    would round-trip to a ValueError at read time."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.store = Store(Path(self.td.name) / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def test_every_status_round_trips_on_items(self):
+        for status in ItemStatus:
+            item_id = f"rt-{status.value}"
+            self.store.upsert_discovered(_mk_item(id=item_id))
+            self.store.transition(item_id, status, note=f"to {status.value}")
+            stored = self.store.get(item_id)
+            self.assertIsNotNone(stored, f"missing row for {status}")
+            self.assertEqual(stored.status, status)
+            self.assertIsInstance(stored.status, ItemStatus)
+            listed = self.store.list_by_status(status)
+            self.assertIn(item_id, [s.id for s in listed],
+                          f"{status} not returned by list_by_status")
+            self.assertEqual(self.store.count_by_status(status),
+                             len(listed))
+
+    def test_every_status_round_trips_on_transitions(self):
+        item_id = "history"
+        self.store.upsert_discovered(_mk_item(id=item_id))
+        # Walk every status in declaration order. from_status on row N is the
+        # to_status of row N-1, so both columns see every value that can ever
+        # appear in them.
+        for status in ItemStatus:
+            if status == ItemStatus.BACKLOG:
+                continue  # seeded by upsert_discovered
+            self.store.transition(item_id, status, note=status.value)
+        history = self.store.transitions_for(item_id)
+        seen_to = {t.to_status for t in history}
+        self.assertEqual(seen_to, set(ItemStatus))
+        for t in history:
+            self.assertIsInstance(t.to_status, ItemStatus)
+            if t.from_status is not None:
+                self.assertIsInstance(t.from_status, ItemStatus)
 
 
 class TestPreviousSettledStatus(unittest.TestCase):
@@ -183,9 +231,9 @@ class TestNoteInfraFailure(unittest.TestCase):
         history = self.store.transitions_for("x")
         last = history[-1]
         # from==to (status didn't change), note tagged.
-        self.assertEqual(last["from_status"], ItemStatus.WORKING.value)
-        self.assertEqual(last["to_status"], ItemStatus.WORKING.value)
-        self.assertIn("infra failure", last["note"])
+        self.assertEqual(last.from_status, ItemStatus.WORKING)
+        self.assertEqual(last.to_status, ItemStatus.WORKING)
+        self.assertIn("infra failure", last.note)
 
     def test_attempts_clamped_at_zero(self):
         self.store.note_infra_failure("x", "err")

@@ -6,6 +6,7 @@ import time
 from typing import Callable
 
 from ..models import ItemStatus
+from ..store import StoredItem
 
 from .formatters import (
     _COL_CTX,
@@ -20,8 +21,8 @@ from .formatters import (
 )
 
 
-ACTIONS = ("[enter]open  [j/k]move  [p]ickup  [r]eview  [d]eferred  "
-           "[i]nspect  [tab]filter  [+/-]pool  [m]ode  [u]npause  [q]uit")
+ACTIONS = ("[↑/↓/j/k]nav  [enter]open  [n]ew  [p]ickup  [r]eview  "
+           "[d]eferred  [i]nspect  [tab]filter  [+/-]pool  [m]ode  [q]uit")
 
 # Filter views: ordered list cycled by Tab. Each entry maps a filter name
 # to the statuses to display (None = all).
@@ -89,10 +90,8 @@ def _status_color(status: ItemStatus) -> int:
     }.get(status, 0)
 
 
-def _render(stdscr, cfg, store, daemon, log_ring, filter_idx, selected_idx):
-    """Draw one full frame and return the ordered items list that was
-    rendered, so the caller can map `selected_idx` back to an item for
-    enter-key dispatch."""
+def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
+            selected_id: str | None = None) -> list[StoredItem]:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     row = 0
@@ -155,11 +154,10 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx, selected_idx):
     body_height = h - body_top - 1  # leave 1 line for log
     _filter_name_cur, filter_statuses = FILTERS[filter_idx]
     statuses = filter_statuses if filter_statuses is not None else list(ItemStatus)
-    # Build the ordered items list once so the caller and the renderer agree
-    # on exactly which item `selected_idx` points to.
-    items = [it for st in statuses for it in store.list_by_status(st)]
-    _render_table(stdscr, store, body_top, body_height, w, items,
-                  cfg.agent.context_window, selected_idx)
+    rendered = _render_table(
+        stdscr, store, body_top, body_height, w, statuses,
+        cfg.agent.context_window, selected_id,
+    )
 
     # log tail
     log_row = h - 1
@@ -178,7 +176,7 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx, selected_idx):
         f"B{counts[ItemStatus.BACKLOG]} "
         f"R{reviews}"
     )
-    return items
+    return rendered
 
 
 def _safe_addstr(stdscr, y, x, s, w, attr=0):
@@ -188,24 +186,61 @@ def _safe_addstr(stdscr, y, x, s, w, attr=0):
         pass
 
 
-def _render_table(stdscr, store, top, height, w, items, context_window,
-                  selected_idx):
+def _render_table(
+    stdscr, store, top, height, w, statuses, context_window,
+    selected_id: str | None = None,
+) -> list[StoredItem]:
+    """Draw the main table and return the items in display order so the
+    caller can drive arrow-key navigation. The row matching `selected_id`
+    is highlighted; the viewport auto-scrolls to keep it visible."""
     if height <= 0:
-        return
+        return []
     header = (f" {'ID':<{_COL_ID-1}}{'STATE':<{_COL_STATE}}"
               f"{'ELAPSED':<{_COL_ELAPSED}}{'CTX':<{_COL_CTX}}"
               f"{'SOURCE':<{_COL_SOURCE}}TITLE")
     _safe_addstr(stdscr, top, 0, header.ljust(w), w,
                  curses.A_BOLD | curses.A_UNDERLINE)
-    rows_used = 1
-    for idx, it in enumerate(items):
+
+    all_items: list[tuple[ItemStatus, StoredItem]] = []
+    for st in statuses:
+        for it in store.list_by_status(st):
+            all_items.append((st, it))
+
+    visible = max(0, height - 1)  # minus header
+    if visible <= 0 or not all_items:
+        return [it for _, it in all_items]
+
+    sel_idx = 0
+    if selected_id:
+        for i, (_, it) in enumerate(all_items):
+            if it.id == selected_id:
+                sel_idx = i
+                break
+
+    # When the list overflows, reserve a row top+bottom for scroll
+    # indicators so the selection highlight never disappears under them.
+    n = len(all_items)
+    if n > visible:
+        data_rows = max(1, visible - 2)
+        reserve_top = 1
+        reserve_bot = 1
+    else:
+        data_rows = n
+        reserve_top = 0
+        reserve_bot = 0
+
+    if data_rows <= 0 or sel_idx < data_rows:
+        offset = 0
+    else:
+        offset = min(sel_idx - data_rows + 1, n - data_rows)
+
+    data_y0 = top + 1 + reserve_top
+    for row_i in range(data_rows):
+        global_i = offset + row_i
+        if global_i >= n:
+            break
+        st, it = all_items[global_i]
         has_err = bool(it.last_error)
-        if rows_used >= height:
-            _safe_addstr(stdscr, top + rows_used - 1, 0,
-                         " ... (more not shown)".ljust(w), w,
-                         curses.A_DIM)
-            return
-        st = it.status
         elapsed = _elapsed_for(store, it.id) if st == ItemStatus.WORKING else None
         elapsed_s = _fmt_elapsed(elapsed) if elapsed is not None else "—"
         ctx_s = _ctx_fill_pct(it, context_window)
@@ -214,9 +249,6 @@ def _render_table(stdscr, store, top, height, w, items, context_window,
             src = "…" + src[-(_COL_SOURCE - 2):]
         title_max = max(0, w - 1 - _COL_ID - _COL_STATE - _COL_ELAPSED
                           - _COL_CTX - _COL_SOURCE)
-        # `!` marker on the state column when the item carries an
-        # unresolved error — makes sticky problems visible in the
-        # default view without needing the errors filter.
         marker = "!" if has_err else " "
         state_label = st.value
         if st == ItemStatus.WORKING:
@@ -230,19 +262,27 @@ def _render_table(stdscr, store, top, height, w, items, context_window,
                 f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
                 f"{src:<{_COL_SOURCE}}{title}")
         if has_err:
-            # Red for rows that need the user's attention; overrides
-            # the status-based color so the error is unmistakable.
             attr = curses.color_pair(4) | curses.A_BOLD
         else:
             attr = curses.color_pair(_status_color(st))
             if st == ItemStatus.WORKING:
                 attr |= curses.A_BOLD
-        if idx == selected_idx:
-            # XOR A_REVERSE onto the existing attr so the selection highlight
-            # doesn't destroy the status color — keeps the error-red visible.
-            attr ^= curses.A_REVERSE
-        _safe_addstr(stdscr, top + rows_used, 0, line, w, attr)
-        rows_used += 1
+        if global_i == sel_idx:
+            # A_REVERSE trumps color so the highlight always reads as
+            # "this is selected" regardless of status color.
+            attr |= curses.A_REVERSE
+        _safe_addstr(stdscr, data_y0 + row_i, 0, line.ljust(w), w, attr)
+
+    if reserve_top and offset > 0:
+        _safe_addstr(stdscr, top + 1, 0,
+                     f" ↑ {offset} above ".ljust(w), w, curses.A_DIM)
+    if reserve_bot:
+        trailing = n - (offset + data_rows)
+        if trailing > 0:
+            _safe_addstr(stdscr, data_y0 + data_rows, 0,
+                         f" ↓ {trailing} below ".ljust(w), w, curses.A_DIM)
+
+    return [it for _, it in all_items]
 
 
 def _show_item_screen(
@@ -327,12 +367,17 @@ def _flash(stdscr, msg: str) -> None:
 
 def _run_with_progress(
     stdscr, title: str, work: Callable[[Callable[[str], None]], object],
+    hint: str | None = None,
 ) -> object:
     """Run `work(progress)` on a background thread while repainting a
     centered progress overlay with the latest progress message and an
-    elapsed-seconds counter. Keeps curses responsive during slow git
-    operations (commit, worktree add, merge/rebase) that would otherwise
-    leave the dashboard looking frozen.
+    elapsed-seconds counter. Keeps curses responsive during slow
+    operations (git merge/rebase, claude one-shot calls) that would
+    otherwise leave the dashboard looking frozen.
+
+    `hint` is an optional short line printed below the spinner to tell
+    the user *why* this is slow. Keep it specific to the caller —
+    misleading hints are worse than none.
 
     Only the main thread touches curses; the worker posts strings via a
     queue. Propagates exceptions raised by `work`."""
@@ -372,10 +417,11 @@ def _run_with_progress(
                 "",
                 f"  {spinner[tick % 4]}  {current}",
                 f"     ({elapsed:.1f}s elapsed)",
-                "",
-                "  this can take a few seconds on large repos —",
-                "  git worktree add + merge/rebase runs here.",
             ]
+            if hint:
+                body.append("")
+                for hint_line in hint.splitlines():
+                    body.append(f"  {hint_line}")
             for i, ln in enumerate(body):
                 _safe_addstr(stdscr, 2 + i, 0, ln[:w], w)
             _safe_addstr(stdscr, h - 1, 0,

@@ -9,6 +9,7 @@ Agentor orchestrates Claude Code agents that consume work items from a target pr
 ## Projects using agentor
 
 - **lancelot** — `/Users/szczygiel/StudioProjects/lancelot` (Godot project; `agentor.toml` lives at repo root).
+- **agentor** — `/Users/szczygiel/StudioProjects/agentor` (self-hosted; meta project dogfoods its own orchestrator. `pickup_mode = "manual"` so each item is approved before running).
 
 ## Commands
 
