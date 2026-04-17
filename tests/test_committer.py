@@ -380,6 +380,74 @@ class TestConflictSummaryFormat(unittest.TestCase):
                       "retry trailing block should be labeled 'retry'")
 
 
+class TestAutoResolveConflicts(unittest.TestCase):
+    """`git.auto_resolve_conflicts` chains resubmit_conflicted into
+    approve_and_commit so a CONFLICTED transition immediately becomes
+    QUEUED with conflict-resolution feedback."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text(
+            "- [ ] Touch a file\n  details\n"
+        )
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _drive_to_conflict(self, cfg: Config):
+        """Run the stub through AWAITING_REVIEW with a README clash queued
+        against main, then call approve_and_commit under `cfg`."""
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        StubRunner(cfg, self.store).run(claimed)
+        item = self.store.get(claimed.id)
+        # Seed a fake session_id so we can verify the runner-resume state
+        # survives the chained resubmit.
+        self.store.transition(item.id, item.status, session_id="sess-auto")
+        item = self.store.get(item.id)
+        wt = Path(item.worktree_path)
+        (wt / "README.md").write_text("# project\n\nFEAT\n")
+        _git(wt, "add", "README.md")
+        _git(wt, "commit", "-q", "-m", "feat readme")
+        (self.root / "README.md").write_text("# project\n\nMAIN\n")
+        _git(self.root, "add", "README.md")
+        _git(self.root, "commit", "-q", "-m", "main readme")
+        approve_and_commit(cfg, self.store, item, "stub commit")
+        return self.store.get(item.id)
+
+    def test_auto_resolve_off_leaves_conflicted(self):
+        cfg = _mk_config(self.root)
+        self.assertFalse(cfg.git.auto_resolve_conflicts)
+        final = self._drive_to_conflict(cfg)
+        self.assertEqual(final.status, ItemStatus.CONFLICTED)
+        self.assertIsNone(final.feedback)
+        self.assertIsNotNone(final.last_error)
+
+    def test_auto_resolve_on_requeues_with_feedback(self):
+        cfg = _mk_config(self.root)
+        cfg.git.auto_resolve_conflicts = True
+        final = self._drive_to_conflict(cfg)
+
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        self.assertIsNone(final.last_error)
+        self.assertEqual(final.attempts, 0)
+        # Worktree, branch, session all preserved so the runner resumes.
+        self.assertTrue(Path(final.worktree_path).exists())
+        self.assertTrue(_branch_exists(self.root, final.branch))
+        self.assertEqual(final.session_id, "sess-auto")
+        # Feedback carries the conflict summary + base branch guidance.
+        fb = final.feedback or ""
+        self.assertIn("conflict", fb.lower())
+        self.assertIn("main", fb)
+        self.assertIn("README.md", fb)
+
+
 class TestRetryErrored(unittest.TestCase):
     def setUp(self):
         self.td = TemporaryDirectory()

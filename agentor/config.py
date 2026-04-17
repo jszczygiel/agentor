@@ -166,6 +166,12 @@ class GitConfig:
     # conflicts, the feature worktree is left in its pre-rebase state and
     # the item is parked in CONFLICTED.
     merge_mode: str = "merge"
+    # When true, a CONFLICTED transition from approve_and_commit is
+    # immediately followed by resubmit_conflicted — the item lands in
+    # QUEUED with conflict-resolution feedback so the agent fixes the
+    # merge in-place. Off by default: existing workflows keep the manual
+    # [m] retry_merge / [e] resubmit dashboard gates.
+    auto_resolve_conflicts: bool = False
 
 
 @dataclass

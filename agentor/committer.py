@@ -112,6 +112,12 @@ def approve_and_commit(
             note=f"{mode} into {config.git.base_branch} conflicted; "
                  f"feature branch {item.branch} kept",
         )
+        if config.git.auto_resolve_conflicts:
+            p("auto-resubmitting for agent conflict resolution")
+            refreshed = store.get(item.id)
+            if refreshed is not None and \
+                    refreshed.status == ItemStatus.CONFLICTED:
+                resubmit_conflicted(config, store, refreshed)
         return sha
 
     assert merge_sha is not None
