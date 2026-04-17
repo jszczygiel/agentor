@@ -71,6 +71,33 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE items ADD COLUMN agentor_version TEXT")
 
 
+def _encode_status(status: ItemStatus) -> str:
+    """Serialize an ItemStatus for storage in SQLite.
+
+    Every write that crosses the DB boundary must go through this helper so
+    the encoding lives in one place; swapping the on-disk representation
+    later (e.g. to an int enum) is then a single-file change."""
+    return status.value
+
+
+def _decode_status(raw: str) -> ItemStatus:
+    """Deserialize a status string read from SQLite back into an ItemStatus.
+
+    Raises ValueError if `raw` is not a known status — the daemon surfaces
+    unknown statuses loudly rather than silently coercing them."""
+    return ItemStatus(raw)
+
+
+@dataclass
+class Transition:
+    """A row from the `transitions` table, with status fields decoded back
+    into ItemStatus enums so callers never touch raw strings."""
+    from_status: ItemStatus | None
+    to_status: ItemStatus
+    note: str | None
+    at: float
+
+
 @dataclass
 class StoredItem:
     id: str
@@ -100,7 +127,7 @@ def _row_to_stored(row: sqlite3.Row) -> StoredItem:
         source_file=row["source_file"],
         source_line=row["source_line"],
         tags=json.loads(row["tags_json"]),
-        status=ItemStatus(row["status"]),
+        status=_decode_status(row["status"]),
         worktree_path=row["worktree_path"],
         branch=row["branch"],
         attempts=row["attempts"],
@@ -169,13 +196,13 @@ class Store:
                 (
                     item.id, item.title, item.body, item.source_file,
                     item.source_line, json.dumps(item.tags),
-                    ItemStatus.BACKLOG.value, now, now,
+                    _encode_status(ItemStatus.BACKLOG), now, now,
                 ),
             )
             c.execute(
                 """INSERT INTO transitions (item_id, from_status, to_status, at)
                    VALUES (?, NULL, ?, ?)""",
-                (item.id, ItemStatus.BACKLOG.value, now),
+                (item.id, _encode_status(ItemStatus.BACKLOG), now),
             )
         return True
 
@@ -190,14 +217,15 @@ class Store:
         with self._lock:
             rows = self.conn.execute(
                 "SELECT * FROM items WHERE status = ? ORDER BY created_at",
-                (status.value,),
+                (_encode_status(status),),
             ).fetchall()
         return [_row_to_stored(r) for r in rows]
 
     def count_by_status(self, status: ItemStatus) -> int:
         with self._lock:
             row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM items WHERE status = ?", (status.value,)
+                "SELECT COUNT(*) AS n FROM items WHERE status = ?",
+                (_encode_status(status),),
             ).fetchone()
         return row["n"]
 
@@ -214,7 +242,7 @@ class Store:
         allowed = {"worktree_path", "branch", "attempts", "last_error",
                    "feedback", "result_json", "session_id"}
         sets = ["status = ?", "updated_at = ?"]
-        params: list[object] = [to.value, now]
+        params: list[object] = [_encode_status(to), now]
         for k, v in fields.items():
             if k not in allowed:
                 raise ValueError(f"cannot update field: {k}")
@@ -236,20 +264,22 @@ class Store:
             c.execute(
                 """INSERT INTO transitions (item_id, from_status, to_status, note, at)
                    VALUES (?, ?, ?, ?, ?)""",
-                (item_id, from_status, to.value, note, now),
+                (item_id, from_status, _encode_status(to), note, now),
             )
 
     def claim_next_queued(self, worktree_path: str, branch: str) -> StoredItem | None:
         """Atomically pick the oldest queued item and mark it working.
         Returns the claimed item or None if the queue is empty.
         Caller enforces the pool cap via pool_has_slot()."""
+        queued = _encode_status(ItemStatus.QUEUED)
+        working = _encode_status(ItemStatus.WORKING)
         with self.tx() as c:
             row = c.execute(
                 """SELECT id FROM items
                    WHERE status = ?
                    ORDER BY created_at
                    LIMIT 1""",
-                (ItemStatus.QUEUED.value,),
+                (queued,),
             ).fetchone()
             if row is None:
                 return None
@@ -261,14 +291,14 @@ class Store:
                        attempts = attempts + 1, agentor_version = ?,
                        updated_at = ?
                    WHERE id = ? AND status = ?""",
-                (ItemStatus.WORKING.value, worktree_path, branch,
+                (working, worktree_path, branch,
                  AGENTOR_VERSION, now,
-                 item_id, ItemStatus.QUEUED.value),
+                 item_id, queued),
             )
             c.execute(
                 """INSERT INTO transitions (item_id, from_status, to_status, at)
                    VALUES (?, ?, ?, ?)""",
-                (item_id, ItemStatus.QUEUED.value, ItemStatus.WORKING.value, now),
+                (item_id, queued, working, now),
             )
         return self.get(item_id)
 
@@ -287,14 +317,22 @@ class Store:
                 (blob, now, item_id),
             )
 
-    def transitions_for(self, item_id: str) -> list[dict]:
+    def transitions_for(self, item_id: str) -> list[Transition]:
         with self._lock:
             rows = self.conn.execute(
                 """SELECT from_status, to_status, note, at
                    FROM transitions WHERE item_id = ? ORDER BY id""",
                 (item_id,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [
+            Transition(
+                from_status=_decode_status(r["from_status"]) if r["from_status"] else None,
+                to_status=_decode_status(r["to_status"]),
+                note=r["note"],
+                at=r["at"],
+            )
+            for r in rows
+        ]
 
     def record_failure(
         self,
@@ -365,7 +403,7 @@ class Store:
         if statuses:
             placeholders = ",".join("?" * len(statuses))
             sql += f" AND status IN ({placeholders})"
-            params.extend(s.value for s in statuses)
+            params.extend(_encode_status(s) for s in statuses)
         with self._lock:
             rows = self.conn.execute(sql, params).fetchall()
         return {r["id"] for r in rows}
@@ -381,8 +419,8 @@ class Store:
                 """SELECT note FROM transitions
                    WHERE item_id = ? AND from_status = ? AND to_status = ?
                    ORDER BY id DESC LIMIT ?""",
-                (item_id, ItemStatus.WORKING.value,
-                 ItemStatus.QUEUED.value, n),
+                (item_id, _encode_status(ItemStatus.WORKING),
+                 _encode_status(ItemStatus.QUEUED), n),
             ).fetchall()
         return [r["note"] or "" for r in rows]
 
@@ -403,15 +441,12 @@ class Store:
         rows = self.transitions_for(item_id)
         if len(rows) < 2:
             return None
-        current = rows[-1]["to_status"]
+        current = rows[-1].to_status
         for row in reversed(rows[:-1]):
-            to = row["to_status"]
-            if not to or to == ItemStatus.WORKING.value or to == current:
+            to = row.to_status
+            if to == ItemStatus.WORKING or to == current:
                 continue
-            try:
-                return ItemStatus(to)
-            except ValueError:
-                continue
+            return to
         return None
 
     def note_infra_failure(self, item_id: str, err: str) -> None:
