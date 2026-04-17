@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Agentor orchestrates Claude Code agents that consume work items from a target project's markdown files (backlog, ideas), develop each item in its own git worktree, and ping the user for review+approval before committing. It is configured **per target project** — agentor itself is the orchestrator, the work happens in some other repo pointed at by `[project].root` in the config.
 
+## Projects using agentor
+
+- **lancelot** — `/Users/szczygiel/StudioProjects/lancelot` (Godot project; `agentor.toml` lives at repo root).
+
 ## Commands
 
 ```bash
