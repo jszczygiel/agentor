@@ -145,6 +145,49 @@ def retry_merge(
     return True, f"{mode}d {merge_sha[:8]} into {config.git.base_branch}"
 
 
+def resubmit_conflicted(
+    config: Config, store: Store, item: StoredItem,
+) -> None:
+    """Send a CONFLICTED item back to the agent to resolve the merge
+    conflict itself. Transitions CONFLICTED → QUEUED; the worktree,
+    feature branch, and session_id are left intact so the runner resumes
+    the same session in execute phase and the injected feedback tells
+    the agent what to fix.
+
+    The agent's instructions: run `git merge <base>` in its own worktree
+    to surface the conflicts, resolve them, and commit. On next approval
+    the integration retries — if the feature now includes base's tip,
+    the merge fast-forwards."""
+    assert item.status == ItemStatus.CONFLICTED, \
+        f"resubmit_conflicted expects CONFLICTED, got {item.status}"
+    assert item.worktree_path and item.branch
+    base = config.git.base_branch
+    conflict_detail = (item.last_error or "(no conflict summary recorded)")
+    feedback = (
+        f"Your branch's changes conflict with `{base}`. Resolve the "
+        f"conflict so the integration can proceed.\n\n"
+        f"Steps to run in this worktree:\n"
+        f"  1. `git merge {base}` — pulls base's commits and surfaces "
+        f"the conflicts as markers in the listed files.\n"
+        f"  2. Fix each conflicted file. Preserve the intent of your "
+        f"original changes AND the base-branch changes where possible; "
+        f"pick base's version only when it clearly supersedes.\n"
+        f"  3. `git add` the resolved files and `git commit` the merge "
+        f"(a merge commit is fine — do NOT rebase).\n"
+        f"  4. Re-run build + tests to confirm the merged result still "
+        f"works.\n\n"
+        f"Conflict summary from the failed integration:\n"
+        f"{conflict_detail}"
+    )
+    store.transition(
+        item.id, ItemStatus.QUEUED,
+        feedback=feedback,
+        last_error=None,
+        attempts=0,
+        note="resubmitted from CONFLICTED — agent will resolve",
+    )
+
+
 def reject(store: Store, item: StoredItem, feedback: str) -> None:
     """Terminal rejection. Keeps worktree+session around for forensics but
     moves the item out of the active flow. Valid at either plan or code

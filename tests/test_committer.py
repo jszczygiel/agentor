@@ -3,7 +3,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from agentor.committer import approve_and_commit, retry, retry_merge
+from agentor.committer import (approve_and_commit, resubmit_conflicted,
+                                retry, retry_merge)
 from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
                             ReviewConfig, SourcesConfig)
 from agentor.models import ItemStatus
@@ -264,6 +265,32 @@ class TestRetryMerge(unittest.TestCase):
         self.assertEqual(final.status, ItemStatus.CONFLICTED)
         self.assertTrue(Path(item.worktree_path).exists())
         self.assertTrue(_branch_exists(self.root, item.branch))
+
+    def test_resubmit_conflicted_requeues_with_feedback(self):
+        item = self._to_conflicted()
+        self.store.transition(
+            item.id, ItemStatus.CONFLICTED,
+            session_id="sess-abc", result_json='{"phase":"plan","plan":"p"}',
+        )
+        item = self.store.get(item.id)
+        original_wt = item.worktree_path
+        original_branch = item.branch
+
+        resubmit_conflicted(self.cfg, self.store, item)
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        self.assertEqual(final.attempts, 0)
+        self.assertIsNone(final.last_error)
+        # Worktree + branch + session preserved so the runner can resume.
+        self.assertEqual(final.worktree_path, original_wt)
+        self.assertEqual(final.branch, original_branch)
+        self.assertEqual(final.session_id, "sess-abc")
+        self.assertEqual(final.result_json, '{"phase":"plan","plan":"p"}')
+        self.assertTrue(Path(original_wt).exists())
+        self.assertTrue(_branch_exists(self.root, original_branch))
+        self.assertIn("conflict", (final.feedback or "").lower())
+        self.assertIn("main", final.feedback or "")
 
 
 class TestRetryErrored(unittest.TestCase):
