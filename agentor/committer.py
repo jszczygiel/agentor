@@ -22,6 +22,40 @@ def _has_uncommitted(wt: Path) -> bool:
     return bool(cp.stdout.strip())
 
 
+_BODY_CAP = 2000
+_RAW_CAP = 1500
+
+
+def _build_conflict_summary(
+    item: StoredItem, mode: str, base: str, raw: str, *, retry: bool = False,
+) -> str:
+    """Compose the CONFLICTED `last_error` text: feature context first
+    (title, branch, item body), then a short trailing block describing the
+    merge failure mechanics. Operators want the bulk of this summary to
+    describe the feature being integrated, not git's output."""
+    body = (item.body or "").strip()
+    if len(body) > _BODY_CAP:
+        body = body[:_BODY_CAP].rstrip() + "\n…(body truncated)"
+    mechanics = (raw or "").strip()
+    if len(mechanics) > _RAW_CAP:
+        mechanics = mechanics[:_RAW_CAP].rstrip() + "\n…(output truncated)"
+    label = f"{mode} into {base}"
+    if retry:
+        label += ", retry"
+    parts = [
+        f"Feature: {item.title}",
+        f"Branch:  {item.branch or '(unknown)'}",
+    ]
+    if body:
+        parts.extend(["", body])
+    parts.extend([
+        "",
+        f"── merge conflict ({label}) ──",
+        mechanics or "(no git output captured)",
+    ])
+    return "\n".join(parts)
+
+
 def approve_and_commit(
     config: Config, store: Store, item: StoredItem, message: str,
     *, progress: ProgressCb | None = None,
@@ -69,9 +103,12 @@ def approve_and_commit(
     if conflict is not None:
         # Keep the worktree and branch — user resolves by hand, then calls
         # retry_merge (inspect [m]) once the conflict is fixed.
+        summary = _build_conflict_summary(
+            item, mode, config.git.base_branch, conflict,
+        )
         store.transition(
             item.id, ItemStatus.CONFLICTED,
-            last_error=conflict[:4000],
+            last_error=summary[:4000],
             note=f"{mode} into {config.git.base_branch} conflicted; "
                  f"feature branch {item.branch} kept",
         )
@@ -128,9 +165,12 @@ def retry_merge(
         tmp_root=tmp_root, mode=mode,
     )
     if conflict is not None:
+        summary = _build_conflict_summary(
+            item, mode, config.git.base_branch, conflict, retry=True,
+        )
         store.transition(
             item.id, ItemStatus.CONFLICTED,
-            last_error=conflict[:4000],
+            last_error=summary[:4000],
             note=f"retry {mode} still conflicts on {config.git.base_branch}",
         )
         return False, f"still conflicted: {conflict.splitlines()[0] if conflict else '?'}"
