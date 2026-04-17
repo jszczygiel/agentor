@@ -37,7 +37,7 @@ def approve_and_commit(
     callers can always address the agent's work directly."""
     assert item.status == ItemStatus.AWAITING_REVIEW, \
         f"commit expects AWAITING_REVIEW, got {item.status}"
-    assert item.worktree_path
+    assert item.worktree_path and item.branch
     p = progress or _noop
 
     wt = Path(item.worktree_path)
@@ -77,6 +77,7 @@ def approve_and_commit(
         )
         return sha
 
+    assert merge_sha is not None
     p("cleaning up worktree and branch")
     git_ops.worktree_remove(repo, wt, force=False)
     git_ops.branch_delete(repo, item.branch, force=True)
@@ -134,6 +135,7 @@ def retry_merge(
         )
         return False, f"still conflicted: {conflict.splitlines()[0] if conflict else '?'}"
 
+    assert merge_sha is not None
     p("cleaning up worktree and branch")
     git_ops.worktree_remove(repo, wt, force=False)
     git_ops.branch_delete(repo, item.branch, force=True)

@@ -1,0 +1,338 @@
+import threading
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
+                            ReviewConfig, SourcesConfig)
+from agentor.daemon import Daemon
+from agentor.models import Item, ItemStatus
+from agentor.runner import InfrastructureError, RunResult, Runner
+from agentor.store import Store
+
+
+def _mk_item(id: str, title: str = "T", body: str = "B") -> Item:
+    return Item(
+        id=id, title=title, body=body,
+        source_file="backlog.md", source_line=1, tags={},
+    )
+
+
+def _mk_config(root: Path, pool_size: int = 1, max_attempts: int = 3) -> Config:
+    return Config(
+        project_name="t",
+        project_root=root,
+        sources=SourcesConfig(),
+        parsing=ParsingConfig(),
+        agent=AgentConfig(pool_size=pool_size, max_attempts=max_attempts),
+        git=GitConfig(),
+        review=ReviewConfig(),
+    )
+
+
+class FakeRunner(Runner):
+    """Test runner — behavior injected via `behavior` callable."""
+
+    def __init__(self, config, store, behavior):
+        super().__init__(config, store)
+        self.behavior = behavior
+        self.started = threading.Event()
+
+    def run(self, item):
+        self.started.set()
+        return self.behavior(self, item)
+
+
+def _drain_workers(daemon: Daemon, timeout: float = 2.0) -> None:
+    for t in list(daemon.workers):
+        t.join(timeout=timeout)
+
+
+class TestDispatchPoolCap(unittest.TestCase):
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        self.block = threading.Event()  # held high = runners hang
+
+    def tearDown(self):
+        self.block.set()  # release any hanging runners
+        self.store.close()
+        self.td.cleanup()
+
+    def _queue(self, id: str) -> None:
+        self.store.upsert_discovered(_mk_item(id))
+        self.store.transition(id, ItemStatus.QUEUED)
+
+    def _factory(self):
+        block = self.block
+
+        def behavior(runner, item):
+            block.wait(timeout=2)
+            return RunResult(item.id, Path("/x"), "br", "ok", [], "")
+
+        def make(cfg, store):
+            return FakeRunner(cfg, store, behavior)
+
+        return make
+
+    def test_does_not_dispatch_past_pool_size(self):
+        for i in ("a", "b", "c"):
+            self._queue(i)
+        cfg = _mk_config(self.root, pool_size=2)
+        d = Daemon(cfg, self.store, self._factory(),
+                   install_signals=False, log=lambda m: None)
+        self.assertTrue(d._dispatch_one())
+        self.assertTrue(d._dispatch_one())
+        # Pool full: third dispatch refused.
+        self.assertFalse(d._dispatch_one())
+        self.assertEqual(
+            self.store.count_by_status(ItemStatus.WORKING), 2)
+        self.assertEqual(d.stats.dispatched, 2)
+        # Release blocked runners and drain.
+        self.block.set()
+        _drain_workers(d)
+
+    def test_pool_size_zero_never_dispatches(self):
+        self._queue("a")
+        cfg = _mk_config(self.root, pool_size=0)
+        d = Daemon(cfg, self.store, self._factory(),
+                   install_signals=False, log=lambda m: None)
+        self.assertFalse(d._dispatch_one())
+        self.assertEqual(d.stats.dispatched, 0)
+
+    def test_try_fill_pool_dispatches_up_to_cap(self):
+        for i in ("a", "b", "c"):
+            self._queue(i)
+        cfg = _mk_config(self.root, pool_size=2)
+        d = Daemon(cfg, self.store, self._factory(),
+                   install_signals=False, log=lambda m: None)
+        n = d.try_fill_pool()
+        self.assertEqual(n, 2)
+        self.assertEqual(
+            self.store.count_by_status(ItemStatus.WORKING), 2)
+        self.block.set()
+        _drain_workers(d)
+
+    def test_empty_queue_returns_false(self):
+        cfg = _mk_config(self.root, pool_size=2)
+        d = Daemon(cfg, self.store, self._factory(),
+                   install_signals=False, log=lambda m: None)
+        self.assertFalse(d._dispatch_one())
+
+    def test_exhausted_attempts_auto_rejected(self):
+        """Queued items whose attempts ≥ max_attempts never enter WORKING —
+        they are moved to REJECTED in-place."""
+        self._queue("a")
+        # Bump attempts past the cap.
+        self.store.transition("a", ItemStatus.QUEUED, attempts=3)
+        cfg = _mk_config(self.root, pool_size=2, max_attempts=3)
+        d = Daemon(cfg, self.store, self._factory(),
+                   install_signals=False, log=lambda m: None)
+        self.assertFalse(d._dispatch_one())
+        item = self.store.get("a")
+        self.assertEqual(item.status, ItemStatus.REJECTED)
+        self.assertIn("max_attempts", (item.last_error or ""))
+
+
+class TestInfraErrorStickyAlert(unittest.TestCase):
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _queue(self, id: str) -> None:
+        self.store.upsert_discovered(_mk_item(id))
+        self.store.transition(id, ItemStatus.QUEUED)
+
+    def test_infra_error_sets_alert_and_pauses(self):
+        self._queue("a")
+
+        def behavior(runner, item):
+            raise InfrastructureError("fatal: not a git repository")
+
+        def factory(cfg, store):
+            return FakeRunner(cfg, store, behavior)
+
+        cfg = _mk_config(self.root, pool_size=2)
+        logs: list[str] = []
+        d = Daemon(cfg, self.store, factory,
+                   install_signals=False, log=logs.append)
+        self.assertTrue(d._dispatch_one())
+        _drain_workers(d)
+        self.assertEqual(d.system_alert, "fatal: not a git repository")
+        self.assertTrue(d.paused)
+        self.assertTrue(any("[ALERT]" in m for m in logs))
+        self.assertTrue(any("press 'u'" in m for m in logs))
+        # Failure counter NOT incremented (system failed, not the item).
+        self.assertEqual(d.stats.failed, 0)
+
+    def test_paused_daemon_refuses_further_dispatch(self):
+        self._queue("a")
+        self._queue("b")
+
+        def behavior(runner, item):
+            raise InfrastructureError("slot broken")
+
+        def factory(cfg, store):
+            return FakeRunner(cfg, store, behavior)
+
+        cfg = _mk_config(self.root, pool_size=2)
+        d = Daemon(cfg, self.store, factory,
+                   install_signals=False, log=lambda m: None)
+        self.assertTrue(d._dispatch_one())
+        _drain_workers(d)
+        self.assertTrue(d.paused)
+        # Second dispatch refused while alert is sticky.
+        self.assertFalse(d._dispatch_one())
+        # Manual dispatch also refused.
+        self.assertFalse(d.dispatch_specific("b"))
+
+    def test_clear_alert_resumes_dispatch(self):
+        self._queue("a")
+
+        def behavior(runner, item):
+            raise InfrastructureError("broken")
+
+        def factory(cfg, store):
+            return FakeRunner(cfg, store, behavior)
+
+        cfg = _mk_config(self.root, pool_size=1)
+        d = Daemon(cfg, self.store, factory,
+                   install_signals=False, log=lambda m: None)
+        d._dispatch_one()
+        _drain_workers(d)
+        self.assertTrue(d.paused)
+        d.clear_alert()
+        self.assertIsNone(d.system_alert)
+        self.assertFalse(d.paused)
+
+    def test_regular_exception_counts_as_failure(self):
+        """Non-infra exceptions bump stats.failed and do NOT trigger alert."""
+        self._queue("a")
+
+        def behavior(runner, item):
+            raise RuntimeError("boom")
+
+        def factory(cfg, store):
+            return FakeRunner(cfg, store, behavior)
+
+        cfg = _mk_config(self.root, pool_size=1)
+        d = Daemon(cfg, self.store, factory,
+                   install_signals=False, log=lambda m: None)
+        d._dispatch_one()
+        _drain_workers(d)
+        self.assertEqual(d.stats.failed, 1)
+        self.assertIsNone(d.system_alert)
+        self.assertFalse(d.paused)
+
+    def test_successful_run_increments_completed(self):
+        self._queue("a")
+
+        def behavior(runner, item):
+            return RunResult(item.id, Path("/x"), "br", "done", [], "")
+
+        def factory(cfg, store):
+            return FakeRunner(cfg, store, behavior)
+
+        cfg = _mk_config(self.root, pool_size=1)
+        d = Daemon(cfg, self.store, factory,
+                   install_signals=False, log=lambda m: None)
+        d._dispatch_one()
+        _drain_workers(d)
+        self.assertEqual(d.stats.completed, 1)
+        self.assertEqual(d.stats.failed, 0)
+
+    def test_run_result_with_error_counts_as_failure(self):
+        self._queue("a")
+
+        def behavior(runner, item):
+            return RunResult(item.id, Path("/x"), "br", "", [], "",
+                             error="agent error")
+
+        def factory(cfg, store):
+            return FakeRunner(cfg, store, behavior)
+
+        cfg = _mk_config(self.root, pool_size=1)
+        d = Daemon(cfg, self.store, factory,
+                   install_signals=False, log=lambda m: None)
+        d._dispatch_one()
+        _drain_workers(d)
+        self.assertEqual(d.stats.failed, 1)
+        self.assertEqual(d.stats.completed, 0)
+
+
+class TestDispatchSpecific(unittest.TestCase):
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        self.block = threading.Event()
+
+    def tearDown(self):
+        self.block.set()
+        self.store.close()
+        self.td.cleanup()
+
+    def _queue(self, id: str) -> None:
+        self.store.upsert_discovered(_mk_item(id))
+        self.store.transition(id, ItemStatus.QUEUED)
+
+    def _factory(self):
+        block = self.block
+
+        def behavior(runner, item):
+            block.wait(timeout=2)
+            return RunResult(item.id, Path("/x"), "br", "ok", [], "")
+
+        def make(cfg, store):
+            return FakeRunner(cfg, store, behavior)
+        return make
+
+    def test_dispatches_specific_queued_item(self):
+        self._queue("a")
+        self._queue("b")
+        cfg = _mk_config(self.root, pool_size=2)
+        d = Daemon(cfg, self.store, self._factory(),
+                   install_signals=False, log=lambda m: None)
+        self.assertTrue(d.dispatch_specific("b"))
+        item = self.store.get("b")
+        self.assertEqual(item.status, ItemStatus.WORKING)
+        # `a` still queued.
+        self.assertEqual(self.store.get("a").status, ItemStatus.QUEUED)
+        self.block.set()
+        _drain_workers(d)
+
+    def test_refuses_when_pool_full(self):
+        self._queue("a")
+        self._queue("b")
+        cfg = _mk_config(self.root, pool_size=1)
+        d = Daemon(cfg, self.store, self._factory(),
+                   install_signals=False, log=lambda m: None)
+        d._dispatch_one()  # fills the pool with "a"
+        self.assertFalse(d.dispatch_specific("b"))
+        self.assertEqual(self.store.get("b").status, ItemStatus.QUEUED)
+        self.block.set()
+        _drain_workers(d)
+
+    def test_refuses_unknown_item(self):
+        cfg = _mk_config(self.root, pool_size=1)
+        d = Daemon(cfg, self.store, self._factory(),
+                   install_signals=False, log=lambda m: None)
+        self.assertFalse(d.dispatch_specific("ghost"))
+
+    def test_refuses_non_queued_item(self):
+        self._queue("a")
+        self.store.transition("a", ItemStatus.WORKING)
+        cfg = _mk_config(self.root, pool_size=1)
+        d = Daemon(cfg, self.store, self._factory(),
+                   install_signals=False, log=lambda m: None)
+        self.assertFalse(d.dispatch_specific("a"))
+
+
+if __name__ == "__main__":
+    unittest.main()

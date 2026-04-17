@@ -447,6 +447,7 @@ def _run_stream_json_subprocess(
         )
     except FileNotFoundError:
         raise RuntimeError(fnfe_hint)
+    assert p.stdout is not None and p.stderr is not None
     if proc_registry is not None:
         proc_registry.register(item_key, p)
 
@@ -684,10 +685,12 @@ class ClaudeRunner(Runner):
             except subprocess.TimeoutExpired as e:
                 _signal_group(p, signal.SIGKILL)
                 stdout, stderr = p.communicate()
+                e_stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+                e_stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
                 transcript_path.write_text(
                     f"TIMEOUT after {self.config.agent.timeout_seconds}s\n\n"
-                    f"stdout:\n{stdout or e.stdout or ''}\n\n"
-                    f"stderr:\n{stderr or e.stderr or ''}\n"
+                    f"stdout:\n{stdout or e_stdout}\n\n"
+                    f"stderr:\n{stderr or e_stderr}\n"
                 )
                 raise RuntimeError(
                     f"claude timed out after {self.config.agent.timeout_seconds}s"
@@ -906,7 +909,9 @@ class CodexRunner(Runner):
                     session_id=state.session_id,
                     note="session id assigned",
                 )
-                item_ref[0] = self.store.get(cur.id)
+                refreshed = self.store.get(cur.id)
+                assert refreshed is not None
+                item_ref[0] = refreshed
             self._publish_live(item_ref[0].id, state)
             return None
 

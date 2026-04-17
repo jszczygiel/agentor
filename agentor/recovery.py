@@ -87,7 +87,9 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
                 attempts=0,
                 note="resumable session demoted to QUEUED for dispatch",
             )
-            resumable.append(store.get(item.id))
+            refreshed = store.get(item.id)
+            assert refreshed is not None
+            resumable.append(refreshed)
             continue
         if wt is not None:
             git_ops.worktree_remove(repo, wt, force=True)

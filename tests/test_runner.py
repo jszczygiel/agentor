@@ -12,7 +12,7 @@ from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
                             ReviewConfig, SourcesConfig)
 from agentor.models import ItemStatus
 from agentor.recovery import recover_on_startup
-from agentor.runner import (ClaudeRunner, CodexRunner, StubRunner,
+from agentor.runner import (CodexRunner, StubRunner,
                             _mark_done_instruction, make_runner, plan_worktree)
 from agentor.store import Store
 from agentor.watcher import scan_once
@@ -691,7 +691,8 @@ class TestDaemonPickupModes(unittest.TestCase):
         cfg = self._cfg("auto")
         d = Daemon(cfg, self.store, make_runner, scan_interval=0.05,
                    log=lambda m: None, install_signals=False)
-        import threading, time as _t
+        import threading
+        import time as _t
         t = threading.Thread(target=d.run, daemon=True)
         t.start()
         _t.sleep(0.3)
@@ -709,7 +710,8 @@ class TestDaemonPickupModes(unittest.TestCase):
         scan_once(cfg, self.store)
         d = Daemon(cfg, self.store, make_runner, scan_interval=0.05,
                    log=lambda m: None, install_signals=False)
-        import threading, time as _t
+        import threading
+        import time as _t
         t = threading.Thread(target=d.run, daemon=True)
         t.start()
         _t.sleep(0.1)  # let recovery run
@@ -1083,7 +1085,8 @@ class TestDaemonPause(unittest.TestCase):
 
         d = Daemon(self.cfg, self.store, factory, scan_interval=0.05,
                    log=lambda m: None, install_signals=False)
-        import threading as _t, time as _tm
+        import threading as _t
+        import time as _tm
         t = _t.Thread(target=d.run, daemon=True)
         t.start()
         # wait until the alert flips
@@ -1179,7 +1182,8 @@ class TestResumePoolGate(unittest.TestCase):
         ids = self._seed_resumable(cfg, 2)
         d = Daemon(cfg, self.store, self._inert_factory(), scan_interval=0.05,
                    log=lambda m: None, install_signals=False)
-        import threading as _t, time as _tm
+        import threading as _t
+        import time as _tm
         t = _t.Thread(target=d.run, daemon=True)
         t.start()
         _tm.sleep(0.2)
@@ -1201,7 +1205,8 @@ class TestResumePoolGate(unittest.TestCase):
         self._seed_resumable(cfg, 2)
         d = Daemon(cfg, self.store, self._inert_factory(), scan_interval=0.05,
                    log=lambda m: None, install_signals=False)
-        import threading as _t, time as _tm
+        import threading as _t
+        import time as _tm
         t = _t.Thread(target=d.run, daemon=True)
         t.start()
         _tm.sleep(0.2)
