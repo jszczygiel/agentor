@@ -182,8 +182,8 @@ class Store:
 
     def upsert_discovered(self, item: Item) -> bool:
         """Insert an item seen in a source file if not already present.
-        Items start in BACKLOG — the caller (scan_once + config) decides
-        whether to auto-promote them to QUEUED.
+        New items land directly at QUEUED — the daemon picks them up on the
+        next dispatch tick.
         Returns True if this was a new item, False if it already existed."""
         now = time.time()
         cur = self.conn.execute(
@@ -200,13 +200,13 @@ class Store:
                 (
                     item.id, item.title, item.body, item.source_file,
                     item.source_line, json.dumps(item.tags),
-                    _encode_status(ItemStatus.BACKLOG), now, now,
+                    _encode_status(ItemStatus.QUEUED), now, now,
                 ),
             )
             c.execute(
                 """INSERT INTO transitions (item_id, from_status, to_status, at)
                    VALUES (?, NULL, ?, ?)""",
-                (item.id, _encode_status(ItemStatus.BACKLOG), now),
+                (item.id, _encode_status(ItemStatus.QUEUED), now),
             )
         return True
 
@@ -388,9 +388,9 @@ class Store:
         had reached AWAITING_PLAN_REVIEW, then was re-queued for execute,
         then crashed mid-work, gets restored to QUEUED (the execute-phase
         wait, with the approved plan still in result_json) rather than
-        starting from BACKLOG. For a fresh first-time crash, this returns
-        QUEUED. For a rejection cascade, it skips the WORKING bounces and
-        returns the QUEUED state that preceded them."""
+        restarting from QUEUED with no plan. For a fresh first-time crash,
+        this returns QUEUED. For a rejection cascade, it skips the WORKING
+        bounces and returns the QUEUED state that preceded them."""
         rows = self.transitions_for(item_id)
         if len(rows) < 2:
             return None

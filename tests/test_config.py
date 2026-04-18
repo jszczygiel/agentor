@@ -54,7 +54,6 @@ class TestLoadConfig(unittest.TestCase):
         self.assertEqual(cfg.project_root, self.dir.resolve())
         self.assertEqual(cfg.agent.runner, "stub")
         self.assertEqual(cfg.agent.pool_size, 0)
-        self.assertEqual(cfg.agent.pickup_mode, "auto")
         self.assertEqual(cfg.parsing.mode, "frontmatter")
         self.assertEqual(cfg.git.base_branch, "main")
         self.assertEqual(cfg.git.merge_mode, "merge")
@@ -147,7 +146,6 @@ class TestLoadConfig(unittest.TestCase):
             '[agent]\n'
             'runner = "claude"\n'
             'pool_size = 3\n'
-            'pickup_mode = "manual"\n'
             'single_phase = true\n'
             '[git]\n'
             'base_branch = "develop"\n'
@@ -158,11 +156,26 @@ class TestLoadConfig(unittest.TestCase):
         cfg = load(cfg_path)
         self.assertEqual(cfg.agent.runner, "claude")
         self.assertEqual(cfg.agent.pool_size, 3)
-        self.assertEqual(cfg.agent.pickup_mode, "manual")
         self.assertTrue(cfg.agent.single_phase)
         self.assertEqual(cfg.git.base_branch, "develop")
         self.assertEqual(cfg.git.merge_mode, "rebase")
         self.assertEqual(cfg.parsing.mode, "heading")
+
+    def test_pickup_mode_is_ignored_as_unknown_key(self):
+        """The pickup_mode knob was removed — stale configs carrying it
+        must not crash the loader, just warn via _filter_known."""
+        cfg_path = self._write(
+            "agentor.toml",
+            '[agent]\n'
+            'runner = "stub"\n'
+            'pickup_mode = "manual"\n',
+        )
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            cfg = load(cfg_path)
+        self.assertEqual(cfg.agent.runner, "stub")
+        self.assertIn("unknown key [agent].pickup_mode", buf.getvalue())
+        self.assertFalse(hasattr(cfg.agent, "pickup_mode"))
 
     def test_missing_file_raises(self):
         with self.assertRaises(FileNotFoundError):

@@ -3,7 +3,6 @@ from pathlib import Path
 
 from .config import Config
 from .extract import extract_items
-from .models import ItemStatus
 from .store import Store
 
 
@@ -57,13 +56,4 @@ def scan_once(config: Config, store: Store) -> ScanResult:
         for item in items:
             if store.upsert_discovered(item):
                 new_count += 1
-                # In auto pickup mode, items skip the BACKLOG gate — promote
-                # straight to QUEUED so the daemon picks them up. In manual
-                # mode they stay in BACKLOG awaiting human approval via the
-                # dashboard.
-                if config.agent.pickup_mode == "auto":
-                    store.transition(
-                        item.id, ItemStatus.QUEUED,
-                        note="auto-approved on discovery",
-                    )
     return ScanResult(scanned_files=scanned, new_items=new_count, skipped_files=skipped)

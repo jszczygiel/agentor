@@ -17,7 +17,6 @@ from .modes import (
     _enter_action,
     _inspect_mode,
     _new_issue_mode,
-    _pickup_mode,
     _review_mode,
 )
 
@@ -138,8 +137,6 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
                 _review_mode(stdscr, cfg, store, daemon)
             elif k == "n":
                 _new_issue_mode(stdscr, cfg, store, daemon)
-            elif k == "p":
-                _pickup_mode(stdscr, cfg, store, daemon)
             elif k == "d":
                 _deferred_mode(stdscr, cfg, store)
             elif k == "i":
@@ -156,12 +153,6 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
                 # naturally, no new dispatches happen until you bump pool
                 # back up.
                 cfg.agent.pool_size = max(0, cfg.agent.pool_size - 1)
-            elif k == "m":
-                cfg.agent.pickup_mode = (
-                    "auto" if cfg.agent.pickup_mode == "manual" else "manual"
-                )
-                if cfg.agent.pickup_mode == "auto":
-                    daemon.try_fill_pool()
             elif k == "u":
                 # Acknowledge a system alert and resume dispatching. No-op
                 # when nothing is paused, so safe to spam.

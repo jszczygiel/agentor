@@ -109,10 +109,9 @@ class Daemon:
         return n
 
     def _dispatch_one(self) -> bool:
-        """Dispatch one QUEUED item if a pool slot is free. Once an item
-        reaches QUEUED (auto-promoted on discovery in auto mode, or manually
-        approved out of BACKLOG), the daemon claims it regardless of pickup
-        mode — the manual/auto gate applies at BACKLOG → QUEUED only."""
+        """Dispatch one QUEUED item if a pool slot is free. New items land
+        at QUEUED on discovery (see Store.upsert_discovered); the daemon
+        claims the oldest unattempted one when a pool slot frees up."""
         if self.paused:
             return False
         if not self.store.pool_has_slot(self.config.agent.pool_size):
@@ -212,9 +211,8 @@ class Daemon:
                      f"for dispatch")
 
         while not self.stop_event.is_set():
-            # scan_once reads pickup_mode itself and promotes BACKLOG → QUEUED
-            # on auto. The daemon always dispatches QUEUED items; the
-            # auto/manual gate sits entirely at the discovery stage.
+            # scan_once lands new items directly at QUEUED; dispatch claims
+            # them as pool slots free up.
             result = scan_once(self.config, self.store)
             self.stats.scans += 1
             if result.new_items:

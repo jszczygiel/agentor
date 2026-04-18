@@ -21,20 +21,19 @@ from .formatters import (
 )
 
 
-ACTIONS = ("[↑/↓/j/k]nav  [enter]open  [n]ew  [p]ickup  [r]eview  "
-           "[d]eferred  [i]nspect  [tab]filter  [+/-]pool  [m]ode  [q]uit")
+ACTIONS = ("[↑/↓/j/k]nav  [enter]open  [n]ew  [r]eview  "
+           "[d]eferred  [i]nspect  [tab]filter  [+/-]pool  [q]uit")
 
 # Filter views: ordered list cycled by Tab. Each entry maps a filter name
 # to the statuses to display (None = all).
 FILTERS: list[tuple[str, list[ItemStatus] | None]] = [
     ("all", [ItemStatus.WORKING, ItemStatus.AWAITING_PLAN_REVIEW,
              ItemStatus.AWAITING_REVIEW, ItemStatus.CONFLICTED,
-             ItemStatus.QUEUED, ItemStatus.BACKLOG, ItemStatus.ERRORED,
+             ItemStatus.QUEUED, ItemStatus.ERRORED,
              ItemStatus.REJECTED, ItemStatus.MERGED, ItemStatus.CANCELLED,
              ItemStatus.DEFERRED]),
     ("errored", [ItemStatus.ERRORED]),
     ("conflicted", [ItemStatus.CONFLICTED]),
-    ("backlog", [ItemStatus.BACKLOG]),
     ("queued", [ItemStatus.QUEUED]),
     ("working", [ItemStatus.WORKING]),
     ("awaiting_plan", [ItemStatus.AWAITING_PLAN_REVIEW]),
@@ -78,7 +77,6 @@ def _init_colors():
 
 def _status_color(status: ItemStatus) -> int:
     return {
-        ItemStatus.BACKLOG: 3,
         ItemStatus.QUEUED: 3,
         ItemStatus.WORKING: 5,
         ItemStatus.AWAITING_PLAN_REVIEW: 1,
@@ -131,11 +129,9 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     # the rest of the queue.
     status_line = (
         f" {cfg.agent.runner}  pool={cfg.agent.pool_size}  "
-        f"mode={cfg.agent.pickup_mode}  "
         f"workers={len(daemon.workers)}  "
         f"done={s.completed}  errored={counts[ItemStatus.ERRORED]}  "
         f"conflicted={counts[ItemStatus.CONFLICTED]}  │  "
-        f"backlog={counts[ItemStatus.BACKLOG]}  "
         f"queued={counts[ItemStatus.QUEUED]}  "
         f"working={counts[ItemStatus.WORKING]}  "
         f"plan?={counts[ItemStatus.AWAITING_PLAN_REVIEW]}  "
@@ -173,7 +169,6 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
         f"agentor[{cfg.project_name}] "
         f"W{len(daemon.workers)}/{cfg.agent.pool_size} "
         f"Q{counts[ItemStatus.QUEUED]} "
-        f"B{counts[ItemStatus.BACKLOG]} "
         f"R{reviews}"
     )
     return rendered

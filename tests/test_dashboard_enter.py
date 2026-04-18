@@ -5,8 +5,11 @@ from agentor.models import ItemStatus
 
 
 class TestEnterRoute(unittest.TestCase):
-    def test_backlog_goes_to_pickup(self):
-        self.assertEqual(_enter_route(ItemStatus.BACKLOG), "pickup")
+    def test_backlog_falls_through_to_inspect(self):
+        # BACKLOG is a legacy status — new items no longer land there. If a
+        # stale row shows up, enter should fall through to the inspect
+        # screen just like any other unknown/terminal status.
+        self.assertEqual(_enter_route(ItemStatus.BACKLOG), "inspect")
 
     def test_deferred_goes_to_pickup(self):
         self.assertEqual(_enter_route(ItemStatus.DEFERRED), "pickup")
