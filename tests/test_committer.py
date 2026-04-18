@@ -3,8 +3,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from agentor.committer import (approve_and_commit, resubmit_conflicted,
-                                retry, retry_merge)
+from agentor.committer import (approve_and_commit, approve_plan,
+                                resubmit_conflicted, retry, retry_merge)
 from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
                             ReviewConfig, SourcesConfig)
 from agentor.models import ItemStatus
@@ -477,6 +477,64 @@ class TestRetryErrored(unittest.TestCase):
         self.assertEqual(final.status, ItemStatus.QUEUED)
         self.assertIsNone(final.last_error)
         self.assertEqual(final.attempts, 0)
+
+
+class TestApproveFeedbackSplit(unittest.TestCase):
+    """`approve_plan` accepts optional feedback that the runner consumes on
+    the next prompt via _prepend_feedback. No feedback → no prompt
+    override; the split lets the dashboard keep approve pure and gate
+    feedback behind a separate action."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text(
+            "- [ ] Split item\n  details\n"
+        )
+        self.cfg = _mk_config(self.root)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        scan_once(self.cfg, self.store)
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _plan_review_item(self):
+        queued = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        self.store.transition(
+            queued.id, ItemStatus.AWAITING_PLAN_REVIEW,
+            result_json='{"phase":"plan","plan":"draft"}',
+        )
+        return self.store.get(queued.id)
+
+    def test_approve_plan_without_feedback_preserves_prior_feedback(self):
+        item = self._plan_review_item()
+        approve_plan(self.store, item)
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        self.assertIsNone(final.feedback)
+        last = self.store.transitions_for(item.id)[-1]
+        self.assertNotIn("with feedback", last.note or "")
+
+    def test_approve_plan_with_feedback_sets_field(self):
+        item = self._plan_review_item()
+        approve_plan(self.store, item, feedback="avoid touching store.py")
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        self.assertEqual(final.feedback, "avoid touching store.py")
+        last = self.store.transitions_for(item.id)[-1]
+        self.assertIn("with feedback", last.note or "")
+
+    def test_approve_plan_empty_feedback_is_noop(self):
+        item = self._plan_review_item()
+        approve_plan(self.store, item, feedback="")
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        self.assertIsNone(final.feedback)
 
 
 if __name__ == "__main__":

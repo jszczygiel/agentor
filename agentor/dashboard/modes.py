@@ -59,8 +59,8 @@ def _pickup_one_screen(stdscr, cfg: Config, store: Store, daemon: Daemon,
         body = _wrap(fresh.body or "(no description)", w - 2)
         _show_item_screen(
             stdscr, header, body,
-            " [a]approve  [s]defer  [x]delete  [n]leave  [q]uit "
-            " · [j/k]scroll ",
+            " [a]approve  [f]approve+feedback  [s]defer  [x]delete  "
+            "[n]leave  [q]uit · [j/k]scroll ",
             content_scroll=scroll,
         )
         ch = stdscr.getch()
@@ -71,13 +71,17 @@ def _pickup_one_screen(stdscr, cfg: Config, store: Store, daemon: Daemon,
         k = chr(ch).lower() if 0 < ch < 256 else ""
         if k == "q":
             return "quit"
-        if k == "a":
+        if k in ("a", "f"):
             f = store.get(fresh.id)
             if f is None:
                 return ""
-            feedback = _prompt_text(
-                stdscr, "feedback for agent (empty = none): "
-            ) or None
+            feedback: str | None = None
+            if k == "f":
+                feedback = _prompt_text(
+                    stdscr, "feedback for agent (empty = cancel): "
+                ) or None
+                if feedback is None:
+                    continue
             if f.status == ItemStatus.DEFERRED:
                 restored = restore_deferred(store, f)
                 if restored == ItemStatus.BACKLOG:
@@ -463,8 +467,8 @@ def _review_plan_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
         content = _wrap(plan_text, w - 2)
         _show_item_screen(
             stdscr, header, content,
-            " [a]approve → execute  [r]eject+feedback  [s]defer  "
-            "[n]leave  [q]uit · [j/k]scroll ",
+            " [a]approve → execute  [f]approve+feedback  "
+            "[r]eject+feedback  [s]defer  [n]leave  [q]uit · [j/k]scroll ",
             content_scroll=scroll,
         )
         ch = stdscr.getch()
@@ -480,6 +484,15 @@ def _review_plan_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
             return "quit"
         if k == "a":
             approve_plan(store, fresh)
+            daemon.try_fill_pool()
+            return ""
+        if k == "f":
+            feedback = _prompt_text(
+                stdscr, "feedback for execute phase (empty = cancel): "
+            )
+            if not feedback:
+                continue
+            approve_plan(store, fresh, feedback=feedback)
             daemon.try_fill_pool()
             return ""
         if k == "r":
