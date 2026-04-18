@@ -72,17 +72,30 @@ TranscriptEvent = Union[
 ]
 
 
-def iter_raw_events(path: Path) -> Iterator[dict]:
+def iter_raw_events(
+    path: Path, tail_bytes: int | None = None,
+) -> Iterator[dict]:
     """Yield parsed JSON objects from a stream-json transcript file.
 
     Skips blank lines, header lines that don't start with `{`, and any line
     that isn't valid JSON or doesn't decode to a dict. A live transcript may
-    end mid-write, so robust-by-default tolerance matters."""
+    end mid-write, so robust-by-default tolerance matters.
+
+    When `tail_bytes` is set, only the final N bytes are read and the first
+    (likely-partial) line in that slice is dropped. Callers that only need
+    a recent-activity view (dashboard inspect) use this to avoid paying
+    O(file-size) on every render tick for transcripts that can grow into
+    the tens of megabytes during long agent runs."""
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        raw = _read_maybe_tail(path, tail_bytes)
     except FileNotFoundError:
         return
-    for line in raw.splitlines():
+    lines = raw.splitlines()
+    if tail_bytes is not None and lines:
+        # First line is almost certainly truncated by the seek boundary;
+        # drop it so we never feed a half-object to json.loads.
+        lines = lines[1:]
+    for line in lines:
         s = line.strip()
         if not s or not s.startswith("{"):
             continue
@@ -92,6 +105,20 @@ def iter_raw_events(path: Path) -> Iterator[dict]:
             continue
         if isinstance(ev, dict):
             yield ev
+
+
+def _read_maybe_tail(path: Path, tail_bytes: int | None) -> str:
+    if tail_bytes is None:
+        return path.read_text(encoding="utf-8", errors="replace")
+    with path.open("rb") as fh:
+        fh.seek(0, 2)
+        size = fh.tell()
+        if size <= tail_bytes:
+            fh.seek(0)
+        else:
+            fh.seek(size - tail_bytes)
+        data = fh.read()
+    return data.decode("utf-8", errors="replace")
 
 
 def tool_result_text(content: object) -> str:
@@ -115,7 +142,9 @@ def tool_result_text(content: object) -> str:
     return str(content)
 
 
-def iter_events(path: Path) -> Iterator[TranscriptEvent]:
+def iter_events(
+    path: Path, tail_bytes: int | None = None,
+) -> Iterator[TranscriptEvent]:
     """Walk a transcript and yield typed activity events in order.
 
     Each assistant message emits an `AssistantUsage` (when a `usage` dict is
@@ -123,9 +152,13 @@ def iter_events(path: Path) -> Iterator[TranscriptEvent]:
     `ToolCall`). Each user message emits one `ToolResult` per `tool_result`
     block, with the originating `ToolCall`'s name + input carried forward
     when the `tool_use_id` matches one we've already seen. The terminal
-    `result` event maps to `RunResult`."""
+    `result` event maps to `RunResult`.
+
+    `tail_bytes` is forwarded to `iter_raw_events` — callers that need a
+    recent-events view (dashboard inspect) should pass a small cap to avoid
+    re-parsing multi-MB transcripts on every render tick."""
     tool_use_by_id: dict[str, tuple[str, dict]] = {}
-    for ev in iter_raw_events(path):
+    for ev in iter_raw_events(path, tail_bytes=tail_bytes):
         etype = ev.get("type")
         if etype == "system" and ev.get("subtype") == "init":
             yield SessionInit(raw=ev)

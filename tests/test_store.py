@@ -466,5 +466,61 @@ class TestMigratePriority(unittest.TestCase):
             store.close()
 
 
+class TestLatestTransitionAt(unittest.TestCase):
+    """Dashboard's elapsed column reads one row instead of the full history.
+    The query must always return the MOST RECENT matching transition, so an
+    item that bounced through WORKING several times shows elapsed from the
+    latest entry — not the first."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.store = Store(Path(self.td.name) / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _create(self, item_id: str) -> None:
+        self.store.upsert_discovered(_mk_item(id=item_id))
+
+    def test_returns_latest_into_working(self):
+        self._create("a")
+        self.store.transition("a", ItemStatus.QUEUED)
+        self.store.transition("a", ItemStatus.WORKING,
+                              worktree_path="/wt", branch="b")
+        first_at = self.store.latest_transition_at("a", ItemStatus.WORKING)
+        self.assertIsNotNone(first_at)
+        time.sleep(0.01)
+        self.store.transition("a", ItemStatus.AWAITING_PLAN_REVIEW)
+        self.store.transition("a", ItemStatus.QUEUED)
+        self.store.transition("a", ItemStatus.WORKING,
+                              worktree_path="/wt", branch="b")
+        second_at = self.store.latest_transition_at("a", ItemStatus.WORKING)
+        self.assertIsNotNone(second_at)
+        # Second entry into WORKING must win — elapsed is measured from the
+        # most recent claim, not the first one.
+        self.assertGreater(second_at, first_at)
+
+    def test_returns_none_when_never_entered(self):
+        self._create("a")
+        self.assertIsNone(
+            self.store.latest_transition_at("a", ItemStatus.WORKING),
+        )
+
+    def test_ignores_other_to_statuses(self):
+        self._create("a")
+        self.store.transition("a", ItemStatus.QUEUED)
+        self.store.transition("a", ItemStatus.REJECTED)
+        # Never entered WORKING — distinct from "has transitions".
+        self.assertIsNone(
+            self.store.latest_transition_at("a", ItemStatus.WORKING),
+        )
+
+    def test_returns_none_for_unknown_item(self):
+        self.assertIsNone(
+            self.store.latest_transition_at("ghost", ItemStatus.WORKING),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

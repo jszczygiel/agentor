@@ -24,11 +24,32 @@ def _transcript_path_for(cfg: Config, item: StoredItem) -> Path:
     )
 
 
+# ~256KB of tail is enough to cover thousands of stream-json events and
+# tens of thousands of raw log lines — far past the dashboard's render
+# budget on anything but a pathological long line. Stays in RAM comfortably
+# while capping the per-tick work at O(tail_bytes), not O(file_size).
+_TAIL_BYTES = 256 * 1024
+
+
 def _tail_lines(path: Path, limit: int = 12) -> list[str]:
     try:
-        lines = path.read_text().splitlines()
+        with path.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            if size <= _TAIL_BYTES:
+                fh.seek(0)
+            else:
+                fh.seek(size - _TAIL_BYTES)
+            data = fh.read()
     except FileNotFoundError:
         return []
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    # Drop the first line when we seeked into the middle of the file — it's
+    # almost certainly truncated at the seek boundary and would show up as
+    # a garbled tail row.
+    if size > _TAIL_BYTES and lines:
+        lines = lines[1:]
     return lines[-limit:]
 
 
@@ -69,9 +90,13 @@ def _tool_result_preview(text: str) -> str:
 
 def _session_activity(path: Path, limit: int = 25) -> list[str]:
     """Render a compact activity feed from the claude stream-json transcript:
-    assistant text, tool_use calls, tool_result summaries."""
+    assistant text, tool_use calls, tool_result summaries.
+
+    Only reads the trailing `_TAIL_BYTES` of the file — a full read on a
+    multi-MB transcript was the root cause of the dashboard appearing hung
+    while inspect view refreshed once per second."""
     out: list[str] = []
-    for ev in iter_events(path):
+    for ev in iter_events(path, tail_bytes=_TAIL_BYTES):
         if isinstance(ev, SessionInit):
             out.append("·  session init")
         elif isinstance(ev, AssistantText):

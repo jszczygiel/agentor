@@ -334,5 +334,69 @@ class TestDispatchSpecific(unittest.TestCase):
         self.assertFalse(d.dispatch_specific("a"))
 
 
+class TestHeartbeatLog(unittest.TestCase):
+    """Heartbeat fires when the daemon's main loop has been idle (no new
+    items, no new dispatches, no live workers) for `heartbeat_interval`
+    seconds. We exercise the decision helper directly — running the full
+    loop and faking time across threads invited sync bugs."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        self.logs: list[str] = []
+        cfg = _mk_config(self.root, pool_size=0)
+
+        def runner_factory(cfg, store):
+            return FakeRunner(cfg, store, lambda *a: None)
+
+        self.d = Daemon(
+            cfg, self.store, runner_factory,
+            scan_interval=0.01, install_signals=False,
+            log=self.logs.append,
+        )
+        self.d.heartbeat_interval = 0.0
+        self.d._heartbeat_last = 0.0
+        self.d._heartbeat_dispatched = 0
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def test_heartbeat_emits_when_idle(self):
+        self.d._maybe_log_heartbeat(new_items=0)
+        heartbeats = [m for m in self.logs if m.startswith("heartbeat:")]
+        self.assertEqual(len(heartbeats), 1, self.logs)
+
+    def test_heartbeat_silent_when_new_items(self):
+        self.d._maybe_log_heartbeat(new_items=3)
+        self.assertFalse([m for m in self.logs
+                          if m.startswith("heartbeat:")])
+
+    def test_heartbeat_silent_when_workers_live(self):
+        self.d.workers.add(threading.current_thread())
+        try:
+            self.d._maybe_log_heartbeat(new_items=0)
+        finally:
+            self.d.workers.discard(threading.current_thread())
+        self.assertFalse([m for m in self.logs
+                          if m.startswith("heartbeat:")])
+
+    def test_heartbeat_respects_interval_gap(self):
+        self.d.heartbeat_interval = 300.0  # never fire inside this test
+        self.d._heartbeat_last = 1e6
+        # Make monotonic-clock comparison short of the interval by seeding
+        # `_heartbeat_last` to a future timestamp.
+        import agentor.daemon as daemon_mod
+        orig = daemon_mod.time.monotonic
+        daemon_mod.time.monotonic = lambda: 0.0
+        try:
+            self.d._maybe_log_heartbeat(new_items=0)
+        finally:
+            daemon_mod.time.monotonic = orig
+        self.assertFalse([m for m in self.logs
+                          if m.startswith("heartbeat:")])
+
+
 if __name__ == "__main__":
     unittest.main()

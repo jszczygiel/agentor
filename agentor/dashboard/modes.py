@@ -625,9 +625,24 @@ def _review_code_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
             return ""
         if k == "v":
             if item.worktree_path:
-                diff = diff_vs_base(Path(item.worktree_path),
-                                    cfg.git.base_branch)
-                _view_text_in_curses(stdscr, diff or "(empty diff)")
+                # Branches with large or binary-heavy diffs would otherwise
+                # block the curses main thread inside the synchronous git
+                # calls — exactly the "dashboard appears hung" shape this
+                # investigation is about. Route the shell-out through the
+                # progress overlay so the UI keeps repainting.
+                wt = Path(item.worktree_path)
+                try:
+                    diff = _run_with_progress(
+                        stdscr, f"  diff · {item.title}",
+                        lambda p: (p("git diff vs base"),
+                                   diff_vs_base(wt, cfg.git.base_branch))[-1],
+                        hint="git diff against base branch.",
+                    )
+                except Exception as e:
+                    _flash(stdscr, f"diff failed: {e}")
+                    continue
+                text = diff if isinstance(diff, str) else ""
+                _view_text_in_curses(stdscr, text or "(empty diff)")
             continue
         if k in ("n", ""):
             return ""
