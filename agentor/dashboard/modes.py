@@ -154,10 +154,11 @@ def _enter_action(stdscr, cfg: Config, store: Store, daemon: Daemon,
     try:
         if route == "pickup":
             _pickup_one_screen(stdscr, cfg, store, daemon, fresh)
-        elif route == "plan_review":
-            _review_plan_curses(stdscr, cfg, store, daemon, fresh)
-        elif route == "code_review":
-            _review_code_curses(stdscr, cfg, store, daemon, fresh)
+        elif route in ("plan_review", "code_review"):
+            # Enter on a review row engages the full cycle with this item
+            # as the starting point, so approving doesn't drop back to the
+            # main list while other items still await review.
+            _review_mode(stdscr, cfg, store, daemon, start_item=fresh)
         else:
             _inspect_render(stdscr, cfg, store, fresh)
     finally:
@@ -437,46 +438,88 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
     return out
 
 
-def _review_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
-    """Walk plan + code reviews as curses-native single-item screens.
-    Plan reviews run first (they gate the pipeline)."""
-    plan_items = store.list_by_status(ItemStatus.AWAITING_PLAN_REVIEW)
-    code_items = store.list_by_status(ItemStatus.AWAITING_REVIEW)
-    items = plan_items + code_items
-    if not items:
+def _next_review_item(store: Store, seen_ids: set[str]) -> StoredItem | None:
+    """Pure helper: return the next item awaiting review, skipping ids already
+    visited in the current cycle. Plan reviews come first (they gate the
+    pipeline), then code reviews. Returns None once the queue is empty."""
+    for status in (ItemStatus.AWAITING_PLAN_REVIEW, ItemStatus.AWAITING_REVIEW):
+        for it in store.list_by_status(status):
+            if it.id not in seen_ids:
+                return it
+    return None
+
+
+def _review_mode(stdscr, cfg: Config, store: Store, daemon: Daemon,
+                 start_item: StoredItem | None = None) -> None:
+    """Cycle through plan + code reviews as curses-native single-item screens.
+    Rescans the queue each iteration so items that transition into
+    AWAITING_* mid-session are visited. Returns to the main list only when
+    the queue is empty (or the user presses q)."""
+    seen_ids: set[str] = set()
+    first: StoredItem | None = None
+    if start_item is not None:
+        fresh_start = store.get(start_item.id)
+        if fresh_start is not None and fresh_start.status in (
+            ItemStatus.AWAITING_PLAN_REVIEW, ItemStatus.AWAITING_REVIEW,
+        ):
+            first = fresh_start
+    if first is None and _next_review_item(store, seen_ids) is None:
         _flash(stdscr, "no items awaiting review.")
         return
     stdscr.nodelay(False)
     try:
-        for item in items:
+        while True:
+            item = first or _next_review_item(store, seen_ids)
+            first = None
+            if item is None:
+                return
+            seen_ids.add(item.id)
             fresh = store.get(item.id)
             if fresh is None:
                 continue
+            # Snapshot remaining queue size for the header hint. Counts items
+            # not yet visited this cycle, excluding the one about to render.
+            remaining = sum(
+                1
+                for st in (ItemStatus.AWAITING_PLAN_REVIEW,
+                           ItemStatus.AWAITING_REVIEW)
+                for candidate in store.list_by_status(st)
+                if candidate.id not in seen_ids
+            )
             if fresh.status == ItemStatus.AWAITING_PLAN_REVIEW:
-                if _review_plan_curses(stdscr, cfg, store, daemon, fresh) == "quit":
+                if _review_plan_curses(
+                    stdscr, cfg, store, daemon, fresh, remaining=remaining,
+                ) == "quit":
                     return
             elif fresh.status == ItemStatus.AWAITING_REVIEW:
-                if _review_code_curses(stdscr, cfg, store, daemon, fresh) == "quit":
+                if _review_code_curses(
+                    stdscr, cfg, store, daemon, fresh, remaining=remaining,
+                ) == "quit":
                     return
+            # Any other status: item left the review queue between scan and
+            # render (e.g. agent retried). Fall through to pick the next.
     finally:
         stdscr.nodelay(True)
 
 
 def _review_plan_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
-                        item: StoredItem) -> str:
+                        item: StoredItem, remaining: int = 0) -> str:
     """Plan review as a single-item curses screen. Returns "quit" if the user
-    pressed q, else "" to continue walking."""
+    pressed q, else "" to continue walking. `remaining` is the number of
+    other items awaiting review at screen-open, surfaced in the header so
+    the operator can see the cycle's depth."""
     from ..committer import approve_plan, defer
     data = _result_data(item) or {}
     plan_text = data.get("plan") or data.get("summary") or "(no plan text)"
     scroll = 0
     while True:
         h, w = stdscr.getmaxyx()
+        queue_suffix = f"  · {remaining} left" if remaining > 0 else ""
         header = [
             f"  plan review · {item.title}",
             f"  id {item.id[:8]}  session "
             f"{(item.session_id or '—')[:8]}  source "
-            f"{item.source_file}:{item.source_line}",
+            f"{item.source_file}:{item.source_line}{queue_suffix}",
         ]
         content = _wrap(plan_text, w - 2)
         _show_item_screen(
@@ -520,8 +563,9 @@ def _review_plan_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
 
 
 def _review_code_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
-                        item: StoredItem) -> str:
-    """Code review (post-commit) as a single-item curses screen."""
+                        item: StoredItem, remaining: int = 0) -> str:
+    """Code review (post-commit) as a single-item curses screen. `remaining`
+    is the queue depth excluding this item, surfaced in the header."""
     from ..committer import approve_and_commit, defer
     data = _result_data(item) or {}
     summary = data.get("summary") or "(no summary)"
@@ -529,10 +573,12 @@ def _review_code_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
     scroll = 0
     while True:
         h, w = stdscr.getmaxyx()
+        queue_suffix = f"  · {remaining} left" if remaining > 0 else ""
         header = [
             f"  code review · {item.title}",
             f"  id {item.id[:8]}  branch {item.branch or '—'}  "
-            f"files {len(files)}  tokens {_tokens_total(item)}",
+            f"files {len(files)}  tokens {_tokens_total(item)}"
+            f"{queue_suffix}",
         ]
         content: list[str] = []
         content += _wrap(summary, w - 2)
