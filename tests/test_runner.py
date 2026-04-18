@@ -637,7 +637,11 @@ class TestDeferred(unittest.TestCase):
         self.assertEqual(target, ItemStatus.AWAITING_REVIEW)
 
 
-class TestDaemonPickupModes(unittest.TestCase):
+class TestDaemonAutoDispatch(unittest.TestCase):
+    """Discovery now auto-queues every new item; the daemon picks them up
+    without any operator gate. Also covers `dispatch_specific` for direct
+    dispatch of a queued item by id."""
+
     def setUp(self):
         self.td = TemporaryDirectory()
         self.root = Path(self.td.name)
@@ -649,46 +653,28 @@ class TestDaemonPickupModes(unittest.TestCase):
         self.store.close()
         self.td.cleanup()
 
-    def _cfg(self, pickup_mode: str) -> Config:
+    def _cfg(self) -> Config:
         return Config(
             project_name="t", project_root=self.root,
             sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
-            agent=AgentConfig(runner="stub", pool_size=1, max_attempts=1,
-                              pickup_mode=pickup_mode),
+            agent=AgentConfig(runner="stub", pool_size=1, max_attempts=1),
             git=GitConfig(base_branch="main", branch_prefix="agent/"),
             review=ReviewConfig(),
         )
 
-    def test_manual_mode_keeps_items_in_backlog(self):
-        """In manual pickup mode, discovery lands items in BACKLOG and the
-        daemon refuses to dispatch them until a human approves them into
-        QUEUED."""
-        from agentor.daemon import Daemon
-        from agentor.runner import make_runner
-        cfg = self._cfg("manual")
+    def test_scan_lands_items_at_queued(self):
+        """No operator gate — one scan pass, every new item lands directly
+        at QUEUED with zero BACKLOG rows produced."""
+        cfg = self._cfg()
         scan_once(cfg, self.store)
-        d = Daemon(cfg, self.store, make_runner, scan_interval=0.05,
-                   log=lambda m: None, install_signals=False)
-        import threading
-        t = threading.Thread(target=d.run, daemon=True)
-        t.start()
-        import time as _t
-        _t.sleep(0.2)
-        d.stop_event.set()
-        t.join(timeout=5)
-        # still in backlog, nothing dispatched
-        self.assertEqual(d.stats.dispatched, 0)
-        self.assertEqual(len(self.store.list_by_status(ItemStatus.BACKLOG)), 2)
-        self.assertEqual(len(self.store.list_by_status(ItemStatus.QUEUED)), 0)
+        self.assertEqual(len(self.store.list_by_status(ItemStatus.QUEUED)), 2)
+        self.assertEqual(len(self.store.list_by_status(ItemStatus.BACKLOG)), 0)
 
-    def test_auto_mode_promotes_discovery_to_queued(self):
-        """In auto pickup mode, scan_once auto-promotes new items from
-        BACKLOG into QUEUED so the daemon can claim them without human
-        intervention."""
+    def test_daemon_dispatches_queued_discovery(self):
         from agentor.daemon import Daemon
         from agentor.runner import make_runner
-        cfg = self._cfg("auto")
+        cfg = self._cfg()
         d = Daemon(cfg, self.store, make_runner, scan_interval=0.05,
                    log=lambda m: None, install_signals=False)
         import threading
@@ -698,35 +684,27 @@ class TestDaemonPickupModes(unittest.TestCase):
         _t.sleep(0.3)
         d.stop_event.set()
         t.join(timeout=5)
-        # at least one item should have been dispatched by the daemon loop
         self.assertGreaterEqual(d.stats.dispatched, 1)
-        self.assertEqual(len(self.store.list_by_status(ItemStatus.BACKLOG)), 0)
 
-    def test_dispatch_specific_works_in_manual_mode(self):
-        from agentor.committer import approve_backlog
+    def test_dispatch_specific_on_queued(self):
+        """Operator picks a specific queued item by id — bypasses the
+        oldest-first claim so you can prioritize a particular row."""
         from agentor.daemon import Daemon
         from agentor.runner import make_runner
-        cfg = self._cfg("manual")
+        cfg = self._cfg()
         scan_once(cfg, self.store)
         d = Daemon(cfg, self.store, make_runner, scan_interval=0.05,
                    log=lambda m: None, install_signals=False)
-        import threading
-        import time as _t
-        t = threading.Thread(target=d.run, daemon=True)
-        t.start()
-        _t.sleep(0.1)  # let recovery run
-        # items are in BACKLOG; promote the second one manually then dispatch.
-        target = self.store.list_by_status(ItemStatus.BACKLOG)[1]
-        approve_backlog(self.store, target)
+        queued = self.store.list_by_status(ItemStatus.QUEUED)
+        self.assertEqual(len(queued), 2)
+        target = queued[1]  # not the oldest — that's the whole point
         ok = d.dispatch_specific(target.id)
         self.assertTrue(ok)
-        # wait for stub runner to finish
+        import time as _t
         for _ in range(30):
             if self.store.get(target.id).status != ItemStatus.WORKING:
                 break
             _t.sleep(0.1)
-        d.stop_event.set()
-        t.join(timeout=5)
         final = self.store.get(target.id)
         self.assertEqual(final.status, ItemStatus.AWAITING_REVIEW)
 
@@ -981,8 +959,6 @@ class TestFailureLandsInErrored(unittest.TestCase):
         )
         self.store = Store(self.root / ".agentor" / "state.db")
         scan_once(self.cfg, self.store)
-        for q in self.store.list_by_status(ItemStatus.BACKLOG):
-            self.store.transition(q.id, ItemStatus.QUEUED)
 
     def tearDown(self):
         self.store.close()
@@ -1025,8 +1001,6 @@ class TestRunnerRecordsFailures(unittest.TestCase):
         )
         self.store = Store(self.root / ".agentor" / "state.db")
         scan_once(self.cfg, self.store)
-        for q in self.store.list_by_status(ItemStatus.BACKLOG):
-            self.store.transition(q.id, ItemStatus.QUEUED)
 
     def tearDown(self):
         self.store.close()
@@ -1059,8 +1033,7 @@ class TestDaemonPause(unittest.TestCase):
             project_name="t", project_root=self.root,
             sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
-            agent=AgentConfig(runner="stub", pool_size=1, max_attempts=3,
-                              pickup_mode="auto"),
+            agent=AgentConfig(runner="stub", pool_size=1, max_attempts=3),
             git=GitConfig(base_branch="main", branch_prefix="agent/"),
             review=ReviewConfig(),
         )
@@ -1135,7 +1108,7 @@ class TestResumePoolGate(unittest.TestCase):
             sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
             agent=AgentConfig(runner="stub", pool_size=pool_size,
-                              max_attempts=1, pickup_mode="auto"),
+                              max_attempts=1),
             git=GitConfig(base_branch="main", branch_prefix="agent/"),
             review=ReviewConfig(),
         )

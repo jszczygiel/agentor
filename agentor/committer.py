@@ -281,25 +281,6 @@ def reject_and_retry(store: Store, item: StoredItem, feedback: str) -> None:
         )
 
 
-def approve_backlog(
-    store: Store, item: StoredItem, feedback: str | None = None
-) -> None:
-    """Promote a backlog item to QUEUED so the daemon can dispatch it. Used
-    by the pickup UI when pickup_mode is 'manual'. Optional `feedback` is
-    persisted and prepended to the agent's first plan prompt (consumed and
-    cleared after one use, same path as reject_and_retry)."""
-    assert item.status == ItemStatus.BACKLOG
-    fields: dict[str, object] = {}
-    if feedback:
-        fields["feedback"] = feedback
-    store.transition(
-        item.id, ItemStatus.QUEUED,
-        note="approved by user (backlog → queued)"
-        + (" with feedback" if feedback else ""),
-        **fields,
-    )
-
-
 def approve_plan(
     store: Store, item: StoredItem, feedback: str | None = None,
 ) -> None:
@@ -308,8 +289,7 @@ def approve_plan(
     result_json and runs the execute phase (resumes the same claude session).
 
     Optional `feedback` is persisted and consumed once by the runner's
-    `_prepend_feedback` on the execute phase — same path as reject_and_retry
-    and approve_backlog."""
+    `_prepend_feedback` on the execute phase — same path as reject_and_retry."""
     assert item.status == ItemStatus.AWAITING_PLAN_REVIEW
     fields: dict[str, object] = {}
     if feedback:

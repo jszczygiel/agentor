@@ -36,9 +36,6 @@ class AgentConfig:
     # Total context window in tokens (Opus 4.6 1M variant = 1_000_000;
     # standard Opus = 200_000). Used to compute CTX% in the dashboard.
     context_window: int = 200_000
-    # auto: daemon dispatches queued items as soon as a pool slot frees up.
-    # manual: items stay queued until a human approves the pickup via the UI.
-    pickup_mode: str = "auto"
     # When true, skip the plan phase entirely — agent goes straight to
     # execute on first claim. Saves a full Claude run for items where the
     # backlog text is already a sufficient spec and human plan-review adds

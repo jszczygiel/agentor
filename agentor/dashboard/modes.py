@@ -39,31 +39,14 @@ from .transcript import (
 )
 
 
-def _pickup_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
-    """Curses-native, one-item-per-screen pickup over BACKLOG + DEFERRED.
-    Approving promotes BACKLOG → QUEUED; the daemon dispatches on its own."""
-    items = (store.list_by_status(ItemStatus.BACKLOG)
-             + store.list_by_status(ItemStatus.DEFERRED))
-    if not items:
-        _flash(stdscr, "no backlog or deferred items.")
-        return
-    stdscr.nodelay(False)
-    try:
-        for it in items:
-            fresh = store.get(it.id)
-            if fresh is None:
-                continue
-            if _pickup_one_screen(stdscr, cfg, store, daemon, fresh) == "quit":
-                return
-    finally:
-        stdscr.nodelay(True)
-
-
 def _pickup_one_screen(stdscr, cfg: Config, store: Store, daemon: Daemon,
                        fresh: StoredItem) -> str:
-    """Single pickup screen for one BACKLOG/DEFERRED item. Returns "quit" on
-    q, else "" when the user advances (a/s/x/n). Caller owns nodelay state."""
-    from ..committer import approve_backlog, defer, delete_idea, restore_deferred
+    """Single pickup screen for one DEFERRED item. Returns "quit" on q,
+    else "" when the user advances (a/s/x/n). Caller owns nodelay state.
+    Approve restores the item to its previous settled status; legacy items
+    whose history leads back to BACKLOG are promoted directly to QUEUED so
+    they don't get stuck in a dead bucket."""
+    from ..committer import defer, delete_idea, restore_deferred
     scroll = 0
     while True:
         h, w = stdscr.getmaxyx()
@@ -102,13 +85,17 @@ def _pickup_one_screen(stdscr, cfg: Config, store: Store, daemon: Daemon,
             if f.status == ItemStatus.DEFERRED:
                 restored = restore_deferred(store, f)
                 if restored == ItemStatus.BACKLOG:
-                    refreshed = store.get(f.id)
-                    assert refreshed is not None
-                    approve_backlog(
-                        store, refreshed, feedback=feedback,
+                    # Legacy rows whose history leads back to BACKLOG — the
+                    # gate no longer exists, so skip it straight to QUEUED.
+                    fields: dict[str, object] = {}
+                    if feedback:
+                        fields["feedback"] = feedback
+                    store.transition(
+                        f.id, ItemStatus.QUEUED,
+                        note="approved by user (legacy backlog → queued)"
+                        + (" with feedback" if feedback else ""),
+                        **fields,
                     )
-            elif f.status == ItemStatus.BACKLOG:
-                approve_backlog(store, f, feedback=feedback)
             daemon.try_fill_pool()
             return ""
         if k == "s":
@@ -126,7 +113,6 @@ def _pickup_one_screen(stdscr, cfg: Config, store: Store, daemon: Daemon,
 
 
 _ENTER_ROUTES = {
-    ItemStatus.BACKLOG: "pickup",
     ItemStatus.DEFERRED: "pickup",
     ItemStatus.AWAITING_PLAN_REVIEW: "plan_review",
     ItemStatus.AWAITING_REVIEW: "code_review",

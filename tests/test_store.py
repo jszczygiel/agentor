@@ -26,11 +26,9 @@ class TestStore(unittest.TestCase):
         self.td.cleanup()
 
     def _upsert_and_queue(self, id: str) -> None:
-        """upsert_discovered now lands items in BACKLOG (so humans can gate
-        new work). Tests that exercise the downstream flow want items already
-        in QUEUED, so promote them explicitly here."""
+        """upsert_discovered lands items at QUEUED directly — thin wrapper
+        kept for test clarity."""
         self.store.upsert_discovered(_mk_item(id=id))
-        self.store.transition(id, ItemStatus.QUEUED, note="test promote")
 
     def test_upsert_new_then_duplicate(self):
         item = _mk_item()
@@ -38,7 +36,7 @@ class TestStore(unittest.TestCase):
         self.assertFalse(self.store.upsert_discovered(item))
         stored = self.store.get(item.id)
         self.assertIsNotNone(stored)
-        self.assertEqual(stored.status, ItemStatus.BACKLOG)
+        self.assertEqual(stored.status, ItemStatus.QUEUED)
         self.assertEqual(stored.tags, {"priority": "high"})
 
     def test_claim_next_queued_transitions_to_working(self):
@@ -76,8 +74,7 @@ class TestStore(unittest.TestCase):
         history = self.store.transitions_for("a")
         statuses = [(t.from_status, t.to_status) for t in history]
         self.assertEqual(statuses, [
-            (None, ItemStatus.BACKLOG),
-            (ItemStatus.BACKLOG, ItemStatus.QUEUED),
+            (None, ItemStatus.QUEUED),
             (ItemStatus.QUEUED, ItemStatus.WORKING),
             (ItemStatus.WORKING, ItemStatus.AWAITING_REVIEW),
         ])
@@ -188,9 +185,15 @@ class TestStatusRoundTrip(unittest.TestCase):
         # Walk every status in declaration order. from_status on row N is the
         # to_status of row N-1, so both columns see every value that can ever
         # appear in them.
+        # Seed BACKLOG explicitly: upsert lands at QUEUED now, and we want
+        # every status — including legacy BACKLOG — to round-trip through
+        # the DB at least once.
+        self.store.transition(item_id, ItemStatus.BACKLOG, note="legacy seed")
         for status in ItemStatus:
-            if status == ItemStatus.BACKLOG:
+            if status == ItemStatus.QUEUED:
                 continue  # seeded by upsert_discovered
+            if status == ItemStatus.BACKLOG:
+                continue  # already seeded above
             self.store.transition(item_id, status, note=status.value)
         history = self.store.transitions_for(item_id)
         seen_to = {t.to_status for t in history}
@@ -459,7 +462,7 @@ class TestMigratePriority(unittest.TestCase):
             self.assertEqual(stored.priority, 0)
             # Downstream queries that order by priority must still work.
             self.assertEqual(
-                [it.id for it in store.list_by_status(ItemStatus.BACKLOG)],
+                [it.id for it in store.list_by_status(ItemStatus.QUEUED)],
                 ["pre"],
             )
         finally:

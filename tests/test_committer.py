@@ -3,9 +3,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from agentor.committer import (approve_and_commit, approve_backlog,
-                                approve_plan, resubmit_conflicted, retry,
-                                retry_merge)
+from agentor.committer import (approve_and_commit, approve_plan,
+                                resubmit_conflicted, retry, retry_merge)
 from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
                             ReviewConfig, SourcesConfig)
 from agentor.models import ItemStatus
@@ -481,10 +480,10 @@ class TestRetryErrored(unittest.TestCase):
 
 
 class TestApproveFeedbackSplit(unittest.TestCase):
-    """`approve_plan` and `approve_backlog` accept optional feedback that
-    the runner consumes on the next prompt via _prepend_feedback. No
-    feedback → no prompt override; the split lets the dashboard keep
-    approve pure and gate feedback behind a separate action."""
+    """`approve_plan` accepts optional feedback that the runner consumes on
+    the next prompt via _prepend_feedback. No feedback → no prompt
+    override; the split lets the dashboard keep approve pure and gate
+    feedback behind a separate action."""
 
     def setUp(self):
         self.td = TemporaryDirectory()
@@ -501,13 +500,6 @@ class TestApproveFeedbackSplit(unittest.TestCase):
         self.store.close()
         self.td.cleanup()
 
-    def _backlog_item(self):
-        queued = self.store.list_by_status(ItemStatus.QUEUED)[0]
-        # scan_once inserts at QUEUED under auto pickup; drop back to
-        # BACKLOG so approve_backlog's precondition holds.
-        self.store.transition(queued.id, ItemStatus.BACKLOG)
-        return self.store.get(queued.id)
-
     def _plan_review_item(self):
         queued = self.store.list_by_status(ItemStatus.QUEUED)[0]
         self.store.transition(
@@ -515,26 +507,6 @@ class TestApproveFeedbackSplit(unittest.TestCase):
             result_json='{"phase":"plan","plan":"draft"}',
         )
         return self.store.get(queued.id)
-
-    def test_approve_backlog_no_feedback_leaves_field_none(self):
-        item = self._backlog_item()
-        approve_backlog(self.store, item)
-
-        final = self.store.get(item.id)
-        self.assertEqual(final.status, ItemStatus.QUEUED)
-        self.assertIsNone(final.feedback)
-        last = self.store.transitions_for(item.id)[-1]
-        self.assertNotIn("with feedback", last.note or "")
-
-    def test_approve_backlog_with_feedback_sets_field(self):
-        item = self._backlog_item()
-        approve_backlog(self.store, item, feedback="use pytest")
-
-        final = self.store.get(item.id)
-        self.assertEqual(final.status, ItemStatus.QUEUED)
-        self.assertEqual(final.feedback, "use pytest")
-        last = self.store.transitions_for(item.id)[-1]
-        self.assertIn("with feedback", last.note or "")
 
     def test_approve_plan_without_feedback_preserves_prior_feedback(self):
         item = self._plan_review_item()

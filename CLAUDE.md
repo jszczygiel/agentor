@@ -9,7 +9,7 @@ Agentor orchestrates Claude Code agents that consume work items from a target pr
 ## Projects using agentor
 
 - **lancelot** — `/Users/szczygiel/StudioProjects/lancelot` (Godot project; `agentor.toml` lives at repo root).
-- **agentor** — `/Users/szczygiel/StudioProjects/agentor` (self-hosted; meta project dogfoods its own orchestrator. `pickup_mode = "manual"` so each item is approved before running).
+- **agentor** — `/Users/szczygiel/StudioProjects/agentor` (self-hosted; meta project dogfoods its own orchestrator. `pool_size = 0` so dispatch is paused until the operator bumps pool with `+`).
 
 ## Commands
 
@@ -31,20 +31,20 @@ Pipeline: **watched markdown files → extracted Items → SQLite queue → daem
 
 Key modules:
 
-- `agentor/models.py` — `Item` (immutable, sha1 of `source_file+title+body`) and `ItemStatus` lifecycle: `backlog → queued → working → awaiting_plan_review → working → awaiting_review → merged | rejected | errored | conflicted | cancelled | deferred`.
-- `agentor/config.py` — loads `agentor.toml`. Project root resolves relative to the config file's directory unless absolute. Knobs worth knowing: `agent.pool_size` (caps concurrent `working` items; default 0 — operator bumps via `+` in the dashboard), `agent.runner` (`stub` | `claude` | `codex`), `agent.pickup_mode` (`auto` | `manual`), `agent.single_phase` (skip the plan phase), `sources.watch` (glob list), `parsing.mode` (`checkbox` | `heading` | `frontmatter`), `git.merge_mode` (`merge` | `rebase`).
+- `agentor/models.py` — `Item` (immutable, sha1 of `source_file+title+body`) and `ItemStatus` lifecycle: `queued → working → awaiting_plan_review → working → awaiting_review → merged | rejected | errored | conflicted | cancelled | deferred`. `backlog` is a legacy enum value kept for DB round-trip compatibility with old rows; new items no longer land there.
+- `agentor/config.py` — loads `agentor.toml`. Project root resolves relative to the config file's directory unless absolute. Knobs worth knowing: `agent.pool_size` (caps concurrent `working` items; default 0 — operator bumps via `+` in the dashboard), `agent.runner` (`stub` | `claude` | `codex`), `agent.single_phase` (skip the plan phase), `sources.watch` (glob list), `parsing.mode` (`checkbox` | `heading` | `frontmatter`), `git.merge_mode` (`merge` | `rebase`).
 - `agentor/extract.py` — parses markdown into Items. Modes:
   - **checkbox**: each `- [ ]` is an item; continuation lines form the body; `- [x]` skipped.
   - **heading**: each `#`..`######` is an item; body runs until the next heading of same-or-higher level.
   - **frontmatter**: one item per file; title/state/tags taken from YAML frontmatter.
   - Inline `@key:value` tags are stripped from title/body into `item.tags`. Title tags win on conflict.
 - `agentor/store.py` — SQLite state store. Atomic `claim_next_queued`, `pool_has_slot`, history via the `transitions` table, failure rows via `failures`. All transitions go through `Store.transition(to, **fields)`.
-- `agentor/watcher.py` — `scan_once` diffs the markdown-extracted items against the DB and inserts new ones at BACKLOG (manual pickup) or QUEUED (auto pickup).
+- `agentor/watcher.py` — `scan_once` diffs the markdown-extracted items against the DB and inserts new ones at QUEUED.
 - `agentor/daemon.py` — main loop. Polls the watcher, dispatches queued items into a thread pool capped by `pool_size`, surfaces infra failures as sticky alerts on the dashboard until the user presses `u`.
 - `agentor/runner.py` — `Runner` base class + `StubRunner`, `ClaudeRunner`, `CodexRunner`. Two-phase flow: `plan` (read-only; stops at AWAITING_PLAN_REVIEW) → human approves via `approve_plan` → `execute` resumes the same session (`--resume <session_id>` for claude, `thread_id` for codex) and commits. `single_phase=true` skips plan and goes straight to execute.
 - `agentor/committer.py` — handles AWAITING_REVIEW → MERGED. `approve_and_commit` commits any uncommitted work on the feature branch, then integrates into `git.base_branch` via an ephemeral detached worktree (`merge` → `--no-ff`, `rebase` → `rebase <base>`-then-CAS-fast-forward). Conflicts transition to CONFLICTED with the summary in `last_error`; `retry_merge` re-runs the integration after the user resolves in the feature worktree. Opt-in `git.auto_resolve_conflicts` chains a `resubmit_conflicted` call right after the CONFLICTED transition so the agent is re-queued to resolve the merge itself without operator intervention.
 - `agentor/recovery.py` — runs at daemon startup. WORKING items with a live `session_id` + worktree go back into resumable; everything else reverts to its previous settled status. Also clears benign stale `last_error` markers.
-- `agentor/dashboard/` — curses UI package. `render.py` owns screens/prompts, `modes.py` owns actions (pickup/review/deferred/inspect), `formatters.py` formats table cells, `transcript.py` parses the claude stream-json session feed. Main table auto-refreshes at `REFRESH_MS=500`; modes: pickup `p`, review `r`, deferred `d`, inspect `i`. Inspect auto-refreshes every 1s; `[m]` retries merge for CONFLICTED items.
+- `agentor/dashboard/` — curses UI package. `render.py` owns screens/prompts, `modes.py` owns actions (review/deferred/inspect), `formatters.py` formats table cells, `transcript.py` parses the claude stream-json session feed. Main table auto-refreshes at `REFRESH_MS=500`; modes: review `r`, deferred `d`, inspect `i`. Inspect auto-refreshes every 1s; `[m]` retries merge for CONFLICTED items.
 
 Design invariants to preserve:
 

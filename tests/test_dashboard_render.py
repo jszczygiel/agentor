@@ -9,9 +9,15 @@ class TestActionsHint(unittest.TestCase):
         self.assertNotIn("unpause", ACTIONS)
 
     def test_core_actions_present(self):
-        for key in ("[p]ickup", "[r]eview", "[d]eferred", "[i]nspect",
-                    "[tab]filter", "[+/-]pool", "[m]ode", "[q]uit"):
+        for key in ("[r]eview", "[d]eferred", "[i]nspect",
+                    "[tab]filter", "[+/-]pool", "[q]uit"):
             self.assertIn(key, ACTIONS)
+
+    def test_removed_pickup_mode_actions_gone(self):
+        # Regression guard: pickup walk (`p`) and pickup-mode toggle (`m`)
+        # were removed when auto-dispatch became the only mode.
+        self.assertNotIn("[p]ickup", ACTIONS)
+        self.assertNotIn("[m]ode", ACTIONS)
 
     def test_double_space_separators(self):
         # single-space separators between words would compress the layout
