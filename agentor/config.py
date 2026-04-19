@@ -3,6 +3,9 @@ import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+from .checkpoint import (DEFAULT_HARD_TEMPLATE, DEFAULT_SOFT_TEMPLATE,
+                         DEFAULT_TOKENS_TEMPLATE)
+
 
 @dataclass
 class SourcesConfig:
@@ -156,6 +159,19 @@ class AgentConfig:
     # system-prompt cache before siblings race for the same prefix.
     # 0 disables (back-compat default).
     dispatch_stagger_seconds: float = 0.0
+    # Mid-run advisory checkpoints. When the live turn count or cumulative
+    # output-token total crosses a threshold, the runner injects a user-role
+    # nudge suggesting the agent delegate discovery to a subagent. Each
+    # threshold fires at most once per run. Set any to 0 to disable that
+    # gate; setting all three to 0 disables checkpoints entirely. Only the
+    # Claude stream-json-stdin path acts on the emissions; legacy `-p
+    # {prompt}` command shapes still observe but do not inject.
+    turn_checkpoint_soft: int = 60
+    turn_checkpoint_hard: int = 100
+    output_token_checkpoint: int = 50_000
+    checkpoint_soft_template: str = DEFAULT_SOFT_TEMPLATE
+    checkpoint_hard_template: str = DEFAULT_HARD_TEMPLATE
+    checkpoint_tokens_template: str = DEFAULT_TOKENS_TEMPLATE
     build_cmd: str | None = None
     test_cmd: str | None = None
     # Threshold (in lines) above which a `Read` tool call MUST pass
@@ -164,6 +180,11 @@ class AgentConfig:
     # Custom `agent.command` overrides that drop the `{settings_path}`
     # placeholder silently skip enforcement.
     large_file_line_threshold: int = 400
+    # When true, a PreToolUse hook rejects `Grep` calls with
+    # `output_mode: content` that don't also pass `head_limit`, so the
+    # agent can't dump hundreds of match lines into context. Content-mode
+    # is the only gated mode — `count` and `files_with_matches` stay free.
+    enforce_grep_head_limit: bool = True
     # When `docs/agent-logs/` has accumulated at least this many files,
     # the daemon auto-queues a "Fold agent log lessons" backlog item so
     # a future agent clusters the Surprises/Gotchas into CLAUDE.md and

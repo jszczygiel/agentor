@@ -11,11 +11,53 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import git_ops
+from .checkpoint import CheckpointConfig, CheckpointEmitter
 from .config import Config
 from .models import ItemStatus
 from .resume_primer import build_primer
 from .slug import slugify
 from .store import Store, StoredItem
+
+
+class ChildStdinHolder:
+    """Thread-safe line writer bound to a child process's stdin pipe.
+
+    `_run_stream_json_subprocess` populates the internal handle after spawn;
+    the stream-reader thread calls `write_line(payload)` to inject additional
+    JSONL messages (e.g. mid-run checkpoint nudges) without racing with
+    process teardown. A lock guards every write/close so `p.kill()` on the
+    timeout path can't corrupt a partial write."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._fh = None
+        self._closed = False
+
+    def attach(self, fh) -> None:
+        with self._lock:
+            self._fh = fh
+
+    def write_line(self, text: str) -> bool:
+        line = text if text.endswith("\n") else text + "\n"
+        with self._lock:
+            if self._closed or self._fh is None:
+                return False
+            try:
+                self._fh.write(line)
+                self._fh.flush()
+                return True
+            except Exception:
+                return False
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
 
 
 class ProcRegistry:
@@ -425,6 +467,8 @@ def _run_stream_json_subprocess(
     item_key: str,
     fnfe_hint: str,
     on_event,
+    stdin_payload: str | None = None,
+    stdin_holder: ChildStdinHolder | None = None,
 ) -> tuple[str, str, int | None, bool, str | None]:
     """Spawn a subprocess that emits line-delimited JSON on stdout, stream
     each event through `on_event`, and return once the child exits (or a
@@ -434,15 +478,24 @@ def _run_stream_json_subprocess(
     a truthy string, the child is killed and that string is surfaced as
     `cap_reason` so callers can raise a descriptive error.
 
+    `stdin_payload` is written (and flushed) before the read loop begins.
+    When `stdin_holder` is passed, stdin stays open and `on_event` can
+    inject further lines via `stdin_holder.write_line(...)`; if no holder
+    is passed stdin is closed immediately after the initial payload.
+
     Returns (stdout_text, stderr_text, returncode, timed_out, cap_reason).
     Caller is responsible for the final shutdown-event / returncode checks —
     this helper just owns the subprocess lifecycle and byte plumbing."""
+    stdin_spec = subprocess.PIPE if (
+        stdin_payload is not None or stdin_holder is not None
+    ) else None
     try:
         # start_new_session=True puts the child (and anything it spawns)
         # in its own process group so the daemon can SIGTERM the whole
         # tree on shutdown via os.killpg.
         p = subprocess.Popen(
             args, cwd=cwd,
+            stdin=stdin_spec,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1, start_new_session=True,
         )
@@ -451,6 +504,19 @@ def _run_stream_json_subprocess(
     assert p.stdout is not None and p.stderr is not None
     if proc_registry is not None:
         proc_registry.register(item_key, p)
+    if stdin_holder is not None and p.stdin is not None:
+        stdin_holder.attach(p.stdin)
+    if stdin_payload is not None and p.stdin is not None:
+        try:
+            p.stdin.write(stdin_payload)
+            p.stdin.flush()
+        except Exception:
+            pass
+        if stdin_holder is None:
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
 
     timed_out = threading.Event()
 
@@ -508,6 +574,8 @@ def _run_stream_json_subprocess(
         timer.cancel()
         if proc_registry is not None:
             proc_registry.unregister(item_key)
+        if stdin_holder is not None:
+            stdin_holder.close()
         try:
             p.stdout.close()
         except Exception:
@@ -641,6 +709,8 @@ class ClaudeRunner(Runner):
 
         Legacy non-streaming commands (no stream-json) still work — we detect
         the output format and fall back to blocking subprocess.run."""
+        template = self.config.agent.command or _default_claude_command()
+        legacy_prompt_arg = _command_has_prompt_placeholder(template)
         settings_path = write_claude_settings(self.config, item.id)
         args = [
             a.format(
@@ -648,7 +718,7 @@ class ClaudeRunner(Runner):
                 model=self.config.agent.model,
                 settings_path=str(settings_path),
             )
-            for a in (self.config.agent.command or _default_claude_command())
+            for a in template
         ]
 
         # Session id: pre-generated + persisted before the child starts so a
@@ -672,8 +742,10 @@ class ClaudeRunner(Runner):
 
         streaming = "stream-json" in args
         if streaming:
+            stdin_prompt = None if legacy_prompt_arg else prompt
             return self._invoke_claude_streaming(
                 item, args, worktree, transcript_path, phase_tag,
+                stdin_prompt=stdin_prompt,
             )
         return self._invoke_claude_blocking(
             item, args, worktree, transcript_path,
@@ -739,18 +811,50 @@ class ClaudeRunner(Runner):
     def _invoke_claude_streaming(
         self, item: StoredItem, args: list[str], worktree: Path,
         transcript_path: Path, phase_tag: str,
+        stdin_prompt: str | None = None,
     ) -> tuple[str, str]:
         """Launch claude with Popen, read stdout line-by-line, parse each
-        stream-json event, and publish live usage/iterations to the store."""
+        stream-json event, and publish live usage/iterations to the store.
+
+        When `stdin_prompt` is set, claude is invoked with stream-json input
+        mode — the prompt is framed as an initial `user` JSONL and written to
+        stdin, and stdin is held open so the checkpoint emitter can inject
+        additional user-role nudges mid-session."""
         state = _StreamState(item_id=item.id, phase=phase_tag)
         max_turns = int(self.config.agent.max_turns or 0)
+        ckpt_cfg = CheckpointConfig(
+            soft_turns=int(self.config.agent.turn_checkpoint_soft or 0),
+            hard_turns=int(self.config.agent.turn_checkpoint_hard or 0),
+            output_tokens=int(self.config.agent.output_token_checkpoint or 0),
+            soft_template=self.config.agent.checkpoint_soft_template,
+            hard_template=self.config.agent.checkpoint_hard_template,
+            tokens_template=self.config.agent.checkpoint_tokens_template,
+        )
+        emitter = None if ckpt_cfg.all_disabled() else CheckpointEmitter(ckpt_cfg)
+
+        stdin_holder: ChildStdinHolder | None = None
+        stdin_payload: str | None = None
+        if stdin_prompt is not None:
+            stdin_holder = ChildStdinHolder()
+            stdin_payload = _claude_initial_stdin_payload(stdin_prompt)
 
         def on_event(ev: dict) -> str | None:
             state.ingest(ev)
-            # Publish on every assistant turn and the final result event —
-            # cheaper than per-line, enough for live dashboard UX.
             if ev.get("type") in ("assistant", "result"):
                 self._publish_live(item.id, state)
+            if emitter is not None and ev.get("type") == "assistant":
+                nudges = emitter.observe(
+                    state.num_turns, state.total_output_tokens,
+                )
+                for nudge in nudges:
+                    self._note_checkpoint(transcript_path, state, nudge,
+                                          injected=stdin_holder is not None)
+                    if stdin_holder is not None:
+                        line = json.dumps({
+                            "type": "user",
+                            "message": {"role": "user", "content": nudge},
+                        })
+                        stdin_holder.write_line(line)
             # Runaway guard. No cost cap — subscription-billed plans make
             # mid-stream dollar accounting misleading; max_turns is enough.
             if max_turns and state.num_turns >= max_turns:
@@ -769,6 +873,8 @@ class ClaudeRunner(Runner):
                     f"Install claude or set agent.command in agentor.toml."
                 ),
                 on_event=on_event,
+                stdin_payload=stdin_payload,
+                stdin_holder=stdin_holder,
             )
         )
         if timed_out:
@@ -799,6 +905,25 @@ class ClaudeRunner(Runner):
         except Exception:
             # A publish failure shouldn't crash the run. Dashboard just
             # stays on the previous snapshot.
+            pass
+
+    def _note_checkpoint(
+        self, transcript_path: Path, state: "_StreamState", nudge: str,
+        injected: bool,
+    ) -> None:
+        """Append a human-readable marker to the transcript so post-hoc
+        analysis can see where a checkpoint nudge landed. The marker sits
+        outside the JSONL event stream (line doesn't start with `{`) so the
+        stream walker skips it."""
+        tag = "injected" if injected else "observed-dry-run"
+        marker = (
+            f"\n[checkpoint-{tag} @ turn {state.num_turns} "
+            f"output_tokens={state.total_output_tokens}]\n{nudge}\n"
+        )
+        try:
+            with transcript_path.open("a") as fh:
+                fh.write(marker)
+        except Exception:
             pass
 
 
@@ -1000,6 +1125,10 @@ class _StreamState:
         self.model_usage: dict[str, dict] = {}
         # Last seen result text (set by the terminal 'result' event).
         self.result_text: str | None = None
+        # Cumulative output tokens across all assistant turns. Published
+        # so the checkpoint emitter can gate on "doing too much in-context"
+        # without recomputing from `iterations` on every event.
+        self.total_output_tokens: int = 0
 
     def ingest(self, ev: dict) -> None:
         etype = ev.get("type")
@@ -1040,6 +1169,7 @@ class _StreamState:
                 usage.get("cache_read_input_tokens", 0) or 0)
             mu["cacheCreationInputTokens"] += int(
                 usage.get("cache_creation_input_tokens", 0) or 0)
+            self.total_output_tokens += int(usage.get("output_tokens", 0) or 0)
             return
         if etype == "result":
             if ev.get("num_turns") is not None:
@@ -1261,49 +1391,87 @@ def _default_codex_command() -> list[str]:
 
 
 def _default_claude_command() -> list[str]:
+    # The `-p` without a prompt argument + `--input-format stream-json` puts
+    # claude into a session where user messages are fed via stdin as JSONL
+    # lines. The runner streams the initial prompt in on start, then can
+    # inject mid-run checkpoint nudges on the same channel. Legacy configs
+    # that still set `agent.command = [..., "-p", "{prompt}", ...]` keep
+    # working — the runner detects the placeholder and falls back to the
+    # single-shot invocation (no mid-run injection).
+    #
     # `--settings {settings_path}` points Claude at a per-run JSON that
     # registers a PreToolUse hook blocking whole-file `Read` calls on
     # files above `agent.large_file_line_threshold`. Custom overrides that
     # drop this placeholder silently disable enforcement.
     return [
-        "claude", "-p", "{prompt}", "--dangerously-skip-permissions",
+        "claude", "-p", "--dangerously-skip-permissions",
         "--settings", "{settings_path}",
+        "--input-format", "stream-json",
         "--output-format", "stream-json", "--verbose",
     ]
 
 
+def _claude_initial_stdin_payload(prompt: str) -> str:
+    """Frame the initial prompt as a single `user` stream-json line.
+    Trailing newline included — the runner writes this verbatim to claude's
+    stdin before the read loop starts."""
+    return json.dumps({
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+    }) + "\n"
+
+
+def _command_has_prompt_placeholder(args: list[str]) -> bool:
+    """Legacy command templates carry `{prompt}` as an arg; the new
+    stream-json stdin path does not. Used to pick single-shot vs
+    injection-capable invocation."""
+    return any("{prompt}" in a for a in args)
+
+
 def _read_hook_path() -> Path:
-    """Absolute path to the shipped PreToolUse hook script."""
+    """Absolute path to the shipped PreToolUse Read hook script."""
     return (Path(__file__).resolve().parent / "read_hook.py")
+
+
+def _grep_hook_path() -> Path:
+    """Absolute path to the shipped PreToolUse Grep hook script."""
+    return (Path(__file__).resolve().parent / "grep_hook.py")
 
 
 def write_claude_settings(
     config: Config, item_id: str,
 ) -> Path:
-    """Write a Claude settings JSON registering the large-file Read hook
-    into `<project>/.agentor/claude-settings/<item_id>.json`. When the
-    threshold is <= 0 the file still exists (claude needs a readable
-    --settings path) but its hooks list is empty."""
+    """Write a Claude settings JSON registering the bundled PreToolUse
+    hooks into `<project>/.agentor/claude-settings/<item_id>.json`. Each
+    enforcement can be toggled independently:
+      - Read offset/limit gate: `agent.large_file_line_threshold` (>0).
+      - Grep head_limit gate: `agent.enforce_grep_head_limit`.
+    The file always exists (claude needs a readable --settings path); if
+    every toggle is off, the hooks list is simply empty."""
     threshold = int(config.agent.large_file_line_threshold or 0)
+    enforce_grep = bool(config.agent.enforce_grep_head_limit)
     settings_dir = (
         config.project_root / ".agentor" / "claude-settings"
     )
     settings_dir.mkdir(parents=True, exist_ok=True)
     settings_path = settings_dir / f"{item_id}.json"
-    settings: dict = {"hooks": {}}
+    pretool: list[dict] = []
     if threshold > 0:
-        hook_cmd = (
+        read_cmd = (
             f"AGENTOR_READ_THRESHOLD={threshold} "
             f"python3 {_read_hook_path()}"
         )
-        settings["hooks"] = {
-            "PreToolUse": [
-                {
-                    "matcher": "Read",
-                    "hooks": [{"type": "command", "command": hook_cmd}],
-                }
-            ]
-        }
+        pretool.append({
+            "matcher": "Read",
+            "hooks": [{"type": "command", "command": read_cmd}],
+        })
+    if enforce_grep:
+        grep_cmd = f"python3 {_grep_hook_path()}"
+        pretool.append({
+            "matcher": "Grep",
+            "hooks": [{"type": "command", "command": grep_cmd}],
+        })
+    settings: dict = {"hooks": {"PreToolUse": pretool} if pretool else {}}
     settings_path.write_text(json.dumps(settings, indent=2))
     return settings_path
 

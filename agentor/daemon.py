@@ -56,6 +56,10 @@ class Daemon:
         self.paused: bool = False
         self._heartbeat_last: float = 0.0
         self._heartbeat_dispatched: int = 0
+        # Epoch set when run() starts; used as the "since-daemon-start" cutoff
+        # for the dashboard token-usage panel. Zero means the loop has not
+        # been entered yet (tests constructing a bare Daemon).
+        self.started_at: float = 0.0
 
     #: Wall-clock seconds of idle before a heartbeat log line fires. Class-
     #: level so tests can shrink it without patching time.
@@ -235,6 +239,7 @@ class Daemon:
         signal.signal(signal.SIGTERM, handler)
 
     def run(self) -> DaemonStats:
+        self.started_at = time.time()
         if self.install_signals:
             self._install_signal_handlers()
         rec = recover_on_startup(self.config, self.store)
