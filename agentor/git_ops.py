@@ -140,6 +140,66 @@ def fast_forward_to_base(
     return False, (cp.stdout + cp.stderr).strip() or "ff-only refused"
 
 
+def advance_user_checkout(
+    repo: Path, base_branch: str, expected_sha: str, new_sha: str,
+) -> str | None:
+    """Fast-forward the user's primary checkout at `repo` to `new_sha`
+    after the base branch ref has already been CAS-advanced by the caller.
+    Returns None on success (including the already-at-tip no-op) and a
+    short reason string on skip, so the caller can surface it to the
+    operator without any transition being fatal.
+
+    Key subtlety: the caller has already done `update-ref
+    refs/heads/<base> new_sha`, so HEAD (a symbolic ref) already resolves
+    to `new_sha` — but the index and working tree still reflect
+    `expected_sha`'s tree. That means `git status --porcelain` and
+    `git diff HEAD` both misreport the phantom-reversion as "user dirt";
+    the guards here compare to `expected_sha` instead. For the same
+    reason the advance itself goes via `read-tree -u -m` (not `merge
+    --ff-only`, which sees HEAD already at new_sha and no-ops).
+
+    Safety gates (any one skips the advance):
+      - checkout not on `base_branch` (feature branch / detached HEAD);
+      - index differs from `expected_sha`'s tree (user staged work);
+      - working tree differs from `expected_sha`'s tree (user edited
+        tracked files);
+      - untracked files present that would be clobbered by the advance.
+
+    The ref has already advanced, so a skip here leaves the repository
+    in a valid state — the user just sees the existing "behind" status
+    until they clean up."""
+    if new_sha == expected_sha:
+        return None
+    current = current_branch(repo)
+    if current != base_branch:
+        return f"checkout on {current}"
+    # Compare index and working tree to expected_sha (the pre-merge tree),
+    # not to HEAD — HEAD already moved and would produce false positives.
+    idx = run(
+        repo, "diff", "--cached", "--quiet", expected_sha, check=False,
+    ).returncode
+    wt = run(
+        repo, "diff", "--quiet", expected_sha, check=False,
+    ).returncode
+    if idx != 0 or wt != 0:
+        return "dirty worktree"
+    untracked = run(
+        repo, "ls-files", "--others", "--exclude-standard", check=False,
+    ).stdout.strip()
+    if untracked:
+        return "dirty worktree"
+    # `read-tree -u -m expected new` applies the expected→new delta to
+    # the index and working tree. With the guards above satisfied, this
+    # is a pure fast-forward and cannot conflict.
+    cp = run(repo, "read-tree", "-u", "-m", expected_sha, new_sha,
+             check=False)
+    if cp.returncode != 0:
+        tail = (cp.stderr or cp.stdout).strip().splitlines()
+        msg = tail[-1] if tail else "unknown error"
+        return f"ff-only refused: {msg}"
+    return None
+
+
 def merge_feature_into_base(
     repo: Path, feature_branch: str, base_branch: str, message: str,
     tmp_root: Path, mode: str = "merge",

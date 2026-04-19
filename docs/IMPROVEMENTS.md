@@ -46,3 +46,7 @@ the current task's scope.
   fix tears down and recreates `edit_win` / `frame` at the new dims so the
   overlay re-centres. Scope kept to getch-based mode loops for the
   top-line-hidden task.
+- `tests/test_dashboard_resize.py` has two unused-import F401 ruff errors
+  (`SimpleNamespace` on line 9, `ItemStatus` on line 174) that predate the
+  fast-forward-user-checkout task. Add to the existing `tests/test_config.py`
+  F401 follow-up so CI's ruff gate is audited in one sweep.

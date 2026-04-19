@@ -46,6 +46,30 @@ _AUTO_RESOLVE_NOTE = (
 )
 
 
+def _advance_user_checkout_after_merge(
+    config: Config, repo: Path, pre_sha: str, new_sha: str,
+    p: ProgressCb,
+) -> str:
+    """Fast-forward the user's primary checkout to the post-merge base tip.
+    The base ref has already been CAS-advanced, so any skip here is
+    non-fatal — the operator just sees "behind" state in `git status`.
+
+    Returns a short suffix to append to the MERGED transition note:
+      ""                               — config gate disabled
+      ", checkout advanced"            — success
+      ", checkout skipped: <reason>"   — guard tripped"""
+    if not config.git.advance_user_checkout:
+        return ""
+    reason = git_ops.advance_user_checkout(
+        repo, config.git.base_branch, pre_sha, new_sha,
+    )
+    if reason is None:
+        p(f"advanced {config.git.base_branch} checkout to {new_sha[:8]}")
+        return ", checkout advanced"
+    p(f"checkout not advanced — {reason}")
+    return f", checkout skipped: {reason}"
+
+
 def _build_conflict_summary(
     item: StoredItem, mode: str, base: str, raw: str, *, retry: bool = False,
 ) -> str:
@@ -114,6 +138,9 @@ def approve_and_commit(
     mode = config.git.merge_mode
     verb = "rebasing onto" if mode == "rebase" else "merging into"
     with _INTEGRATION_LOCK:
+        pre_sha = git_ops.run(
+            repo, "rev-parse", f"refs/heads/{config.git.base_branch}",
+        ).stdout.strip()
         p(f"{verb} {config.git.base_branch}")
         merge_sha, conflict = git_ops.merge_feature_into_base(
             repo, item.branch, config.git.base_branch,
@@ -145,13 +172,16 @@ def approve_and_commit(
             return sha
 
         assert merge_sha is not None
+        checkout_suffix = _advance_user_checkout_after_merge(
+            config, repo, pre_sha, merge_sha, p,
+        )
         p("cleaning up worktree and branch")
         git_ops.worktree_remove(repo, wt, force=False)
         git_ops.branch_delete(repo, item.branch, force=True)
         store.transition(
             item.id, ItemStatus.MERGED,
             note=f"{note_prefix} {sha[:8]}, {mode}d {merge_sha[:8]} into "
-                 f"{config.git.base_branch}",
+                 f"{config.git.base_branch}{checkout_suffix}",
         )
         return sha
 
@@ -188,6 +218,9 @@ def retry_merge(
     mode = config.git.merge_mode
     verb = "rebasing onto" if mode == "rebase" else "merging into"
     with _INTEGRATION_LOCK:
+        pre_sha = git_ops.run(
+            repo, "rev-parse", f"refs/heads/{config.git.base_branch}",
+        ).stdout.strip()
         p(f"{verb} {config.git.base_branch} (retry)")
         merge_sha, conflict = git_ops.merge_feature_into_base(
             repo, item.branch, config.git.base_branch,
@@ -207,13 +240,17 @@ def retry_merge(
             return False, f"still conflicted: {conflict.splitlines()[0] if conflict else '?'}"
 
         assert merge_sha is not None
+        checkout_suffix = _advance_user_checkout_after_merge(
+            config, repo, pre_sha, merge_sha, p,
+        )
         p("cleaning up worktree and branch")
         git_ops.worktree_remove(repo, wt, force=False)
         git_ops.branch_delete(repo, item.branch, force=True)
         store.transition(
             item.id, ItemStatus.MERGED,
             last_error=None,
-            note=f"resolved — {mode}d {merge_sha[:8]} into {config.git.base_branch}",
+            note=f"resolved — {mode}d {merge_sha[:8]} into "
+                 f"{config.git.base_branch}{checkout_suffix}",
         )
         return True, f"{mode}d {merge_sha[:8]} into {config.git.base_branch}"
 
