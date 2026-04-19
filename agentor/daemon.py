@@ -249,6 +249,9 @@ class Daemon:
         if rec.auto_recovered:
             self.log(f"auto-recovered {len(rec.auto_recovered)} items "
                      f"with benign last_error (shutdown/cap/stale session)")
+        if rec.stale_sessions:
+            self.log(f"auto-recovered {len(rec.stale_sessions)} items "
+                     f"with stale claude session")
         if rec.resumable:
             # Resumable items are now demoted to QUEUED by recovery; the
             # normal dispatch loop claims them when a pool slot opens, and

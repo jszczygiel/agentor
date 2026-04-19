@@ -1,4 +1,5 @@
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -6,6 +7,19 @@ from . import git_ops
 from .config import Config
 from .models import ItemStatus
 from .store import Store, StoredItem
+
+
+# Substring (lowercased) identifying a Claude CLI failure caused by a
+# resume against an expired/missing session. Matched against the most
+# recent `failures` row's `error` field — the runtime `_error_signature`
+# strips digits but leaves the surrounding words intact, so the same
+# substring matches both raw error and signature forms.
+_DEAD_SESSION_NEEDLE = "no conversation found with session id"
+
+# Marker placed on `last_error` when the recovery sweep demotes a stale
+# session. Operators should see it for one tick to understand why the
+# item restarted; the next sweep clears it via `_AUTO_RECOVERABLE_PATTERNS`.
+_STALE_SESSION_MARKER = "session expired; restarting plan"
 
 
 # Known-benign last_error patterns. An item carrying any of these is safe to
@@ -36,6 +50,9 @@ _AUTO_RECOVERABLE_PATTERNS = (
     "already exists",
     "is already checked out",
     "already used by worktree",
+    # Single-tick marker the recovery sweep itself plants when it demotes
+    # a stale session — clears on the next startup so it doesn't linger.
+    _STALE_SESSION_MARKER,
 )
 
 
@@ -51,6 +68,38 @@ class RecoveryResult:
     requeued: list[str]   # items reset to QUEUED — must start fresh
     resumable: list[StoredItem]  # WORKING items with session_id + live worktree
     auto_recovered: list[str] = field(default_factory=list)  # errors cleared
+    # WORKING items whose persisted session_id is presumed dead (age over
+    # `agent.session_max_age_hours` or a prior failure row matching the
+    # claude "No conversation found …" signature). Demoted to QUEUED with
+    # session_id cleared so the next dispatch starts a fresh plan run
+    # instead of paying for a doomed `claude --resume`.
+    stale_sessions: list[str] = field(default_factory=list)
+
+
+def _has_dead_session_failure(store: Store, item_id: str) -> bool:
+    """True when the item's most recent failure row matches the dead-
+    session signature. We only inspect the latest failure to avoid
+    re-acting on errors the operator has already moved past."""
+    rows = store.list_failures(item_id, limit=1)
+    if not rows:
+        return False
+    last = rows[0]
+    err = (last.get("error") or "").lower()
+    sig = (last.get("error_sig") or "").lower()
+    needle = _DEAD_SESSION_NEEDLE
+    sig_needle = needle.replace(" ", "")
+    return needle in err or sig_needle in sig
+
+
+def _session_age_seconds(store: Store, item: StoredItem, now: float) -> float:
+    """Age of the WORKING claim, used as a proxy for session age. Falls
+    back to `items.updated_at` when no WORKING transition row exists
+    (shouldn't happen for items that hold a session_id, but the fallback
+    keeps the sweep robust against partial DB state)."""
+    at = store.latest_transition_at(item.id, ItemStatus.WORKING)
+    if at is None:
+        at = item.updated_at
+    return max(0.0, now - at)
 
 
 def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
@@ -77,9 +126,31 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
     stuck = store.list_by_status(ItemStatus.WORKING)
     requeued: list[str] = []
     resumable: list[StoredItem] = []
+    stale_sessions: list[str] = []
     repo = config.project_root
+    now = time.time()
+    max_age_seconds = max(0.0, float(config.agent.session_max_age_hours)) * 3600.0
     for item in stuck:
         wt = Path(item.worktree_path) if item.worktree_path else None
+        # Stale-session check runs before the resumable check. An item with
+        # a session_id whose age exceeds the configured threshold, or whose
+        # last failure was a dead-session error, is demoted to a fresh plan
+        # run — `claude --resume` against an expired session always exits 1
+        # and burns ~$0.50 per attempt.
+        if item.session_id:
+            age = _session_age_seconds(store, item, now)
+            stale = (max_age_seconds > 0 and age > max_age_seconds)
+            stale = stale or _has_dead_session_failure(store, item.id)
+            if stale:
+                store.transition(
+                    item.id, ItemStatus.QUEUED,
+                    attempts=0,
+                    session_id=None, worktree_path=None, branch=None,
+                    last_error=_STALE_SESSION_MARKER,
+                    note="stale session demoted; restarting plan",
+                )
+                stale_sessions.append(item.id)
+                continue
         can_resume = bool(item.session_id and wt and wt.exists())
         if can_resume:
             store.transition(
@@ -119,8 +190,16 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
         ItemStatus.AWAITING_PLAN_REVIEW, ItemStatus.AWAITING_REVIEW,
         ItemStatus.DEFERRED, ItemStatus.REJECTED,
     ]
+    # Items demoted by the stale-session branch live in QUEUED with the
+    # _STALE_SESSION_MARKER on `last_error`. We deliberately leave that
+    # marker visible for the current tick so operators can see why the
+    # item restarted; the *next* startup sweep treats the marker as
+    # benign and clears it.
+    just_demoted = set(stale_sessions)
     for st in active_states:
         for item in store.list_by_status(st):
+            if item.id in just_demoted:
+                continue
             if _is_auto_recoverable_error(item.last_error):
                 store.clear_error_and_reset_attempts(item.id)
                 auto_recovered.append(item.id)
@@ -132,4 +211,5 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
     return RecoveryResult(
         requeued=requeued, resumable=resumable,
         auto_recovered=auto_recovered,
+        stale_sessions=stale_sessions,
     )

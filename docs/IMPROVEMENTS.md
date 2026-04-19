@@ -5,6 +5,13 @@ the current task's scope.
 
 ## Open
 
+- Stale-session demotion in `recovery.py` clears `worktree_path` on the item
+  but leaves the actual worktree directory on disk. `claim_next_queued` will
+  overwrite the path with a fresh slug on re-dispatch, so the old worktree
+  lingers until external cleanup (or the next conflicting `git worktree add`).
+  Consider calling `git_ops.worktree_remove` from the stale-session branch the
+  same way the dead-session-revert path does, gated on the worktree dir
+  existing. Scope kept narrow for the original task.
 - `CodexRunner` does not yet wire `CheckpointEmitter`. Codex uses its own
   JSONL event shape and `thread_id` resume semantics — the emitter module
   is runner-agnostic so a follow-up PR can gate on `_CodexStreamState`
