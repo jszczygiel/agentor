@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -9,6 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, TypeVar
 
 from . import git_ops
 from .config import Config
@@ -16,6 +18,8 @@ from .models import ItemStatus
 from .resume_primer import build_primer
 from .slug import slugify
 from .store import Store, StoredItem
+
+T = TypeVar("T")
 
 
 class ProcRegistry:
@@ -141,6 +145,121 @@ def _error_signature(msg: str) -> str:
     'claude killed: max_turns=30 hit (30 turns)' →
     'claude killed: max_turns= hit'."""
     return _ERR_NOISE.sub("", (msg or "").lower())[:80]
+
+
+# Exponential-backoff cadence for transient CLI failures. Module-level so
+# tests can monkey-patch. `_sleep` is looked up at call time so patching
+# `runner._sleep` works end-to-end.
+_RETRY_DELAYS: tuple[float, ...] = (2.0, 8.0, 30.0)
+_RETRY_JITTER: float = 0.25
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+_TRANSIENT_NEEDLES = (
+    "429", "rate limit", "rate_limit",
+    "500 ", "502 ", "503 ", "504 ",
+    "bad gateway", "gateway timeout",
+    "service unavailable", "internal server error",
+    "overloaded",
+    "connection reset", "connection refused", "connection aborted",
+    "temporary failure in name resolution",
+    "name or service not known", "nodename nor servname",
+    "network is unreachable",
+    "eof occurred in violation",
+    "read timed out",
+)
+
+
+# Strings that look transient at a glance but are actually fatal and should
+# fail fast so the operator sees them. Auth/quota/credit won't recover on
+# retry; max_turns / max_cost_usd are deliberate runaway-guard kills;
+# syntax errors in the prompt/template won't self-heal.
+_FATAL_NEEDLES = (
+    "invalid api key", "unauthorized", "forbidden",
+    "quota", "credit",
+    "syntaxerror", "syntax error",
+    "max_turns=", "max_cost_usd=",
+)
+
+
+def _is_transient_error(
+    msg: str, elapsed: float, timeout_seconds: float,
+) -> bool:
+    """True if `msg` looks like a momentary hiccup worth retrying in-dispatch
+    (HTTP 429/5xx, TCP/DNS blips, or a `timed out` when elapsed was well
+    under the configured budget — i.e. a subprocess.TimeoutExpired-style
+    stall, not a genuine hang). Returns False for shutdown / dead-session /
+    infrastructure (dedicated paths), auth/quota/syntax/runaway-cap fatals,
+    and real hangs (timeout with elapsed ≥ 90% of the budget)."""
+    low = (msg or "").lower()
+    if not low:
+        return False
+    if (_is_shutdown_error(low) or _is_dead_session_error(low)
+            or _is_infrastructure_error(low)):
+        return False
+    if any(n in low for n in _FATAL_NEEDLES):
+        return False
+    if "timed out" in low or "timeout" in low:
+        if timeout_seconds > 0 and elapsed >= 0.9 * timeout_seconds:
+            return False
+        return True
+    return any(n in low for n in _TRANSIENT_NEEDLES)
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Return the sleep duration before retry number `attempt` (0-indexed).
+    Indexes past the table clamp to the last value."""
+    idx = min(attempt, len(_RETRY_DELAYS) - 1)
+    base = _RETRY_DELAYS[idx]
+    return base + random.uniform(0.0, base * _RETRY_JITTER)
+
+
+def _log_retry(
+    transcript_path: Path, attempt: int, budget: int, delay: float,
+    error: str,
+) -> None:
+    """Append a RETRY marker to the per-item transcript so operators can see
+    why a run took longer than expected. Best-effort — a write failure must
+    not derail the retry."""
+    try:
+        with transcript_path.open("a") as fh:
+            fh.write(
+                f"\nRETRY {attempt}/{budget} in {delay:.1f}s: "
+                f"{error.strip()[-500:]}\n"
+            )
+    except Exception:
+        pass
+
+
+def _retry_transient(
+    invoke: Callable[[], T], *,
+    transcript_path: Path, retries: int, timeout_seconds: int,
+) -> T:
+    """Call `invoke()`, retrying up to `retries` times on transient errors
+    with exponential backoff. Non-transient errors and budget-exhausted
+    retries propagate unchanged. Each backoff is written to `transcript_path`
+    so operators can see why a run took longer than expected."""
+    if retries <= 0:
+        return invoke()
+    for attempt in range(retries + 1):
+        t0 = time.monotonic()
+        try:
+            return invoke()
+        except RuntimeError as e:
+            elapsed = time.monotonic() - t0
+            if attempt >= retries:
+                raise
+            if not _is_transient_error(str(e), elapsed, timeout_seconds):
+                raise
+            delay = _backoff_delay(attempt)
+            _log_retry(
+                transcript_path, attempt + 1, retries, delay, str(e),
+            )
+            _sleep(delay)
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 @dataclass
@@ -481,7 +600,11 @@ def _run_stream_json_subprocess(
 
     stdout_buf: list[str] = []
     cap_reason: str | None = None
-    transcript_path.write_text(f"args: {args}\n\nstdout:\n")
+    # Append mode so RETRY markers written by the surrounding retry loop
+    # are preserved across attempts; _invoke_claude/_invoke_codex truncate
+    # the file once before the first attempt.
+    with transcript_path.open("a") as fh:
+        fh.write(f"args: {args}\n\nstdout:\n")
     try:
         for line in iter(p.stdout.readline, ""):
             stdout_buf.append(line)
@@ -669,14 +792,26 @@ class ClaudeRunner(Runner):
         phase_tag = "execute" if had_session else "plan"
         transcript_path = self._transcript_path(item, phase_tag)
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        # Clear once before the retry loop so the first attempt's log isn't
+        # contaminated by a prior run; retry attempts append so RETRY markers
+        # survive.
+        transcript_path.write_text("")
 
         streaming = "stream-json" in args
-        if streaming:
-            return self._invoke_claude_streaming(
-                item, args, worktree, transcript_path, phase_tag,
+
+        def invoke() -> tuple[str, str]:
+            if streaming:
+                return self._invoke_claude_streaming(
+                    item, args, worktree, transcript_path, phase_tag,
+                )
+            return self._invoke_claude_blocking(
+                item, args, worktree, transcript_path,
             )
-        return self._invoke_claude_blocking(
-            item, args, worktree, transcript_path,
+
+        return _retry_transient(
+            invoke, transcript_path=transcript_path,
+            retries=self.config.agent.transient_retries,
+            timeout_seconds=self.config.agent.timeout_seconds,
         )
 
     def _invoke_claude_blocking(
@@ -710,11 +845,12 @@ class ClaudeRunner(Runner):
                 stdout, stderr = p.communicate()
                 e_stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
                 e_stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
-                transcript_path.write_text(
-                    f"TIMEOUT after {self.config.agent.timeout_seconds}s\n\n"
-                    f"stdout:\n{stdout or e_stdout}\n\n"
-                    f"stderr:\n{stderr or e_stderr}\n"
-                )
+                with transcript_path.open("a") as fh:
+                    fh.write(
+                        f"TIMEOUT after {self.config.agent.timeout_seconds}s\n\n"
+                        f"stdout:\n{stdout or e_stdout}\n\n"
+                        f"stderr:\n{stderr or e_stderr}\n"
+                    )
                 raise RuntimeError(
                     f"claude timed out after {self.config.agent.timeout_seconds}s"
                 )
@@ -722,11 +858,12 @@ class ClaudeRunner(Runner):
             if self.proc_registry is not None:
                 self.proc_registry.unregister(item.id)
 
-        transcript_path.write_text(
-            f"exit: {p.returncode}\n"
-            f"args: {args}\n\n"
-            f"stdout:\n{stdout}\n\nstderr:\n{stderr}\n"
-        )
+        with transcript_path.open("a") as fh:
+            fh.write(
+                f"exit: {p.returncode}\n"
+                f"args: {args}\n\n"
+                f"stdout:\n{stdout}\n\nstderr:\n{stderr}\n"
+            )
         if self.stop_event is not None and self.stop_event.is_set():
             raise RuntimeError("claude killed: agentor shutdown")
         if p.returncode != 0:
@@ -891,9 +1028,24 @@ class CodexRunner(Runner):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists():
             output_path.unlink()
-        args = self._codex_args(item, prompt, output_path)
-        return self._invoke_codex_jsonl(
-            item, args, worktree, transcript_path, output_path, phase_tag,
+        # Clear transcript once before the retry loop; RETRY markers and
+        # per-attempt logs are appended so the full history survives.
+        transcript_path.write_text("")
+
+        def invoke() -> tuple[str, str]:
+            # Re-fetch the item each attempt so a thread_id persisted by a
+            # prior failed attempt flips us onto the resume template (and we
+            # don't orphan the codex thread created mid-stream).
+            fresh = self.store.get(item.id) or item
+            args = self._codex_args(fresh, prompt, output_path)
+            return self._invoke_codex_jsonl(
+                fresh, args, worktree, transcript_path, output_path, phase_tag,
+            )
+
+        return _retry_transient(
+            invoke, transcript_path=transcript_path,
+            retries=self.config.agent.transient_retries,
+            timeout_seconds=self.config.agent.timeout_seconds,
         )
 
     def _codex_args(
