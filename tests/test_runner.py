@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from agentor import git_ops
 from agentor.committer import (approve_and_commit, approve_plan, defer,
                                 reject, restore_deferred, retry)
 from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
@@ -564,6 +565,70 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"here is the plan",
         prompts = prompt_log.read_text()
         _, _, exec_block = prompts.partition("\n---\n")
         self.assertNotIn("## Prior run", exec_block)
+
+    def test_force_execute_item_skips_plan_phase(self):
+        """An item resubmitted with `force_execute=True` (auto-resolve chain)
+        carries `result_json.phase == "plan"` so the runner routes straight
+        to `_do_execute` on the next dispatch — no plan subprocess, no
+        `.plan.log`. Verified end-to-end: one fake-claude invocation, one
+        `.execute.log`, prompt built from the execute template."""
+        bin_dir = Path(self.td.name) / "bin"
+        prompt_log = Path(self.td.name) / "prompts.log"
+        _write_fake_claude(
+            bin_dir, f'printf "%s\\n---\\n" "$2" >> "{prompt_log}"\n',
+        )
+        cfg = Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                runner="claude", pool_size=1, max_attempts=1,
+                command=[str(bin_dir / "claude"), "-p", "{prompt}"],
+                plan_prompt_template="PLAN: {title}",
+                execute_prompt_template="EXEC: {title}\nplan={plan}",
+                timeout_seconds=10,
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        # Create the worktree up-front so the runner's resume branch fires
+        # (mirrors the post-conflict state: worktree + branch + session live).
+        git_ops.worktree_add(self.root, wt, br, "main")
+        # Simulate the state produced by
+        # `resubmit_conflicted(..., force_execute=True)`: session_id live,
+        # result_json rewritten to phase=plan so the two-phase dispatch
+        # picks the _do_execute branch.
+        self.store.transition(
+            item.id, ItemStatus.QUEUED,
+            session_id="sess-force",
+            result_json='{"phase":"plan","plan":"resolve the merge conflict"}',
+        )
+        claimed = self.store.claim_next_queued(str(wt), br)
+        runner = make_runner(cfg, self.store)
+        result = runner.run(claimed)
+
+        self.assertIsNone(result.error, msg=result.error)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_REVIEW)
+
+        transcripts_dir = self.root / ".agentor" / "transcripts"
+        plan_log = transcripts_dir / f"{claimed.id}.plan.log"
+        exec_log = transcripts_dir / f"{claimed.id}.execute.log"
+        self.assertFalse(plan_log.exists(),
+                         "force-execute path must not produce a plan transcript")
+        self.assertTrue(exec_log.exists(),
+                        "execute phase must write its own transcript")
+
+        prompts = prompt_log.read_text()
+        # Fake claude was invoked exactly once.
+        self.assertEqual(prompts.count("\n---\n"), 1,
+                         f"expected one invocation, got: {prompts!r}")
+        self.assertIn("EXEC: Add hello file", prompts)
+        self.assertIn("plan=resolve the merge conflict", prompts)
+        self.assertNotIn("PLAN: Add hello file", prompts)
 
     def test_claude_runner_timeout(self):
         # sleep > timeout

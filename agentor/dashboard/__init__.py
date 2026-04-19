@@ -11,6 +11,7 @@ from .render import (
     _init_colors,
     _render,
     _set_terminal_title,
+    _show_help,
 )
 from .modes import (
     _deferred_mode,
@@ -133,6 +134,9 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
 
             if k == "q":
                 return
+            if ch == ord("?"):
+                _show_help(stdscr)
+                continue
             if k == "r":
                 _review_mode(stdscr, cfg, store, daemon)
             elif k == "n":

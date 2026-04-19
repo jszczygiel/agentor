@@ -312,6 +312,23 @@ def _fmt_token_compact(windows: dict) -> str:
     return f"tok sess={_fmt_tokens(sess)}  wk={_fmt_tokens(wk)}"
 
 
+def _fmt_token_line_mid(label: str, totals: dict) -> str:
+    """Mid-tier (60–79 col) compact form. Drops the cache columns and
+    leads with Σ so the most operator-relevant number isn't clipped."""
+    return (f"{label:<8}"
+            f"Σ {_fmt_tokens(int(totals.get('total', 0))):>6}  "
+            f"in {_fmt_tokens(int(totals.get('input', 0))):>6}  "
+            f"out {_fmt_tokens(int(totals.get('output', 0))):>6}")
+
+
+def _fmt_token_line_narrow(label: str, totals: dict) -> str:
+    """Narrow-tier (<60 col) form. Label is truncated to 4 chars and
+    only Σ survives — the other fields live in the inspect view."""
+    short = label[:4]
+    return (f"{short:<5}"
+            f"Σ {_fmt_tokens(int(totals.get('total', 0))):>6}")
+
+
 def _build_commit_message(item: StoredItem) -> str:
     """Commit message sourced from the agent's own summary, not the user.
     Falls back to the item title if no summary is available."""

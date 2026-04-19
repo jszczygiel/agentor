@@ -1,5 +1,7 @@
+import curses
 import json
 import unittest
+from collections import deque
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -8,12 +10,21 @@ from unittest.mock import patch
 from agentor.dashboard.formatters import _token_windows_invalidate
 from agentor.dashboard.render import (
     ACTIONS,
+    ACTIONS_MID,
+    ACTIONS_NARROW,
+    ACTIONS_WIDE,
+    _build_alert_banner,
+    _build_status_line,
+    _layout_tier,
     _render,
     _render_table,
     _render_token_panel,
+    _state_glyph,
+    _table_header,
+    _table_row,
 )
 from agentor.models import Item, ItemStatus
-from agentor.store import Store
+from agentor.store import Store, StoredItem
 
 
 class _FakeStdscr:
@@ -47,15 +58,296 @@ class TestActionsHint(unittest.TestCase):
             self.assertIn(key, ACTIONS)
 
     def test_removed_pickup_mode_actions_gone(self):
-        # Regression guard: pickup walk (`p`) and pickup-mode toggle (`m`)
-        # were removed when auto-dispatch became the only mode.
         self.assertNotIn("[p]ickup", ACTIONS)
         self.assertNotIn("[m]ode", ACTIONS)
 
     def test_double_space_separators(self):
-        # single-space separators between words would compress the layout
-        # and mislead operators about which tokens are grouped.
         self.assertNotIn("] [", ACTIONS)
+
+
+class TestLayoutTier(unittest.TestCase):
+    def test_thresholds(self):
+        self.assertEqual(_layout_tier(40), "narrow")
+        self.assertEqual(_layout_tier(59), "narrow")
+        self.assertEqual(_layout_tier(60), "mid")
+        self.assertEqual(_layout_tier(79), "mid")
+        self.assertEqual(_layout_tier(80), "wide")
+        self.assertEqual(_layout_tier(120), "wide")
+
+    def test_actions_mid_fits_60(self):
+        # Mid-tier hint must fit the bottom of the mid range (60 cols).
+        # The render prepends one leading space before centering.
+        self.assertLessEqual(len(ACTIONS_MID) + 1, 60)
+
+    def test_actions_narrow_fits_40(self):
+        self.assertLessEqual(len(ACTIONS_NARROW) + 1, 40)
+
+    def test_actions_alias(self):
+        self.assertIs(ACTIONS, ACTIONS_WIDE)
+
+    def test_actions_narrow_points_to_help(self):
+        self.assertIn("?", ACTIONS_NARROW)
+
+
+class TestStateGlyph(unittest.TestCase):
+    def test_all_statuses_mapped(self):
+        for st in ItemStatus:
+            g = _state_glyph(st)
+            self.assertEqual(len(g), 1, f"{st} glyph must be 1 char, got {g!r}")
+
+
+class TestAlertBanner(unittest.TestCase):
+    def test_wide_embeds_message(self):
+        b = _build_alert_banner("git push failed", 80)
+        self.assertIn("git push failed", b)
+        self.assertIn("[u]", b)
+
+    def test_long_message_truncated(self):
+        b = _build_alert_banner("x" * 200, 40)
+        self.assertLessEqual(len(b), 40)
+
+    def test_very_narrow_drops_message(self):
+        # At w<33 the wrapper text alone eats the budget; the action
+        # prompt must still survive without raising.
+        b = _build_alert_banner("some-long-error-message-text", 20)
+        self.assertIn("[u]", b)
+        self.assertLessEqual(len(b), 20)
+
+    def test_empty_alert_safe(self):
+        b = _build_alert_banner("", 60)
+        self.assertIn("[u]", b)
+
+
+class TestStatusLineTier(unittest.TestCase):
+    def _stats(self):
+        class S:
+            completed = 12
+        return S()
+
+    def _cfg(self):
+        class A:
+            runner = "claude"
+            pool_size = 3
+        class C:
+            agent = A()
+        return C()
+
+    def _counts(self):
+        return {st: 0 for st in ItemStatus} | {
+            ItemStatus.QUEUED: 2,
+            ItemStatus.WORKING: 1,
+            ItemStatus.AWAITING_REVIEW: 4,
+            ItemStatus.ERRORED: 1,
+        }
+
+    def test_wide_has_full_fields(self):
+        line = _build_status_line("wide", self._cfg(), self._stats(),
+                                  self._counts(), 1)
+        self.assertIn("pool=3", line)
+        self.assertIn("queued=2", line)
+        self.assertIn("rejected=0", line)
+
+    def test_mid_fits_60(self):
+        line = _build_status_line("mid", self._cfg(), self._stats(),
+                                  self._counts(), 1)
+        self.assertLessEqual(len(line), 60)
+        self.assertIn("p=3", line)
+        self.assertIn("R=4", line)
+
+    def test_narrow_fits_40(self):
+        line = _build_status_line("narrow", self._cfg(), self._stats(),
+                                  self._counts(), 1)
+        self.assertLessEqual(len(line), 40)
+        self.assertIn("p=3", line)
+        self.assertIn("R=4", line)
+
+    def test_wide_appends_compact_indicator_when_provided(self):
+        line = _build_status_line(
+            "wide", self._cfg(), self._stats(), self._counts(), 1,
+            token_compact="tok sess=1.2k  wk=3.4M",
+        )
+        self.assertIn("tok sess=1.2k  wk=3.4M", line)
+
+    def test_wide_without_compact_unchanged(self):
+        # Default empty token_compact → no trailing indicator substring.
+        line = _build_status_line("wide", self._cfg(), self._stats(),
+                                  self._counts(), 1)
+        self.assertNotIn("tok sess=", line)
+        self.assertNotIn("wk=", line)
+
+    def test_mid_ignores_compact_indicator(self):
+        # Passing token_compact at mid must not push line past the 60-col
+        # budget — mid drops the indicator entirely.
+        line = _build_status_line(
+            "mid", self._cfg(), self._stats(), self._counts(), 1,
+            token_compact="tok sess=1.2k  wk=3.4M",
+        )
+        self.assertLessEqual(len(line), 60)
+        self.assertNotIn("tok sess=", line)
+
+    def test_narrow_ignores_compact_indicator(self):
+        line = _build_status_line(
+            "narrow", self._cfg(), self._stats(), self._counts(), 1,
+            token_compact="tok sess=1.2k  wk=3.4M",
+        )
+        self.assertLessEqual(len(line), 40)
+        self.assertNotIn("tok sess=", line)
+
+
+def _make_item(title="hello", src="docs/backlog/foo.md") -> StoredItem:
+    return StoredItem(
+        id="abc12345", title=title, body="", source_file=src,
+        source_line=1, tags={}, status=ItemStatus.WORKING,
+        worktree_path=None, branch=None, attempts=0, last_error=None,
+        feedback=None, result_json=None, session_id=None,
+        agentor_version=None, priority=0, created_at=0.0, updated_at=0.0,
+    )
+
+
+class TestTableRowFits(unittest.TestCase):
+    def test_row_fits_at_each_tier(self):
+        item = _make_item(title="a fairly long backlog item title that should trim")
+        for w in (40, 60, 80, 120):
+            tier = _layout_tier(w)
+            row = _table_row(tier, item, ItemStatus.WORKING,
+                             "01:23", "45%", False, w)
+            self.assertLessEqual(
+                len(row), w,
+                f"tier={tier} w={w} row={row!r} len={len(row)}"
+            )
+
+    def test_header_fits_at_each_tier(self):
+        for w in (40, 60, 80, 120):
+            tier = _layout_tier(w)
+            header = _table_header(tier)
+            self.assertLessEqual(
+                len(header), w,
+                f"tier={tier} w={w} header={header!r} len={len(header)}"
+            )
+
+    def test_narrow_drops_source(self):
+        header = _table_header("narrow")
+        self.assertNotIn("SOURCE", header)
+        self.assertNotIn("STATE", header)  # narrow uses a 1-char glyph
+
+    def test_mid_drops_source_keeps_state(self):
+        header = _table_header("mid")
+        self.assertNotIn("SOURCE", header)
+        self.assertIn("STATE", header)
+
+    def test_wide_keeps_everything(self):
+        header = _table_header("wide")
+        self.assertIn("SOURCE", header)
+        self.assertIn("STATE", header)
+
+    def test_error_marker_in_narrow(self):
+        item = _make_item()
+        row = _table_row("narrow", item, ItemStatus.ERRORED,
+                         "—", "—", True, 40)
+        # Marker `!` should survive the narrow layout.
+        self.assertTrue(row.strip().split()[1].startswith("!"),
+                        f"marker missing in {row!r}")
+
+
+class _StubScreen:
+    """Minimal curses-like stdscr for render tests. Captures every line
+    written via addnstr/addstr along with the width clip, so the test can
+    assert nothing exceeds the reported terminal width."""
+
+    def __init__(self, h: int, w: int) -> None:
+        self.h = h
+        self.w = w
+        self.lines: list[str] = []
+
+    def getmaxyx(self):
+        return (self.h, self.w)
+
+    def erase(self):
+        self.lines.clear()
+
+    def refresh(self):
+        pass
+
+    def addnstr(self, y, x, s, n, attr=0):
+        # Mimic curses: clip at n characters. x is an offset on the row.
+        clipped = s[: max(0, n - x)]
+        self.lines.append(clipped)
+
+    # ignore unused methods
+    def nodelay(self, *a, **k): pass
+    def timeout(self, *a, **k): pass
+    def getch(self): return -1
+
+
+class _FakeStats:
+    completed = 0
+
+
+class _FakeAgent:
+    runner = "claude"
+    pool_size = 1
+    context_window = 200_000
+
+
+class _FakeCfg:
+    agent = _FakeAgent()
+    project_name = "test"
+
+
+class _FakeDaemon:
+    def __init__(self, alert: str | None = None) -> None:
+        self.system_alert = alert
+        self.workers: list = []
+        self.stats = _FakeStats()
+        # Main added the token-usage panel; the renderer reads
+        # `daemon.started_at` to bound the "session" window. 0.0 is the
+        # sentinel the real daemon uses pre-main-loop.
+        self.started_at = 0.0
+
+
+class _FakeStore:
+    def count_by_status(self, st):
+        return 0
+
+    def list_by_status(self, st):
+        return []
+
+    def latest_transition_at(self, *a, **k):
+        return None
+
+    def aggregate_token_usage(self, *, since=None):
+        # Returned shape matches Store.aggregate_token_usage; zeros keep
+        # the token panel renderable without a real SQLite backend.
+        return {"input": 0, "output": 0, "cache_read": 0,
+                "cache_create": 0, "total": 0}
+
+
+class TestRenderFitsWidth(unittest.TestCase):
+    def _render_all(self, w: int, alert: str | None = None):
+        scr = _StubScreen(24, w)
+        # `_render` reaches for `curses.color_pair` to colour the alert
+        # banner; without `initscr()` that raises. Stub it so we can
+        # exercise the render path headless.
+        with patch.object(curses, "color_pair", return_value=0):
+            _render(scr, _FakeCfg(), _FakeStore(),
+                    _FakeDaemon(alert=alert), deque(), 0)
+        return scr.lines
+
+    def test_no_line_exceeds_width(self):
+        for w in (40, 60, 80, 120):
+            lines = self._render_all(w)
+            for ln in lines:
+                self.assertLessEqual(
+                    len(ln), w,
+                    f"w={w}: line exceeds width: {ln!r}"
+                )
+
+    def test_alert_banner_narrow_no_crash(self):
+        # Regression: the old `w - 30` truncation would produce a
+        # negative slice at w<33 and garble the banner.
+        lines = self._render_all(20, alert="git merge conflict: foo.py")
+        for ln in lines:
+            self.assertLessEqual(len(ln), 20, f"banner overflow: {ln!r}")
 
 
 class TestRenderTokenPanel(unittest.TestCase):
