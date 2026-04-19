@@ -485,5 +485,74 @@ class TestHeartbeatLog(unittest.TestCase):
                           if m.startswith("heartbeat:")])
 
 
+class TestFoldAutoQueueInLoop(unittest.TestCase):
+    """The daemon's main loop calls `maybe_enqueue_fold_item` once per tick
+    after `try_fill_pool`. With enough agent-logs accumulated, a backlog
+    file is created, `scan_once` on the next tick enqueues it, and a
+    queued item runs through the normal dispatch path to AWAITING_REVIEW."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _seed_logs(self, n: int) -> None:
+        d = self.root / "docs" / "agent-logs"
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            (d / f"2026-04-{i:02d}-note.md").write_text("x\n")
+
+    def test_one_tick_creates_and_queues(self):
+        self._seed_logs(10)
+        cfg = Config(
+            project_name="t",
+            project_root=self.root,
+            sources=SourcesConfig(watch=["docs/backlog/*.md"]),
+            parsing=ParsingConfig(mode="frontmatter"),
+            agent=AgentConfig(pool_size=0, fold_threshold=10),
+            git=GitConfig(),
+            review=ReviewConfig(),
+        )
+
+        def factory(c, s):
+            return FakeRunner(c, s, lambda r, i: None)
+
+        logs: list[str] = []
+        d = Daemon(cfg, self.store, factory,
+                   install_signals=False, log=logs.append)
+
+        # Exercise the hook directly — the daemon calls this helper in
+        # its main loop, and wrapping it in the stop_event dance would
+        # drag real git-worktree setup into a unit test.
+        from agentor.fold import maybe_enqueue_fold_item
+        created = maybe_enqueue_fold_item(d.config, d.store)
+        self.assertIsNotNone(created)
+        self.assertTrue(created.exists())
+
+        # scan_once is the next step the real loop takes — it lifts the
+        # new backlog file into a QUEUED row.
+        from agentor.watcher import scan_once
+        result = scan_once(d.config, d.store)
+        self.assertEqual(result.new_items, 1)
+        queued = self.store.list_by_status(ItemStatus.QUEUED)
+        self.assertEqual(len(queued), 1)
+        self.assertTrue(queued[0].title.startswith("Fold agent log lessons"))
+        self.assertEqual(queued[0].tags.get("category"), "meta")
+
+        # Second tick: the guard sees a QUEUED fold item, so no duplicate
+        # file or duplicate row even though the logs directory is still
+        # above threshold.
+        again = maybe_enqueue_fold_item(d.config, d.store)
+        self.assertIsNone(again)
+        scan_once(d.config, d.store)
+        self.assertEqual(
+            len(self.store.list_by_status(ItemStatus.QUEUED)), 1,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
