@@ -10,9 +10,7 @@ from agentor.dashboard.formatters import (
     _ctx_fill_pct,
     _fmt_elapsed,
     _fmt_token_compact,
-    _fmt_token_line,
-    _fmt_token_line_mid,
-    _fmt_token_line_narrow,
+    _fmt_token_row,
     _fmt_tokens,
     _token_breakdown,
     _token_windows,
@@ -181,28 +179,92 @@ class TestTokenBreakdown(unittest.TestCase):
         self.assertEqual(rows[0]["model"], "claude-opus-4-6")
 
 
-class TestFmtTokenLine(unittest.TestCase):
-    def test_contains_all_buckets(self):
-        totals = {
-            "input": 100, "output": 50,
-            "cache_read": 2000, "cache_create": 300,
-            "total": 2450,
-        }
-        line = _fmt_token_line("session", totals)
-        self.assertIn("session", line)
-        self.assertIn("in ", line)
-        self.assertIn("out ", line)
-        self.assertIn("cache_r ", line)
-        self.assertIn("cache_c ", line)
-        # Values rendered via _fmt_tokens — 2000 stays as "2.0k".
-        self.assertIn("2.0k", line)
+class _FakeAgentCfg:
+    def __init__(self, session_token_budget=0, weekly_token_budget=0):
+        self.session_token_budget = session_token_budget
+        self.weekly_token_budget = weekly_token_budget
 
-    def test_zero_totals_render_zeros(self):
-        totals = {"input": 0, "output": 0,
-                  "cache_read": 0, "cache_create": 0, "total": 0}
-        line = _fmt_token_line("today", totals)
-        # All buckets should read 0, not "—".
-        self.assertEqual(line.count("     0"), 5)
+
+class TestFmtTokenRow(unittest.TestCase):
+    """The new one-line token readout replaces the old 4-row panel. Must
+    show session/today/7d totals in a single line, append `(NN%)` suffixes
+    when budgets set (session + 7d only; today has no budget knob), and
+    stay under 50 cols at the narrow tier."""
+
+    def test_wide_line_contains_three_windows_and_totals(self):
+        windows = {
+            "session": {"total": 0},
+            "today": {"total": 11_700_000},
+            "7d": {"total": 174_100_000},
+        }
+        line = _fmt_token_row(windows)
+        self.assertIn("tokens", line)
+        self.assertIn("session 0", line)
+        self.assertIn("today 11.7M", line)
+        self.assertIn("7d 174.1M", line)
+
+    def test_missing_windows_render_zero(self):
+        self.assertEqual(
+            _fmt_token_row({}),
+            "tokens  session 0  today 0  7d 0",
+        )
+
+    def test_wide_no_suffix_when_budgets_zero(self):
+        windows = {"session": {"total": 500_000},
+                   "today": {"total": 100_000},
+                   "7d": {"total": 5_000_000}}
+        cfg = _FakeAgentCfg()
+        line = _fmt_token_row(windows, cfg)
+        self.assertNotIn("%", line)
+
+    def test_wide_pct_suffix_when_budgets_set(self):
+        windows = {"session": {"total": 500_000},
+                   "today": {"total": 100_000},
+                   "7d": {"total": 5_000_000}}
+        cfg = _FakeAgentCfg(
+            session_token_budget=1_000_000,
+            weekly_token_budget=10_000_000,
+        )
+        line = _fmt_token_row(windows, cfg)
+        self.assertIn("session 500.0k (50%)", line)
+        self.assertIn("7d 5.0M (50%)", line)
+        # today has no budget knob — never carries a suffix.
+        self.assertIn("today 100.0k  ", line)
+
+    def test_agent_cfg_none_behaves_like_unconfigured(self):
+        windows = {"session": {"total": 1500},
+                   "today": {"total": 900},
+                   "7d": {"total": 2_300_000}}
+        line = _fmt_token_row(windows, None)
+        self.assertEqual(
+            line,
+            "tokens  session 1.5k  today 900  7d 2.3M",
+        )
+
+    def test_narrow_uses_short_labels(self):
+        windows = {"session": {"total": 1500},
+                   "today": {"total": 900},
+                   "7d": {"total": 2_300_000}}
+        line = _fmt_token_row(windows, None, tier="narrow")
+        self.assertIn("tok", line)
+        self.assertIn("s=1.5k", line)
+        self.assertIn("t=900", line)
+        self.assertIn("w=2.3M", line)
+        self.assertNotIn("session", line)
+
+    def test_narrow_fits_50_cols_with_m_scale_totals(self):
+        # M-scale everywhere plus session + weekly pct suffixes (the
+        # widest shape the formatter emits) must still fit a 50-col
+        # terminal with the leading space the renderer prepends.
+        windows = {"session": {"total": 174_100_000},
+                   "today": {"total": 11_700_000},
+                   "7d": {"total": 174_100_000}}
+        cfg = _FakeAgentCfg(
+            session_token_budget=200_000_000,
+            weekly_token_budget=200_000_000,
+        )
+        line = _fmt_token_row(windows, cfg, tier="narrow")
+        self.assertLessEqual(len(line) + 1, 50)
 
 
 class TestFmtTokenCompact(unittest.TestCase):
@@ -230,12 +292,6 @@ class TestFmtTokenCompact(unittest.TestCase):
             _fmt_token_compact({"session": {}, "7d": {}}),
             "tok sess=0  wk=0",
         )
-
-
-class _FakeAgentCfg:
-    def __init__(self, session_token_budget=0, weekly_token_budget=0):
-        self.session_token_budget = session_token_budget
-        self.weekly_token_budget = weekly_token_budget
 
 
 class TestFmtTokenCompactPct(unittest.TestCase):
@@ -420,92 +476,6 @@ class TestTokenWindowsCache(unittest.TestCase):
         _token_windows(store, daemon_started_at=0.0)
         _token_windows(store, daemon_started_at=123.0)
         self.assertEqual(len(store.calls), 6)
-
-
-class TestFmtTokenLineTiers(unittest.TestCase):
-    """Tier-specific token-panel line formatters must fit their own
-    minimum width so the dashboard doesn't silently clip the totals."""
-
-    totals = {"input": 1_500_000, "output": 120_000,
-              "cache_read": 8_000_000, "cache_create": 350_000,
-              "total": 10_000_000}
-
-    def test_wide_line_fits_80(self):
-        line = _fmt_token_line("session", self.totals)
-        self.assertLessEqual(len(line) + 1, 80)  # leading space
-
-    def test_mid_line_fits_60(self):
-        line = _fmt_token_line_mid("session", self.totals)
-        self.assertLessEqual(len(line) + 1, 60)
-        # Σ survives in mid tier — most operator-relevant datum.
-        self.assertIn("Σ", line)
-
-    def test_narrow_line_fits_40(self):
-        line = _fmt_token_line_narrow("session", self.totals)
-        self.assertLessEqual(len(line) + 1, 40)
-        self.assertIn("Σ", line)
-
-    def test_narrow_truncates_long_label(self):
-        line = _fmt_token_line_narrow("session", self.totals)
-        # Narrow truncates `session` to 4 chars so Σ never clips.
-        self.assertIn("sess", line)
-        self.assertNotIn("session", line)
-
-
-class TestFmtTokenLineBudget(unittest.TestCase):
-    """`(NN%)` suffix on panel rows lets operators eyeball proximity to the
-    configured session/weekly caps without doing the math. Matches the
-    clamp/format rules from the compact status-line indicator."""
-
-    totals_half = {"input": 100_000, "output": 50_000,
-                   "cache_read": 300_000, "cache_create": 50_000,
-                   "total": 500_000}
-    totals_over = {"input": 500_000, "output": 100_000,
-                   "cache_read": 1_200_000, "cache_create": 200_000,
-                   "total": 2_000_000}
-
-    # Worst-case suffix width — must fit the narrow tier's 40-col budget.
-    totals_narrow = {"total": 10_000_000}
-
-    def test_wide_no_suffix_when_budget_zero(self):
-        line = _fmt_token_line("session", self.totals_half)
-        self.assertTrue(line.endswith("Σ 500.0k"), line)
-        self.assertNotIn("%", line)
-
-    def test_wide_shows_percent_when_budget_set(self):
-        line = _fmt_token_line("session", self.totals_half,
-                               budget=1_000_000)
-        self.assertIn("Σ 500.0k (50%)", line)
-
-    def test_wide_clamps_over_budget(self):
-        line = _fmt_token_line("session", self.totals_over,
-                               budget=1_000_000)
-        self.assertIn("(>99%)", line)
-
-    def test_mid_no_suffix_when_budget_zero(self):
-        line = _fmt_token_line_mid("session", self.totals_half)
-        self.assertNotIn("%", line)
-
-    def test_mid_shows_percent_when_budget_set(self):
-        line = _fmt_token_line_mid("session", self.totals_half,
-                                   budget=1_000_000)
-        self.assertIn("Σ 500.0k (50%)", line)
-
-    def test_narrow_no_suffix_when_budget_zero(self):
-        line = _fmt_token_line_narrow("session", self.totals_half)
-        self.assertNotIn("%", line)
-
-    def test_narrow_shows_percent_when_budget_set(self):
-        line = _fmt_token_line_narrow("session", self.totals_half,
-                                      budget=1_000_000)
-        self.assertIn("Σ 500.0k (50%)", line)
-
-    def test_narrow_fits_40_with_overbudget_suffix(self):
-        # Worst-case suffix `(>99%)` is 7 chars — narrow must still fit.
-        line = _fmt_token_line_narrow("session", self.totals_narrow,
-                                      budget=1)
-        self.assertIn("(>99%)", line)
-        self.assertLessEqual(len(line) + 1, 40)  # leading space
 
 
 if __name__ == "__main__":

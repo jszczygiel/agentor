@@ -291,22 +291,6 @@ def _token_windows(store: Store, daemon_started_at: float) -> dict[str, dict]:
     return result
 
 
-def _fmt_token_line(label: str, totals: dict, budget: int = 0) -> str:
-    """One compact row for the token-usage panel. Kept narrow so it fits in
-    80-column terminals: `session  in 1.5M  out 120k  cache_r 8.0M  cache_c 350k  Σ 10.0M`.
-
-    When `budget` is non-zero, a `(NN%)` suffix is appended to the Σ so
-    operators can eyeball proximity to the configured session/weekly cap
-    without doing the math."""
-    total = int(totals.get('total', 0))
-    return (f"{label:<8}"
-            f"in {_fmt_tokens(int(totals.get('input', 0))):>6}  "
-            f"out {_fmt_tokens(int(totals.get('output', 0))):>6}  "
-            f"cache_r {_fmt_tokens(int(totals.get('cache_read', 0))):>6}  "
-            f"cache_c {_fmt_tokens(int(totals.get('cache_create', 0))):>6}  "
-            f"Σ {_fmt_tokens(total):>6}{_fmt_pct_of_budget(total, budget)}")
-
-
 def _fmt_pct_of_budget(total: int, budget: int) -> str:
     """Render `(NN%)` suffix for the status-line rate-limit readout.
     Empty when budget is 0 (operator hasn't configured one). Clamps at
@@ -339,25 +323,30 @@ def _fmt_token_compact(windows: dict, agent_cfg=None) -> str:
             f"wk={_fmt_tokens(wk)}{wk_pct}")
 
 
-def _fmt_token_line_mid(label: str, totals: dict, budget: int = 0) -> str:
-    """Mid-tier (60–79 col) compact form. Drops the cache columns and
-    leads with Σ so the most operator-relevant number isn't clipped.
-    `budget>0` appends a `(NN%)` suffix next to Σ."""
-    total = int(totals.get('total', 0))
-    return (f"{label:<8}"
-            f"Σ {_fmt_tokens(total):>6}{_fmt_pct_of_budget(total, budget)}  "
-            f"in {_fmt_tokens(int(totals.get('input', 0))):>6}  "
-            f"out {_fmt_tokens(int(totals.get('output', 0))):>6}")
+def _fmt_token_row(windows: dict, agent_cfg=None, tier: str = "wide") -> str:
+    """One-line token readout replacing the old 4-row token panel. Shows
+    cumulative totals for session / today / 7d, with optional `(NN%)`
+    budget suffixes on the session and 7d cells when `agent_cfg` supplies
+    non-zero `session_token_budget` / `weekly_token_budget`. `today` has
+    no budget knob so never carries a suffix.
 
-
-def _fmt_token_line_narrow(label: str, totals: dict, budget: int = 0) -> str:
-    """Narrow-tier (<60 col) form. Label is truncated to 4 chars and
-    only Σ survives — the other fields live in the inspect view.
-    `budget>0` appends a `(NN%)` suffix next to Σ."""
-    short = label[:4]
-    total = int(totals.get('total', 0))
-    return (f"{short:<5}"
-            f"Σ {_fmt_tokens(total):>6}{_fmt_pct_of_budget(total, budget)}")
+    Narrow tier (<60 col) shortens labels to `tok s=… t=… w=…` so three
+    M-scale numbers plus percent suffixes fit under 50 chars.
+    """
+    sess = int(windows.get("session", {}).get("total", 0))
+    today = int(windows.get("today", {}).get("total", 0))
+    wk = int(windows.get("7d", {}).get("total", 0))
+    sess_pct = _fmt_pct_of_budget(
+        sess, getattr(agent_cfg, "session_token_budget", 0) or 0)
+    wk_pct = _fmt_pct_of_budget(
+        wk, getattr(agent_cfg, "weekly_token_budget", 0) or 0)
+    if tier == "narrow":
+        return (f"tok s={_fmt_tokens(sess)}{sess_pct}  "
+                f"t={_fmt_tokens(today)}  "
+                f"w={_fmt_tokens(wk)}{wk_pct}")
+    return (f"tokens  session {_fmt_tokens(sess)}{sess_pct}  "
+            f"today {_fmt_tokens(today)}  "
+            f"7d {_fmt_tokens(wk)}{wk_pct}")
 
 
 def _build_commit_message(item: StoredItem) -> str:
