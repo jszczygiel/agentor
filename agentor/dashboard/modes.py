@@ -21,7 +21,6 @@ from .formatters import (
     _progress_data,
     _result_data,
     _token_breakdown,
-    _tokens_total,
 )
 from .render import (
     REFRESH_MS,
@@ -425,6 +424,13 @@ def _is_auto_resolve_chain(store: Store, item: StoredItem) -> bool:
 def _build_detail_lines(
     cfg: Config, store: Store, item: StoredItem, *, width: int = 120,
 ) -> list[str]:
+    # Approve-mode screens (AWAITING_PLAN_REVIEW / AWAITING_REVIEW) render
+    # only metadata + the decision content (plan / files-changed / summary).
+    # Run-mechanics sections (transcript, token breakdown, failure history,
+    # agent-run stats, live progress) are noise at approval time.
+    is_review = item.status in (
+        ItemStatus.AWAITING_PLAN_REVIEW, ItemStatus.AWAITING_REVIEW,
+    )
     out: list[str] = []
     data = _result_data(item)
     progress = _progress_data(item)
@@ -445,7 +451,7 @@ def _build_detail_lines(
     elapsed = _elapsed_for(store, item.id)
     if elapsed is not None:
         out.append(f"elapsed:  {_fmt_elapsed(elapsed)} (since enter WORKING)")
-    if progress:
+    if progress and not is_review:
         last_event_at = progress.get("last_event_at")
         age = None
         if isinstance(last_event_at, (int, float)):
@@ -458,76 +464,78 @@ def _build_detail_lines(
             out.append(f"doing:    {activity}")
         if isinstance(event_type, str) and event_type:
             out.append(f"event:    {event_type}")
-    if transcript_path.exists():
+    if transcript_path.exists() and not is_review:
         out.append(f"log:      {transcript_path}")
     if item.feedback:
         out.append("")
         out.append("── pending feedback ──")
         out.extend(item.feedback[:2000].splitlines())
     if not data:
-        out.append("")
-        out.append("(no agent result yet — no token data)")
-        activity = _session_activity(transcript_path)
-        if activity:
+        if not is_review:
             out.append("")
-            out.append("── session activity ──")
-            out.extend(activity)
-        else:
-            tail = _tail_lines(transcript_path)
-            if tail:
+            out.append("(no agent result yet — no token data)")
+            activity = _session_activity(transcript_path)
+            if activity:
                 out.append("")
-                out.append("── transcript tail ──")
-                out.extend(tail)
+                out.append("── session activity ──")
+                out.extend(activity)
+            else:
+                tail = _tail_lines(transcript_path)
+                if tail:
+                    out.append("")
+                    out.append("── transcript tail ──")
+                    out.extend(tail)
         if item.status == ItemStatus.AWAITING_PLAN_REVIEW:
             out.append("")
             out.append("── plan ──")
             out.append("(no plan text captured)")
         return out
-    out.append("")
-    out.append("── agent run ──")
-    if data.get("live"):
-        out.append("stream:   live")
-    if data.get("phase"):
-        out.append(f"phase:    {data['phase']}")
-    if "num_turns" in data:
-        out.append(f"turns:    {data['num_turns']}")
-    if "duration_ms" in data:
-        out.append(f"wall:     {data['duration_ms'] / 1000:.1f}s "
-                   f"(api: {data.get('duration_api_ms', 0) / 1000:.1f}s)")
-    if "stop_reason" in data:
-        out.append(f"stop:     {data['stop_reason']}")
-    rows = _token_breakdown(item)
-    if rows:
+    if not is_review:
         out.append("")
-        out.append("── per-model tokens ──")
-        # Tabular form needs ~80 cols (36 model + 4 × 10 numbers + pads).
-        # 60–79 stacks to a 2-line compact per model; <60 goes fully
-        # vertical so no field wraps mid-row.
-        if width >= 80:
-            out.append(f"{'MODEL':<36} {'IN':>10} {'OUT':>10} "
-                       f"{'CACHE_R':>12} {'CACHE_W':>10}")
-            for r in rows:
-                out.append(f"{r['model']:<36} "
-                           f"{_fmt_tokens(r['input']):>10} "
-                           f"{_fmt_tokens(r['output']):>10} "
-                           f"{_fmt_tokens(r['cache_read']):>12} "
-                           f"{_fmt_tokens(r['cache_create']):>10}")
-        elif width >= 60:
-            for r in rows:
-                out.append(f"model: {r['model']}")
-                out.append(
-                    f"  in={_fmt_tokens(r['input'])} "
-                    f"out={_fmt_tokens(r['output'])} "
-                    f"cr={_fmt_tokens(r['cache_read'])} "
-                    f"cw={_fmt_tokens(r['cache_create'])}"
-                )
-        else:
-            for r in rows:
-                out.append(f"model:   {r['model']}")
-                out.append(f"  in:      {_fmt_tokens(r['input'])}")
-                out.append(f"  out:     {_fmt_tokens(r['output'])}")
-                out.append(f"  cache_r: {_fmt_tokens(r['cache_read'])}")
-                out.append(f"  cache_w: {_fmt_tokens(r['cache_create'])}")
+        out.append("── agent run ──")
+        if data.get("live"):
+            out.append("stream:   live")
+        if data.get("phase"):
+            out.append(f"phase:    {data['phase']}")
+        if "num_turns" in data:
+            out.append(f"turns:    {data['num_turns']}")
+        if "duration_ms" in data:
+            out.append(f"wall:     {data['duration_ms'] / 1000:.1f}s "
+                       f"(api: {data.get('duration_api_ms', 0) / 1000:.1f}s)")
+        if "stop_reason" in data:
+            out.append(f"stop:     {data['stop_reason']}")
+        rows = _token_breakdown(item)
+        if rows:
+            out.append("")
+            out.append("── per-model tokens ──")
+            # Tabular form needs ~80 cols (36 model + 4 × 10 numbers + pads).
+            # 60–79 stacks to a 2-line compact per model; <60 goes fully
+            # vertical so no field wraps mid-row.
+            if width >= 80:
+                out.append(f"{'MODEL':<36} {'IN':>10} {'OUT':>10} "
+                           f"{'CACHE_R':>12} {'CACHE_W':>10}")
+                for r in rows:
+                    out.append(f"{r['model']:<36} "
+                               f"{_fmt_tokens(r['input']):>10} "
+                               f"{_fmt_tokens(r['output']):>10} "
+                               f"{_fmt_tokens(r['cache_read']):>12} "
+                               f"{_fmt_tokens(r['cache_create']):>10}")
+            elif width >= 60:
+                for r in rows:
+                    out.append(f"model: {r['model']}")
+                    out.append(
+                        f"  in={_fmt_tokens(r['input'])} "
+                        f"out={_fmt_tokens(r['output'])} "
+                        f"cr={_fmt_tokens(r['cache_read'])} "
+                        f"cw={_fmt_tokens(r['cache_create'])}"
+                    )
+            else:
+                for r in rows:
+                    out.append(f"model:   {r['model']}")
+                    out.append(f"  in:      {_fmt_tokens(r['input'])}")
+                    out.append(f"  out:     {_fmt_tokens(r['output'])}")
+                    out.append(f"  cache_r: {_fmt_tokens(r['cache_read'])}")
+                    out.append(f"  cache_w: {_fmt_tokens(r['cache_create'])}")
     if item.status == ItemStatus.AWAITING_PLAN_REVIEW:
         plan_text = data.get("plan") or data.get("summary")
         if plan_text:
@@ -543,12 +551,13 @@ def _build_detail_lines(
                 out.append(f"  {f}")
             if len(files) > 50:
                 out.append(f"  ... and {len(files) - 50} more")
-        out.append(f"tokens:   {_tokens_total(item)}")
     summary = data.get("result") or data.get("summary")
     if summary:
         out.append("")
         out.append("── summary ──")
         out.extend(summary[:4000].splitlines())
+    if is_review:
+        return out
     if item.status == ItemStatus.CONFLICTED and item.last_error:
         # Dedicated block for merge conflicts — keep the full summary (file
         # list + git output) visible since the short `last_error:` line
