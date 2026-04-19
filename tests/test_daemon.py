@@ -1,4 +1,5 @@
 import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -552,6 +553,145 @@ class TestFoldAutoQueueInLoop(unittest.TestCase):
         self.assertEqual(
             len(self.store.list_by_status(ItemStatus.QUEUED)), 1,
         )
+
+
+class TestStaleSessionWatchdog(unittest.TestCase):
+    """Detects WORKING items whose transcript hasn't been touched in a
+    while. Informational — the process is not killed, dispatch is not
+    paused; `timeout_seconds` still owns the terminal decision."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        self.logs: list[str] = []
+        self.transcripts_dir = self.root / ".agentor" / "transcripts"
+        self.transcripts_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _mk_daemon(self, threshold: int = 300) -> Daemon:
+        cfg = Config(
+            project_name="t",
+            project_root=self.root,
+            sources=SourcesConfig(),
+            parsing=ParsingConfig(),
+            agent=AgentConfig(
+                pool_size=1,
+                stale_session_alert_seconds=threshold,
+            ),
+            git=GitConfig(),
+            review=ReviewConfig(),
+        )
+
+        def factory(c, s):
+            return FakeRunner(c, s, lambda r, i: None)
+
+        return Daemon(cfg, self.store, factory,
+                      install_signals=False, log=self.logs.append)
+
+    def _seed_working(self, id: str = "a", session_id: str = "sess-x") -> None:
+        self.store.upsert_discovered(_mk_item(id))
+        self.store.transition(id, ItemStatus.QUEUED)
+        self.store.transition(
+            id, ItemStatus.WORKING,
+            worktree_path=str(self.root / "wt"),
+            branch="agent/test",
+            session_id=session_id,
+        )
+
+    def _write_transcript(self, id: str, phase: str, age_seconds: float) -> int:
+        import os
+        p = self.transcripts_dir / f"{id}.{phase}.log"
+        p.write_text("dummy\n")
+        mtime = time.time() - age_seconds
+        os.utime(p, (mtime, mtime))
+        return p.stat().st_mtime_ns
+
+    def test_stale_transcript_sets_alert(self):
+        self._seed_working("a")
+        old_mtime_ns = self._write_transcript("a", "execute", age_seconds=310)
+        d = self._mk_daemon(threshold=300)
+        d._check_stale_sessions(time.time_ns())
+        self.assertEqual(d.stale_session_alerts, {"a": old_mtime_ns})
+        self.assertFalse(d.paused)
+        self.assertEqual(d.stats.failed, 0)
+        alerts = [m for m in self.logs if "[ALERT]" in m and "a" in m]
+        self.assertEqual(len(alerts), 1, self.logs)
+        self.assertIn("stale session", alerts[0])
+
+    def test_fresh_transcript_no_alert(self):
+        self._seed_working("a")
+        self._write_transcript("a", "execute", age_seconds=5)
+        d = self._mk_daemon(threshold=300)
+        d._check_stale_sessions(time.time_ns())
+        self.assertEqual(d.stale_session_alerts, {})
+        self.assertFalse(
+            [m for m in self.logs if "[ALERT]" in m],
+        )
+
+    def test_missing_transcript_no_crash(self):
+        self._seed_working("a")
+        # no transcript written
+        d = self._mk_daemon(threshold=300)
+        d._check_stale_sessions(time.time_ns())
+        self.assertEqual(d.stale_session_alerts, {})
+
+    def test_threshold_zero_disables(self):
+        self._seed_working("a")
+        self._write_transcript("a", "execute", age_seconds=99999)
+        d = self._mk_daemon(threshold=0)
+        d._check_stale_sessions(time.time_ns())
+        self.assertEqual(d.stale_session_alerts, {})
+
+    def test_no_session_id_skipped(self):
+        """WORKING items without a live session_id are not yet dispatched
+        through a claude/codex session — skip them so we don't alert on
+        stub-runner fixtures or pre-session setup."""
+        self.store.upsert_discovered(_mk_item("a"))
+        self.store.transition("a", ItemStatus.QUEUED)
+        self.store.transition(
+            "a", ItemStatus.WORKING,
+            worktree_path=str(self.root / "wt"), branch="agent/test",
+        )
+        self._write_transcript("a", "execute", age_seconds=600)
+        d = self._mk_daemon(threshold=300)
+        d._check_stale_sessions(time.time_ns())
+        self.assertEqual(d.stale_session_alerts, {})
+
+    def test_dedupe_on_same_mtime(self):
+        self._seed_working("a")
+        self._write_transcript("a", "execute", age_seconds=400)
+        d = self._mk_daemon(threshold=300)
+        d._check_stale_sessions(time.time_ns())
+        d._check_stale_sessions(time.time_ns())
+        alerts = [m for m in self.logs if "[ALERT]" in m]
+        self.assertEqual(len(alerts), 1, self.logs)
+
+    def test_clear_alert_wipes_active_only(self):
+        self._seed_working("a")
+        self._write_transcript("a", "execute", age_seconds=400)
+        d = self._mk_daemon(threshold=300)
+        d._check_stale_sessions(time.time_ns())
+        self.assertIn("a", d.stale_session_alerts)
+        d.clear_alert()
+        self.assertEqual(d.stale_session_alerts, {})
+        # Next tick with same mtime stays muted via dedupe memory.
+        d._check_stale_sessions(time.time_ns())
+        self.assertEqual(d.stale_session_alerts, {})
+        alerts = [m for m in self.logs if "[ALERT]" in m]
+        self.assertEqual(len(alerts), 1, self.logs)
+
+    def test_plan_transcript_used_when_only_plan_exists(self):
+        """Watchdog checks both phases; if only plan.log exists, it picks
+        plan's mtime rather than silently no-op'ing."""
+        self._seed_working("a", session_id="sess-plan")
+        self._write_transcript("a", "plan", age_seconds=400)
+        d = self._mk_daemon(threshold=300)
+        d._check_stale_sessions(time.time_ns())
+        self.assertIn("a", d.stale_session_alerts)
 
 
 if __name__ == "__main__":

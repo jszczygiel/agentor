@@ -1,5 +1,6 @@
 import curses
 import json
+import time
 import unittest
 from collections import deque
 from pathlib import Path
@@ -356,6 +357,31 @@ class TestRenderFitsWidth(unittest.TestCase):
         lines = self._render_all(20, alert="git merge conflict: foo.py")
         for ln in lines:
             self.assertLessEqual(len(ln), 20, f"banner overflow: {ln!r}")
+
+    def test_stale_session_banner_rendered(self):
+        scr = _StubScreen(24, 100)
+        daemon = _FakeDaemon()
+        daemon.stale_session_alerts = {"abcd1234": time.time_ns() - 7 * 60_000_000_000}
+        with patch.object(curses, "color_pair", return_value=0):
+            _render(scr, _FakeCfg(), _FakeStore(), daemon, deque(), 0)
+        joined = "\n".join(scr.lines)
+        self.assertIn("stale session abcd1234", joined)
+        self.assertIn("7m idle", joined)
+
+    def test_stale_session_banner_caps_at_three(self):
+        scr = _StubScreen(24, 100)
+        daemon = _FakeDaemon()
+        now_ns = time.time_ns()
+        daemon.stale_session_alerts = {
+            f"id{i:06d}": now_ns - (10 + i) * 60_000_000_000
+            for i in range(5)
+        }
+        with patch.object(curses, "color_pair", return_value=0):
+            _render(scr, _FakeCfg(), _FakeStore(), daemon, deque(), 0)
+        joined = "\n".join(scr.lines)
+        # Three banners plus one roll-up summary = 4 lines mentioning "stale"
+        # or "+N more".
+        self.assertIn("+2 more stale session", joined)
 
 
 class TestRenderTokenPanel(unittest.TestCase):
