@@ -22,6 +22,12 @@ from .store import Store, StoredItem
 
 T = TypeVar("T")
 
+# Seconds to wait after `on_event` sees a `type:"result"` event before the
+# helper force-closes any still-open stdin pipe. Belt-and-suspenders for a
+# protocol drift where the child emits `result` but then blocks on stdin
+# rather than exiting. Tests monkeypatch this down to <1s.
+_STDIN_CLOSE_AFTER_RESULT_SECONDS = 8
+
 
 class ChildStdinHolder:
     """Thread-safe line writer bound to a child process's stdin pipe.
@@ -686,6 +692,25 @@ def _run_stream_json_subprocess(
 
     stdout_buf: list[str] = []
     cap_reason: str | None = None
+    drift_timer: threading.Timer | None = None
+
+    def _close_stdin_after_result() -> None:
+        # Protocol drift: child emitted `result` but hasn't EOF'd stdout
+        # within the grace window. Close stdin so a child blocked on
+        # `read()` can unblock; outer timeout still owns the final kill.
+        if stdin_holder is not None:
+            stdin_holder.close()
+        try:
+            if p.stdin is not None:
+                p.stdin.close()
+        except Exception:
+            pass
+        try:
+            with transcript_path.open("a") as fh:
+                fh.write("\n[closed stdin after result — protocol drift]\n")
+        except Exception:
+            pass
+
     # Append mode so RETRY markers written by the surrounding retry loop
     # are preserved across attempts; _invoke_claude/_invoke_codex truncate
     # the file once before the first attempt.
@@ -706,6 +731,16 @@ def _run_stream_json_subprocess(
                     reason = on_event(ev)
                     if reason and not cap_reason:
                         cap_reason = reason
+                    if (
+                        drift_timer is None
+                        and ev.get("type") == "result"
+                    ):
+                        drift_timer = threading.Timer(
+                            _STDIN_CLOSE_AFTER_RESULT_SECONDS,
+                            _close_stdin_after_result,
+                        )
+                        drift_timer.daemon = True
+                        drift_timer.start()
             if cap_reason:
                 try:
                     p.kill()
@@ -715,6 +750,8 @@ def _run_stream_json_subprocess(
         p.wait(timeout=5)
     finally:
         timer.cancel()
+        if drift_timer is not None:
+            drift_timer.cancel()
         if proc_registry is not None:
             proc_registry.unregister(item_key)
         if stdin_holder is not None:
