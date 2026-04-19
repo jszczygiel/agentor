@@ -679,6 +679,77 @@ def _prompt_text(stdscr, message: str) -> str:
         return ""
 
 
+def _prompt_multiline(stdscr, label: str, *, rows: int = 8) -> str:
+    """Multi-line text entry in a centered overlay. Enter inserts a newline;
+    Ctrl-G submits; Ctrl-C or Esc cancels (empty string). Empty submit also
+    returns empty. Falls back to `_prompt_text` on very small terminals."""
+    import curses.textpad
+
+    h, w = stdscr.getmaxyx()
+    if h < 10 or w < 40:
+        return _prompt_text(stdscr, label + " (empty=cancel): ")
+
+    box_h = min(rows + 4, h - 2)
+    box_w = min(80, w - 4)
+    inner_rows = box_h - 4
+    inner_cols = box_w - 2
+    top = (h - box_h) // 2
+    left = (w - box_w) // 2
+
+    frame = curses.newwin(box_h, box_w, top, left)
+    frame.bkgd(" ", curses.A_NORMAL)
+    frame.box()
+    header = f" {label} "[: box_w - 2]
+    try:
+        frame.addnstr(0, max(1, (box_w - len(header)) // 2),
+                      header, box_w - 2, curses.A_BOLD | curses.A_REVERSE)
+    except curses.error:
+        pass
+    footer = " Ctrl-G submit · Ctrl-C cancel · empty=cancel "[: box_w - 2]
+    try:
+        frame.addnstr(box_h - 1, max(1, (box_w - len(footer)) // 2),
+                      footer, box_w - 2, curses.A_DIM)
+    except curses.error:
+        pass
+    frame.refresh()
+
+    edit_win = curses.newwin(inner_rows, inner_cols, top + 2, left + 1)
+    edit_win.keypad(True)
+    box = curses.textpad.Textbox(edit_win)
+    # stripspaces=True (default) drops trailing whitespace per-line; that
+    # wipes intentional blank paragraph separators in multi-line feedback.
+    box.stripspaces = False
+
+    cancelled = {"flag": False}
+
+    def validator(ch: int) -> int:
+        if ch in (3, 27):  # Ctrl-C, Esc
+            cancelled["flag"] = True
+            return 7  # Ctrl-G — terminate edit()
+        if ch in (127, curses.KEY_BACKSPACE, 8):
+            return curses.KEY_BACKSPACE
+        return ch
+
+    curses.curs_set(1)
+    stdscr.nodelay(False)
+    try:
+        box.edit(validator)
+        text = box.gather()
+    except KeyboardInterrupt:
+        cancelled["flag"] = True
+        text = ""
+    finally:
+        curses.curs_set(0)
+        del edit_win
+        del frame
+        stdscr.touchwin()
+        stdscr.refresh()
+
+    if cancelled["flag"]:
+        return ""
+    return text.rstrip()
+
+
 def _wrap(text: str, width: int) -> list[str]:
     """Wrap text into lines ≤ width while keeping explicit newlines. Long
     whitespace-free runs (eg. SHAs) are hard-broken."""

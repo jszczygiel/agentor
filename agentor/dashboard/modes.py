@@ -25,6 +25,7 @@ from .formatters import (
 from .render import (
     REFRESH_MS,
     _flash,
+    _prompt_multiline,
     _prompt_text,
     _prompt_yn,
     _run_with_progress,
@@ -273,8 +274,8 @@ def _inspect_dispatch(
                 daemon.try_fill_pool()
             return True, "plan approved → execute queued"
         if key == "f":
-            feedback = _prompt_text(
-                stdscr, "feedback for execute phase (empty = cancel): "
+            feedback = _prompt_multiline(
+                stdscr, "feedback for execute phase"
             )
             if not feedback:
                 return False, ""
@@ -283,8 +284,8 @@ def _inspect_dispatch(
                 daemon.try_fill_pool()
             return True, "plan approved with feedback"
         if key == "r":
-            feedback = _prompt_text(
-                stdscr, "feedback (plan retry, empty=cancel): "
+            feedback = _prompt_multiline(
+                stdscr, "feedback (plan retry)"
             )
             if not feedback:
                 return False, ""
@@ -308,8 +309,8 @@ def _inspect_dispatch(
                 return True, f"merge failed: {e}"
             return True, "merge complete"
         if key == "r":
-            feedback = _prompt_text(
-                stdscr, "feedback (code retry, empty=cancel): "
+            feedback = _prompt_multiline(
+                stdscr, "feedback (code retry)"
             )
             if not feedback:
                 return False, ""

@@ -34,3 +34,8 @@ the current task's scope.
   reconciling the force-execute branch (needed to run the test suite), but a
   wider grep + mypy `strict_optional=True` + per-member enum exhaustiveness
   check should be considered so this class of drift is caught pre-merge.
+- The new-issue bug/idea note prompt at `dashboard/modes.py:784` is still
+  single-line (`_prompt_text`). Same long-form argument as the feedback paths
+  that moved to `_prompt_multiline` — operators would benefit from newlines
+  and wrapping. Deferred to keep the multi-line-feedback task on its stated
+  scope ("at least the feedback-reject paths").
