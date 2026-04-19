@@ -111,6 +111,29 @@ def commit_all(worktree: Path, message: str) -> str:
     return cp.stdout.strip()
 
 
+def added_agent_logs(
+    repo: Path, feature_branch: str, base_branch: str,
+) -> list[str]:
+    """Return paths of `docs/agent-logs/*.md` files added on the
+    feature branch but not on `base_branch`. Used by the committer's
+    compliance gate to verify the agent wrote a per-run findings log
+    before approving the merge.
+
+    Uses the three-dot diff form (`base...feature`) so the comparison
+    is against the merge-base — files added on `base` since fork do
+    not count as additions on the feature side."""
+    cp = run(
+        repo, "diff", "--name-only", "--diff-filter=A",
+        f"{base_branch}...{feature_branch}", check=False,
+    )
+    if cp.returncode != 0:
+        return []
+    return [
+        line for line in cp.stdout.splitlines()
+        if line.startswith("docs/agent-logs/") and line.endswith(".md")
+    ]
+
+
 def is_inside_repo(path: Path) -> bool:
     cp = run(path, "rev-parse", "--is-inside-work-tree", check=False)
     return cp.returncode == 0 and cp.stdout.strip() == "true"
