@@ -833,9 +833,7 @@ def _new_issue_mode(
     mode = cfg.parsing.mode
     expand_kind = "frontmatter" if (mode == "frontmatter" and kind == "dir") \
         else "checkbox"
-    note = _prompt_text(
-        stdscr, "bug/idea note (enter=submit, empty=cancel): ",
-    )
+    note = _prompt_multiline(stdscr, "bug/idea note")
     if not note:
         return
     def _expand_work(p: Callable[[str], None]) -> str:
