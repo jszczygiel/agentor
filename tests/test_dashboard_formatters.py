@@ -452,5 +452,61 @@ class TestFmtTokenLineTiers(unittest.TestCase):
         self.assertNotIn("session", line)
 
 
+class TestFmtTokenLineBudget(unittest.TestCase):
+    """`(NN%)` suffix on panel rows lets operators eyeball proximity to the
+    configured session/weekly caps without doing the math. Matches the
+    clamp/format rules from the compact status-line indicator."""
+
+    totals_half = {"input": 100_000, "output": 50_000,
+                   "cache_read": 300_000, "cache_create": 50_000,
+                   "total": 500_000}
+    totals_over = {"input": 500_000, "output": 100_000,
+                   "cache_read": 1_200_000, "cache_create": 200_000,
+                   "total": 2_000_000}
+
+    # Worst-case suffix width — must fit the narrow tier's 40-col budget.
+    totals_narrow = {"total": 10_000_000}
+
+    def test_wide_no_suffix_when_budget_zero(self):
+        line = _fmt_token_line("session", self.totals_half)
+        self.assertTrue(line.endswith("Σ 500.0k"), line)
+        self.assertNotIn("%", line)
+
+    def test_wide_shows_percent_when_budget_set(self):
+        line = _fmt_token_line("session", self.totals_half,
+                               budget=1_000_000)
+        self.assertIn("Σ 500.0k (50%)", line)
+
+    def test_wide_clamps_over_budget(self):
+        line = _fmt_token_line("session", self.totals_over,
+                               budget=1_000_000)
+        self.assertIn("(>99%)", line)
+
+    def test_mid_no_suffix_when_budget_zero(self):
+        line = _fmt_token_line_mid("session", self.totals_half)
+        self.assertNotIn("%", line)
+
+    def test_mid_shows_percent_when_budget_set(self):
+        line = _fmt_token_line_mid("session", self.totals_half,
+                                   budget=1_000_000)
+        self.assertIn("Σ 500.0k (50%)", line)
+
+    def test_narrow_no_suffix_when_budget_zero(self):
+        line = _fmt_token_line_narrow("session", self.totals_half)
+        self.assertNotIn("%", line)
+
+    def test_narrow_shows_percent_when_budget_set(self):
+        line = _fmt_token_line_narrow("session", self.totals_half,
+                                      budget=1_000_000)
+        self.assertIn("Σ 500.0k (50%)", line)
+
+    def test_narrow_fits_40_with_overbudget_suffix(self):
+        # Worst-case suffix `(>99%)` is 7 chars — narrow must still fit.
+        line = _fmt_token_line_narrow("session", self.totals_narrow,
+                                      budget=1)
+        self.assertIn("(>99%)", line)
+        self.assertLessEqual(len(line) + 1, 40)  # leading space
+
+
 if __name__ == "__main__":
     unittest.main()

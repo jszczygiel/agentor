@@ -201,7 +201,7 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     _safe_addstr(stdscr, row, 0, status_line, w)
     row += 1
     row = _render_token_panel(stdscr, row, w, store, daemon, tier,
-                              windows=token_windows)
+                              windows=token_windows, agent_cfg=cfg.agent)
     _safe_addstr(stdscr, row, 0, "─" * w, w, curses.A_DIM)
     row += 1
 
@@ -378,7 +378,8 @@ def _build_status_line(tier: str, cfg, stats, counts: dict,
 
 def _render_token_panel(stdscr, row: int, w: int, store, daemon,
                         tier: str = "wide",
-                        windows: dict | None = None) -> int:
+                        windows: dict | None = None,
+                        agent_cfg=None) -> int:
     """Draw the cumulative token-usage panel: one line per time window
     (session / today / 7d). Tier-aware so the 71-char wide format
     doesn't silently clip on phone-width terminals. Returns the next
@@ -386,20 +387,28 @@ def _render_token_panel(stdscr, row: int, w: int, store, daemon,
 
     `windows` may be pre-computed by the caller to avoid a second
     `_token_windows` call in the same render tick (the 2s cache also
-    deduplicates, but explicit sharing keeps call-ownership obvious)."""
+    deduplicates, but explicit sharing keeps call-ownership obvious).
+
+    `agent_cfg` supplies the `session_token_budget` / `weekly_token_budget`
+    used to append `(NN%)` suffixes to the session / 7d rows. `today` has
+    no budget and is always rendered suffix-less."""
     if windows is None:
         windows = _token_windows(store, daemon.started_at)
+    sess_budget = getattr(agent_cfg, "session_token_budget", 0) or 0
+    wk_budget = getattr(agent_cfg, "weekly_token_budget", 0) or 0
+    budgets = {"session": sess_budget, "7d": wk_budget}
     if tier != "narrow":
         _safe_addstr(stdscr, row, 0, " tokens".ljust(w), w,
                      curses.A_DIM | curses.A_BOLD)
         row += 1
     for label, totals in windows.items():
+        budget = budgets.get(label, 0)
         if tier == "wide":
-            line = " " + _fmt_token_line(label, totals)
+            line = " " + _fmt_token_line(label, totals, budget)
         elif tier == "mid":
-            line = " " + _fmt_token_line_mid(label, totals)
+            line = " " + _fmt_token_line_mid(label, totals, budget)
         else:
-            line = " " + _fmt_token_line_narrow(label, totals)
+            line = " " + _fmt_token_line_narrow(label, totals, budget)
         _safe_addstr(stdscr, row, 0, line.ljust(w), w, curses.A_DIM)
         row += 1
     return row

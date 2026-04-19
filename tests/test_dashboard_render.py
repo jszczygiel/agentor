@@ -410,6 +410,7 @@ class TestRenderTokenPanel(unittest.TestCase):
     def test_panel_draws_header_and_three_windows(self):
         stdscr = _FakeStdscr()
         daemon = SimpleNamespace(started_at=0.0)
+        _token_windows_invalidate()
         next_row = _render_token_panel(stdscr, 0, 120, self.store, daemon)
         # 1 header + 3 window rows = row pointer advances by 4.
         self.assertEqual(next_row, 4)
@@ -420,6 +421,29 @@ class TestRenderTokenPanel(unittest.TestCase):
         self.assertIn("7d", joined)
         # Values are formatted via _fmt_tokens — 78000 → "78.0k".
         self.assertIn("78.0k", joined)
+        # No budget configured → no `(NN%)` suffix on any row.
+        self.assertNotIn("%", joined)
+
+    def test_panel_shows_percent_suffix_when_budgets_set(self):
+        stdscr = _FakeStdscr()
+        daemon = SimpleNamespace(started_at=0.0)
+        agent_cfg = SimpleNamespace(
+            session_token_budget=1_000_000,
+            weekly_token_budget=1_000_000,
+        )
+        _token_windows_invalidate()
+        _render_token_panel(stdscr, 0, 120, self.store, daemon,
+                            agent_cfg=agent_cfg)
+        per_row = [s for _, s in stdscr.lines]
+        # Locate the session / today / 7d rows by prefix (leading space).
+        sess = next(s for s in per_row if s.lstrip().startswith("session"))
+        today = next(s for s in per_row if s.lstrip().startswith("today"))
+        week = next(s for s in per_row if s.lstrip().startswith("7d"))
+        # Seeded totals = 79299 tokens, budget = 1M → 7% rounded.
+        self.assertIn("(7%)", sess)
+        self.assertIn("(7%)", week)
+        # `today` has no budget concept — always suffix-less.
+        self.assertNotIn("%", today)
 
 
 class TestRenderStatusLineTokenIndicator(unittest.TestCase):
