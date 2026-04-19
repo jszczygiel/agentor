@@ -4,9 +4,19 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from agentor.committer import (approve_and_commit, approve_plan,
                                 resubmit_conflicted, retry, retry_merge)
+
+
+def _suppress_auto_chain(test: unittest.TestCase) -> None:
+    """Disable the committer's unconditional CONFLICTED→QUEUED auto-chain
+    for tests that need to observe the CONFLICTED state directly. The
+    auto-chain has dedicated coverage in `TestAutoResolveConflicts`."""
+    p = patch("agentor.committer.resubmit_conflicted")
+    p.start()
+    test.addCleanup(p.stop)
 from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
                             ReviewConfig, SourcesConfig)
 from agentor.models import ItemStatus
@@ -29,11 +39,6 @@ def _init_project(root: Path) -> None:
 
 
 def _mk_config(root: Path, *, merge_mode: str = "merge") -> Config:
-    # Test fixture pins `auto_resolve_conflicts=False` so committer tests can
-    # assert on the CONFLICTED state without the default-on auto-chain
-    # immediately moving the item to QUEUED. TestAutoResolveConflicts
-    # explicitly re-enables it to exercise the on-path; the production
-    # GitConfig() default is True and is pinned in tests/test_config.py.
     return Config(
         project_name=root.name,
         project_root=root,
@@ -41,8 +46,7 @@ def _mk_config(root: Path, *, merge_mode: str = "merge") -> Config:
         parsing=ParsingConfig(mode="checkbox"),
         agent=AgentConfig(pool_size=1),
         git=GitConfig(base_branch="main", branch_prefix="agent/",
-                      merge_mode=merge_mode,
-                      auto_resolve_conflicts=False),
+                      merge_mode=merge_mode),
         review=ReviewConfig(),
     )
 
@@ -73,6 +77,7 @@ def _head_sha(repo: Path) -> str:
 
 class TestAutoMerge(unittest.TestCase):
     def setUp(self):
+        _suppress_auto_chain(self)
         self.td = TemporaryDirectory()
         self.root = Path(self.td.name)
         _init_project(self.root)
@@ -161,6 +166,7 @@ class TestRebaseMode(unittest.TestCase):
     """merge_mode="rebase" — linear history, no merge commits."""
 
     def setUp(self):
+        _suppress_auto_chain(self)
         self.td = TemporaryDirectory()
         self.root = Path(self.td.name)
         _init_project(self.root)
@@ -242,6 +248,7 @@ class TestRebaseMode(unittest.TestCase):
 
 class TestRetryMerge(unittest.TestCase):
     def setUp(self):
+        _suppress_auto_chain(self)
         self.td = TemporaryDirectory()
         self.root = Path(self.td.name)
         _init_project(self.root)
@@ -409,6 +416,7 @@ class TestConflictSummaryFormat(unittest.TestCase):
     """Feature-context framing of the CONFLICTED `last_error`."""
 
     def setUp(self):
+        _suppress_auto_chain(self)
         self.td = TemporaryDirectory()
         self.root = Path(self.td.name)
         _init_project(self.root)
@@ -472,9 +480,9 @@ class TestConflictSummaryFormat(unittest.TestCase):
 
 
 class TestAutoResolveConflicts(unittest.TestCase):
-    """`git.auto_resolve_conflicts` chains resubmit_conflicted into
-    approve_and_commit so a CONFLICTED transition immediately becomes
-    QUEUED with conflict-resolution feedback."""
+    """`approve_and_commit` always chains `resubmit_conflicted` on a
+    CONFLICTED transition — the item lands back in QUEUED with
+    conflict-resolution feedback so the agent fixes the merge in-place."""
 
     def setUp(self):
         self.td = TemporaryDirectory()
@@ -489,7 +497,7 @@ class TestAutoResolveConflicts(unittest.TestCase):
         self.store.close()
         self.td.cleanup()
 
-    def _drive_to_conflict(self, cfg: Config):
+    def _drive_through_conflict(self, cfg: Config):
         """Run the stub through AWAITING_REVIEW with a README clash queued
         against main, then call approve_and_commit under `cfg`."""
         scan_once(cfg, self.store)
@@ -512,18 +520,9 @@ class TestAutoResolveConflicts(unittest.TestCase):
         approve_and_commit(cfg, self.store, item, "stub commit")
         return self.store.get(item.id)
 
-    def test_auto_resolve_off_leaves_conflicted(self):
+    def test_chain_requeues_with_feedback(self):
         cfg = _mk_config(self.root)
-        cfg.git.auto_resolve_conflicts = False
-        final = self._drive_to_conflict(cfg)
-        self.assertEqual(final.status, ItemStatus.CONFLICTED)
-        self.assertIsNone(final.feedback)
-        self.assertIsNotNone(final.last_error)
-
-    def test_auto_resolve_on_requeues_with_feedback(self):
-        cfg = _mk_config(self.root)
-        cfg.git.auto_resolve_conflicts = True  # re-enable (fixture forces off)
-        final = self._drive_to_conflict(cfg)
+        final = self._drive_through_conflict(cfg)
 
         self.assertEqual(final.status, ItemStatus.QUEUED)
         self.assertIsNone(final.last_error)
@@ -538,15 +537,14 @@ class TestAutoResolveConflicts(unittest.TestCase):
         self.assertIn("main", fb)
         self.assertIn("README.md", fb)
 
-    def test_auto_resolve_on_marks_transition_note(self):
+    def test_chain_marks_transition_note(self):
         """Chained resubmit tags the CONFLICTED → QUEUED transition so the
         dashboard can distinguish an auto-chain from a manual resubmit AND
         flips result_json so the runner skips the plan phase on the next
         dispatch (conflict resolution is pure execute work)."""
         from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
         cfg = _mk_config(self.root)
-        cfg.git.auto_resolve_conflicts = True  # re-enable (fixture forces off)
-        final = self._drive_to_conflict(cfg)
+        final = self._drive_through_conflict(cfg)
 
         self.assertEqual(final.status, ItemStatus.QUEUED)
         history = self.store.transitions_for(final.id)
@@ -573,16 +571,21 @@ class TestAutoResolveConflicts(unittest.TestCase):
         self.assertIn("force_execute", chain[0].note or "")
 
     def test_manual_resubmit_has_no_auto_marker(self):
-        """Manual `resubmit_conflicted` call (auto off) must not carry the
-        marker — the dashboard uses its absence to keep the indicator
-        silent."""
+        """Manual `resubmit_conflicted` (e.g. after `[m]` retry_merge still
+        conflicts) must not carry the auto marker — the dashboard uses its
+        absence to keep the indicator silent."""
         from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
         cfg = _mk_config(self.root)
-        # Force off so drive reaches CONFLICTED without chaining; then call
-        # resubmit_conflicted manually to simulate a non-auto-chain path.
-        cfg.git.auto_resolve_conflicts = False
-        conflicted = self._drive_to_conflict(cfg)
-        self.assertEqual(conflicted.status, ItemStatus.CONFLICTED)
+        # Drive through approve_and_commit, then walk the item back to
+        # CONFLICTED (as retry_merge would on continued conflict) so we can
+        # exercise the manual resubmit path directly.
+        requeued = self._drive_through_conflict(cfg)
+        self.store.transition(
+            requeued.id, ItemStatus.CONFLICTED,
+            last_error="still conflicting on README.md",
+            note="retry merge still conflicts on main",
+        )
+        conflicted = self.store.get(requeued.id)
 
         resubmit_conflicted(cfg, self.store, conflicted)
 
@@ -594,11 +597,14 @@ class TestAutoResolveConflicts(unittest.TestCase):
             if t.from_status == ItemStatus.CONFLICTED
             and t.to_status == ItemStatus.QUEUED
         ]
-        self.assertEqual(len(chain), 1)
+        # Two CONFLICTED → QUEUED transitions now exist: the auto-chain
+        # from approve_and_commit and the manual one we just triggered.
+        self.assertEqual(len(chain), 2)
+        latest = max(chain, key=lambda t: t.at)
         self.assertFalse(
-            (chain[0].note or "").startswith(AUTO_RESOLVE_NOTE_PREFIX),
+            (latest.note or "").startswith(AUTO_RESOLVE_NOTE_PREFIX),
             f"manual resubmit should not carry the auto marker: "
-            f"note={chain[0].note!r}",
+            f"note={latest.note!r}",
         )
 
 
@@ -1104,6 +1110,7 @@ class TestAdvanceUserCheckoutNoteSurfacing(unittest.TestCase):
     for opt-outs)."""
 
     def setUp(self):
+        _suppress_auto_chain(self)
         self.td = TemporaryDirectory()
         self.root = Path(self.td.name)
         _init_project(self.root)

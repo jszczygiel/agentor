@@ -246,18 +246,6 @@ class GitConfig:
     # conflicts, the feature worktree is left in its pre-rebase state and
     # the item is parked in CONFLICTED.
     merge_mode: str = "merge"
-    # When true, a CONFLICTED transition from approve_and_commit is
-    # immediately followed by resubmit_conflicted — the item lands in
-    # QUEUED with conflict-resolution feedback so the agent fixes the
-    # integration in-place. Default-on: failed integrations bounce back
-    # to the agent without operator intervention. Covers every failure
-    # mode that `git_ops.merge_feature_into_base` funnels into the
-    # CONFLICTED path — true merge/rebase conflicts, rebase aborts, and
-    # CAS races where base advanced under the integration. Opt out by
-    # setting `auto_resolve_conflicts = false` so conflicts park at
-    # CONFLICTED for the operator to resolve by hand in the feature
-    # worktree and press `[m]` retry merge in the dashboard.
-    auto_resolve_conflicts: bool = True
     # After a clean auto-merge CAS-advances `refs/heads/<base_branch>`, the
     # user's primary checkout at `project.root` still reads stale files
     # until they manually `git pull`. When true, the committer fast-forwards

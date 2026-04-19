@@ -27,9 +27,9 @@ class TestInspectActionMap(unittest.TestCase):
         self.assertEqual(keys, {"a", "r", "s", "v", "x"})
 
     def test_conflicted_has_retry_merge_defer_delete(self):
-        # [e]resubmit-to-agent collapsed into the [m]retry-merge binding:
-        # operators pick one or the other via `git.auto_resolve_conflicts`,
-        # which automates the resubmit path when enabled.
+        # [e]resubmit-to-agent collapsed into the [m]retry-merge binding;
+        # the committer's unconditional auto-chain covers the resubmit path
+        # on every CONFLICTED transition.
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[ItemStatus.CONFLICTED]}
         self.assertEqual(keys, {"m", "s", "x"})
 

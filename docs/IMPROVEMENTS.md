@@ -24,11 +24,11 @@ the current task's scope.
 - `tests/test_dashboard_resize.py` has two F401 unused-import errors (`SimpleNamespace`
   at line 9, `ItemStatus` at line 174) introduced in `6cde420`. Same story as the
   `test_config.py` bullet — noisy on `ruff check` but doesn't block tests.
-- When `git.auto_resolve_conflicts` chains a CONFLICTED item back into QUEUED,
-  the dashboard inspect view shows no explicit signal that the re-queue was
-  automatic. Consider tagging the transition note (or surfacing an auto-resolve
-  badge in the main table) so operators can distinguish a human `[e]` resubmit
-  from a committer-driven one.
+- The committer unconditionally chains a CONFLICTED item back into QUEUED,
+  but the dashboard inspect view shows no explicit signal that the re-queue
+  was automatic. Consider tagging the transition note (or surfacing an
+  auto-resolve badge in the main table) so operators can distinguish a human
+  `[e]` resubmit from a committer-driven one.
 - Audit for other stale `ItemStatus.BACKLOG` references across the codebase.
   `agentor/dashboard/render.py:_STATE_GLYPHS` carried a `BACKLOG: "B"` entry
   that broke every import after the enum member was removed on main — the
