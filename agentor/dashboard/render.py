@@ -17,6 +17,7 @@ from .formatters import (
     _ctx_fill_pct,
     _elapsed_for,
     _fmt_elapsed,
+    _fmt_token_compact,
     _fmt_token_line,
     _fmt_token_line_mid,
     _fmt_token_line_narrow,
@@ -168,10 +169,18 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     # unresolved last_error. Surfaces stuck/faulty items in the header
     # even when the default 'all' filter would visually smear them into
     # the rest of the queue.
-    status_line = _build_status_line(tier, cfg, s, counts, len(daemon.workers))
+    # Compute once and reuse — the token-windows cache makes the second
+    # call free but explicit sharing keeps the data-flow obvious.
+    token_windows = _token_windows(store, daemon.started_at)
+    token_compact = _fmt_token_compact(token_windows)
+    status_line = _build_status_line(
+        tier, cfg, s, counts, len(daemon.workers),
+        token_compact=token_compact,
+    )
     _safe_addstr(stdscr, row, 0, status_line, w)
     row += 1
-    row = _render_token_panel(stdscr, row, w, store, daemon, tier)
+    row = _render_token_panel(stdscr, row, w, store, daemon, tier,
+                              windows=token_windows)
     _safe_addstr(stdscr, row, 0, "─" * w, w, curses.A_DIM)
     row += 1
 
@@ -291,11 +300,18 @@ def _build_alert_banner(alert: str, w: int) -> str:
 
 
 def _build_status_line(tier: str, cfg, stats, counts: dict,
-                       worker_count: int) -> str:
+                       worker_count: int,
+                       token_compact: str = "") -> str:
     """Tier-aware status/counts line. Mid/narrow abbreviate heavily so the
     most important counters (pool/workers/review-queue/errors) survive a
-    phone-width terminal."""
+    phone-width terminal.
+
+    `token_compact` is the compact session/weekly token indicator (see
+    `_fmt_token_compact`). Appended to the wide tier only — mid and narrow
+    have no spare budget, and the token panel still shows their tier-
+    specific totals."""
     if tier == "wide":
+        tail = f"  │  {token_compact}" if token_compact else ""
         return (
             f" {cfg.agent.runner}  pool={cfg.agent.pool_size}  "
             f"workers={worker_count}  "
@@ -308,6 +324,7 @@ def _build_status_line(tier: str, cfg, stats, counts: dict,
             f"deferred={counts[ItemStatus.DEFERRED]}  "
             f"merged={counts[ItemStatus.MERGED]}  "
             f"rejected={counts[ItemStatus.REJECTED]}"
+            f"{tail}"
         )
     review = (counts[ItemStatus.AWAITING_PLAN_REVIEW]
               + counts[ItemStatus.AWAITING_REVIEW])
@@ -328,12 +345,18 @@ def _build_status_line(tier: str, cfg, stats, counts: dict,
 
 
 def _render_token_panel(stdscr, row: int, w: int, store, daemon,
-                        tier: str = "wide") -> int:
+                        tier: str = "wide",
+                        windows: dict | None = None) -> int:
     """Draw the cumulative token-usage panel: one line per time window
     (session / today / 7d). Tier-aware so the 71-char wide format
     doesn't silently clip on phone-width terminals. Returns the next
-    free row."""
-    windows = _token_windows(store, daemon.started_at)
+    free row.
+
+    `windows` may be pre-computed by the caller to avoid a second
+    `_token_windows` call in the same render tick (the 2s cache also
+    deduplicates, but explicit sharing keeps call-ownership obvious)."""
+    if windows is None:
+        windows = _token_windows(store, daemon.started_at)
     if tier != "narrow":
         _safe_addstr(stdscr, row, 0, " tokens".ljust(w), w,
                      curses.A_DIM | curses.A_BOLD)

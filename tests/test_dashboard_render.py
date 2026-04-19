@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agentor.dashboard.formatters import _token_windows_invalidate
 from agentor.dashboard.render import (
     ACTIONS,
     ACTIONS_MID,
@@ -38,6 +39,12 @@ class _FakeStdscr:
 
     def addnstr(self, y, x, s, w, attr=0):
         self.lines.append((y, s[:w]))
+
+    def erase(self):
+        self.lines.clear()
+
+    def refresh(self):
+        pass
 
 
 class TestActionsHint(unittest.TestCase):
@@ -153,6 +160,38 @@ class TestStatusLineTier(unittest.TestCase):
         self.assertLessEqual(len(line), 40)
         self.assertIn("p=3", line)
         self.assertIn("R=4", line)
+
+    def test_wide_appends_compact_indicator_when_provided(self):
+        line = _build_status_line(
+            "wide", self._cfg(), self._stats(), self._counts(), 1,
+            token_compact="tok sess=1.2k  wk=3.4M",
+        )
+        self.assertIn("tok sess=1.2k  wk=3.4M", line)
+
+    def test_wide_without_compact_unchanged(self):
+        # Default empty token_compact → no trailing indicator substring.
+        line = _build_status_line("wide", self._cfg(), self._stats(),
+                                  self._counts(), 1)
+        self.assertNotIn("tok sess=", line)
+        self.assertNotIn("wk=", line)
+
+    def test_mid_ignores_compact_indicator(self):
+        # Passing token_compact at mid must not push line past the 60-col
+        # budget — mid drops the indicator entirely.
+        line = _build_status_line(
+            "mid", self._cfg(), self._stats(), self._counts(), 1,
+            token_compact="tok sess=1.2k  wk=3.4M",
+        )
+        self.assertLessEqual(len(line), 60)
+        self.assertNotIn("tok sess=", line)
+
+    def test_narrow_ignores_compact_indicator(self):
+        line = _build_status_line(
+            "narrow", self._cfg(), self._stats(), self._counts(), 1,
+            token_compact="tok sess=1.2k  wk=3.4M",
+        )
+        self.assertLessEqual(len(line), 40)
+        self.assertNotIn("tok sess=", line)
 
 
 def _make_item(title="hello", src="docs/backlog/foo.md") -> StoredItem:
@@ -347,6 +386,73 @@ class TestRenderTokenPanel(unittest.TestCase):
         self.assertIn("7d", joined)
         # Values are formatted via _fmt_tokens — 78000 → "78.0k".
         self.assertIn("78.0k", joined)
+
+
+class TestRenderStatusLineTokenIndicator(unittest.TestCase):
+    """The compact `tok sess=… wk=…` indicator is appended to the main status
+    line so cumulative session + weekly spend is readable at a glance without
+    scanning the full token panel."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.store = Store(Path(self.td.name) / "state.db")
+        item = Item(id="a", title="t", body="", source_file="s.md",
+                    source_line=1, tags={})
+        self.store.upsert_discovered(item)
+        # 1234 + 56 + 78000 + 9 = 79299 → "79.3k" via _fmt_tokens.
+        self.store.update_result_json("a", json.dumps({
+            "usage": {
+                "input_tokens": 1234,
+                "output_tokens": 56,
+                "cache_read_input_tokens": 78000,
+                "cache_creation_input_tokens": 9,
+            },
+        }))
+        # Shared across tests — clear so our known totals aren't masked by
+        # a prior run's cached result (see `_TOKEN_CACHE_TTL_S`).
+        _token_windows_invalidate()
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _render_once(self, width: int = 200):
+        stdscr = _FakeStdscr(width=width)
+        cfg = SimpleNamespace(
+            project_name="demo",
+            agent=SimpleNamespace(runner="stub", pool_size=1,
+                                  context_window=200_000),
+        )
+        daemon = SimpleNamespace(
+            stats=SimpleNamespace(completed=0),
+            system_alert=None,
+            started_at=0.0,
+            workers=set(),
+        )
+        with patch("agentor.dashboard.render.curses.color_pair",
+                   return_value=0), \
+             patch("agentor.dashboard.render._set_terminal_title"):
+            _render(stdscr, cfg, self.store, daemon, log_ring=[],
+                    filter_idx=0, selected_id=None)
+        return stdscr.lines
+
+    def test_status_line_contains_compact_indicator(self):
+        lines = self._render_once()
+        joined = "\n".join(s for _, s in lines)
+        # Session (daemon not started → mirrors today) and 7d windows
+        # both include the only seeded item → totals match.
+        self.assertIn("tok sess=79.3k", joined)
+        self.assertIn("wk=79.3k", joined)
+
+    def test_indicator_lives_on_status_line_not_panel(self):
+        # The panel row for "session" starts with " session" (leading space
+        # from _render_token_panel). The compact indicator must be on the
+        # *preceding* status line — i.e. the line with `pool=`.
+        lines = self._render_once()
+        status_lines = [s for _, s in lines if "pool=" in s]
+        self.assertEqual(len(status_lines), 1)
+        self.assertIn("tok sess=", status_lines[0])
+        self.assertIn("wk=", status_lines[0])
 
 
 class TestPriorityGlyph(unittest.TestCase):
