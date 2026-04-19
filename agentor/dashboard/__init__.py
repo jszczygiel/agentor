@@ -119,11 +119,11 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
             if ch in (10, 13, curses.KEY_ENTER) and rendered and selected_id:
                 sel = store.get(selected_id)
                 if sel is not None:
-                    # Route by status: BACKLOG/DEFERRED → pickup screen,
-                    # AWAITING_PLAN_REVIEW/AWAITING_REVIEW → review screens,
-                    # everything else → live inspect. `i` still opens the
-                    # prefix-prompt inspect as a backward-compatible escape
-                    # hatch.
+                    # Unified detail view: Enter always opens inspect,
+                    # which exposes the action set (approve/reject/defer/
+                    # retry merge/diff/etc.) gated by the item's current
+                    # status. The `r`/`d` keys still kick off cycling
+                    # walks through the review and deferred queues.
                     _enter_action(stdscr, cfg, store, daemon, sel)
                     # Flush any keys typed while the sub-screen was
                     # tearing down — a double-tap of 'q' to close
@@ -138,9 +138,9 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
             elif k == "n":
                 _new_issue_mode(stdscr, cfg, store, daemon)
             elif k == "d":
-                _deferred_mode(stdscr, cfg, store)
+                _deferred_mode(stdscr, cfg, store, daemon)
             elif k == "i":
-                _inspect_mode(stdscr, cfg, store)
+                _inspect_mode(stdscr, cfg, store, daemon)
             elif ch in (ord("+"), ord("=")):
                 # '=' is the unshifted key that shares '+'; accept both so
                 # the user doesn't have to hold shift. Kick dispatch now so

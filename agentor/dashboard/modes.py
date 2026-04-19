@@ -30,7 +30,6 @@ from .render import (
     _scroll_key,
     _show_item_screen,
     _view_text_in_curses,
-    _wrap,
 )
 from .transcript import (
     _session_activity,
@@ -39,164 +38,106 @@ from .transcript import (
 )
 
 
-def _pickup_one_screen(stdscr, cfg: Config, store: Store, daemon: Daemon,
-                       fresh: StoredItem) -> str:
-    """Single pickup screen for one DEFERRED item. Returns "quit" on q,
-    else "" when the user advances (a/s/x/n). Caller owns nodelay state.
-    Approve restores the item to its previous settled status; legacy items
-    whose history leads back to BACKLOG are promoted directly to QUEUED so
-    they don't get stuck in a dead bucket."""
-    from ..committer import defer, delete_idea, restore_deferred
-    scroll = 0
-    while True:
-        h, w = stdscr.getmaxyx()
-        header = [
-            f"  pickup · {fresh.status.value} · {fresh.title}",
-            f"  id {fresh.id[:8]}  source {fresh.source_file}:"
-            f"{fresh.source_line}  attempts "
-            f"{fresh.attempts}/{cfg.agent.max_attempts}",
-        ]
-        body = _wrap(fresh.body or "(no description)", w - 2)
-        _show_item_screen(
-            stdscr, header, body,
-            " [a]approve  [f]approve+feedback  [s]defer  [x]delete  "
-            "[n]leave  [q]uit · [j/k]scroll ",
-            content_scroll=scroll,
-        )
-        ch = stdscr.getch()
-        new_scroll = _scroll_key(ch, scroll, len(body), max(1, h - 6))
-        if new_scroll >= 0:
-            scroll = new_scroll
-            continue
-        k = chr(ch).lower() if 0 < ch < 256 else ""
-        if k == "q":
-            return "quit"
-        if k in ("a", "f"):
-            f = store.get(fresh.id)
-            if f is None:
-                return ""
-            feedback: str | None = None
-            if k == "f":
-                feedback = _prompt_text(
-                    stdscr, "feedback for agent (empty = cancel): "
-                ) or None
-                if feedback is None:
-                    continue
-            if f.status == ItemStatus.DEFERRED:
-                restored = restore_deferred(store, f)
-                if restored == ItemStatus.BACKLOG:
-                    # Legacy rows whose history leads back to BACKLOG — the
-                    # gate no longer exists, so skip it straight to QUEUED.
-                    fields: dict[str, object] = {}
-                    if feedback:
-                        fields["feedback"] = feedback
-                    store.transition(
-                        f.id, ItemStatus.QUEUED,
-                        note="approved by user (legacy backlog → queued)"
-                        + (" with feedback" if feedback else ""),
-                        **fields,
-                    )
-            daemon.try_fill_pool()
-            return ""
-        if k == "s":
-            f = store.get(fresh.id)
-            if f and f.status != ItemStatus.DEFERRED:
-                defer(store, f)
-            return ""
-        if k == "x":
-            f = store.get(fresh.id)
-            if f and _prompt_yn(stdscr, "delete this idea?"):
-                delete_idea(store, f)
-            return ""
-        if k in ("n", ""):
-            return ""
-
-
-_ENTER_ROUTES = {
-    ItemStatus.DEFERRED: "pickup",
-    ItemStatus.AWAITING_PLAN_REVIEW: "plan_review",
-    ItemStatus.AWAITING_REVIEW: "code_review",
+# Unified action keymap per item status. Each entry is (key, label).
+# The inspect view renders these as footer hints and gates keystrokes
+# against the set so a key only fires when the status allows it.
+# Terminal states (MERGED, CANCELLED, APPROVED) and mid-flight states
+# (WORKING, QUEUED) intentionally have no entries — view-only.
+_ACTION_KEYS_BY_STATUS: dict[ItemStatus, list[tuple[str, str]]] = {
+    ItemStatus.AWAITING_PLAN_REVIEW: [
+        ("a", "[a]approve→execute"),
+        ("f", "[f]approve+feedback"),
+        ("r", "[r]eject+feedback"),
+        ("s", "[s]defer"),
+    ],
+    ItemStatus.AWAITING_REVIEW: [
+        ("a", "[a]approve+merge"),
+        ("r", "[r]eject+feedback"),
+        ("s", "[s]defer"),
+        ("v", "[v]diff"),
+    ],
+    ItemStatus.CONFLICTED: [
+        ("m", "[m]retry merge"),
+        ("e", "[e]resubmit to agent"),
+        ("s", "[s]defer"),
+    ],
+    ItemStatus.ERRORED: [
+        ("a", "[a]retry"),
+        ("s", "[s]defer"),
+    ],
+    ItemStatus.REJECTED: [
+        ("a", "[a]retry"),
+    ],
+    ItemStatus.DEFERRED: [
+        ("a", "[a]restore"),
+        ("x", "[x]delete"),
+    ],
+    ItemStatus.BACKLOG: [
+        ("a", "[a]approve→queued"),
+        ("x", "[x]delete"),
+    ],
 }
 
 
-def _enter_route(status: ItemStatus) -> str:
-    """Pure router: dashboard status → action key for enter.
-    QUEUED is past pickup (already claimed by the scheduler), so it falls
-    through to inspect along with WORKING/MERGED/ERRORED/CONFLICTED/etc."""
-    return _ENTER_ROUTES.get(status, "inspect")
+def _inspect_action_label(status: ItemStatus) -> str:
+    """Footer-ready label string for the actions available at `status`.
+    Empty string when there are no actions — caller renders a view-only
+    footer."""
+    pairs = _ACTION_KEYS_BY_STATUS.get(status, [])
+    return "  ".join(label for _, label in pairs)
 
 
 def _enter_action(stdscr, cfg: Config, store: Store, daemon: Daemon,
                   item: StoredItem) -> None:
-    """Handle enter on the selected row. Re-fetches the item before acting
-    (status may have changed since the last render) and dispatches to the
-    matching single-item screen."""
+    """Handle enter on the selected row. Always opens the unified inspect
+    detail view — the view itself exposes the action set appropriate for
+    the item's current status, so pickup/review/deferred actions are all
+    reachable directly from the main table."""
     fresh = store.get(item.id)
     if fresh is None:
         _flash(stdscr, "item no longer exists.")
         return
-    route = _enter_route(fresh.status)
     stdscr.nodelay(False)
     try:
-        if route == "pickup":
-            _pickup_one_screen(stdscr, cfg, store, daemon, fresh)
-        elif route in ("plan_review", "code_review"):
-            # Enter on a review row engages the full cycle with this item
-            # as the starting point, so approving doesn't drop back to the
-            # main list while other items still await review.
-            _review_mode(stdscr, cfg, store, daemon, start_item=fresh)
-        else:
-            _inspect_render(stdscr, cfg, store, fresh)
+        _inspect_render(stdscr, cfg, store, fresh, daemon)
     finally:
         stdscr.nodelay(True)
 
 
-def _deferred_mode(stdscr, cfg: Config, store: Store) -> None:
-    """Walk DEFERRED items as curses-native screens. r=restore, n=leave, q=quit."""
-    from ..committer import restore_deferred
+def _deferred_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
+    """Walk DEFERRED items as unified inspect screens. Each iteration
+    exposes the full deferred action set (restore/delete) plus [n]ext and
+    [q]uit. Items whose status drifted out of DEFERRED between the initial
+    snapshot and render are skipped."""
     items = store.list_by_status(ItemStatus.DEFERRED)
     if not items:
         _flash(stdscr, "no deferred items.")
         return
     stdscr.nodelay(False)
     try:
+        seen: set[str] = set()
         for it in items:
             fresh = store.get(it.id)
-            if fresh is None:
+            if fresh is None or fresh.status != ItemStatus.DEFERRED:
                 continue
-            h, w = stdscr.getmaxyx()
-            header = [
-                f"  deferred · {fresh.title}",
-                f"  id {fresh.id[:8]}  source {fresh.source_file}",
-            ]
-            body = _wrap(fresh.body or "(no description)", w - 2)
-            scroll = 0
-            while True:
-                _show_item_screen(
-                    stdscr, header, body,
-                    " [r]estore  [n]leave  [q]uit · [j/k]scroll ",
-                    content_scroll=scroll,
-                )
-                ch = stdscr.getch()
-                new_scroll = _scroll_key(ch, scroll, len(body), max(1, h - 6))
-                if new_scroll >= 0:
-                    scroll = new_scroll
-                    continue
-                k = chr(ch).lower() if 0 < ch < 256 else ""
-                if k == "q":
-                    return
-                if k == "r":
-                    restore_deferred(store, fresh)
-                    break
-                if k in ("n", ""):
-                    break
+            seen.add(it.id)
+            remaining = sum(
+                1 for d in store.list_by_status(ItemStatus.DEFERRED)
+                if d.id not in seen
+            )
+            signal = _inspect_render(
+                stdscr, cfg, store, fresh, daemon,
+                cycle=True, remaining=remaining,
+            )
+            if signal == "quit":
+                return
     finally:
         stdscr.nodelay(True)
 
 
-def _inspect_mode(stdscr, cfg: Config, store: Store) -> None:
-    """Prompt (in-curses) for an item id prefix, then render the full detail
-    view in a scrollable single-item screen. Blank input = first WORKING item."""
+def _inspect_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
+    """Prompt (in-curses) for an item id prefix, then render the unified
+    detail view. Blank input = first WORKING item."""
     stdscr.nodelay(False)
     try:
         prefix = _prompt_text(stdscr, "item id prefix (blank = working): ")
@@ -215,16 +156,28 @@ def _inspect_mode(stdscr, cfg: Config, store: Store) -> None:
         if target is None:
             _flash(stdscr, f"no item matching {prefix!r}")
             return
-        _inspect_render(stdscr, cfg, store, target)
+        _inspect_render(stdscr, cfg, store, target, daemon)
     finally:
         stdscr.nodelay(True)
 
 
-def _inspect_render(stdscr, cfg: Config, store: Store, item: StoredItem) -> None:
-    """Render inspect as a live view. Re-fetches the item and rebuilds the
-    detail block on every tick so an in-flight agent's activity feed updates
-    in place. Uses `timeout(1000)` so getch returns -1 once per second and
-    drives a redraw even without keypresses."""
+def _inspect_render(
+    stdscr, cfg: Config, store: Store, item: StoredItem,
+    daemon: Daemon | None = None, *,
+    cycle: bool = False, remaining: int = 0,
+) -> str:
+    """Unified single-item detail view. Re-fetches the item on every tick
+    so transcript activity and status changes render in place. Actions
+    available at the footer are gated by the item's current status
+    (see `_ACTION_KEYS_BY_STATUS`) so entry point does not restrict what
+    the operator can do.
+
+    Return values:
+      "quit" — user pressed q, caller should stop any cycling walk.
+      ""     — view closed (non-cycle) or caller may advance to the next
+               item (cycle). Also returned when an action changed state;
+               the caller re-queries the store for the next item.
+    """
     scroll = 0
     stdscr.timeout(1000)
     try:
@@ -233,18 +186,14 @@ def _inspect_render(stdscr, cfg: Config, store: Store, item: StoredItem) -> None
             item = fresh
             lines = _build_detail_lines(cfg, store, item)
             h, w = stdscr.getmaxyx()
+            queue_suffix = (
+                f"  · {remaining} left" if cycle and remaining > 0 else ""
+            )
             header = [
-                f"  inspect · {item.title}",
+                f"  inspect · {item.title}{queue_suffix}",
                 f"  id {item.id[:8]}  status {item.status.value}",
             ]
-            footer = (
-                " [q/enter]close · [j/k]scroll · [space/pgdn]page · "
-                "auto-refresh 1s "
-                + ("· [m]retry merge · [e]resubmit to agent "
-                   if item.status == ItemStatus.CONFLICTED else "")
-                + ("· [r]retry " if item.status == ItemStatus.ERRORED
-                   else "")
-            )
+            footer = _inspect_footer(item.status, cycle=cycle)
             _show_item_screen(
                 stdscr, header, lines, footer, content_scroll=scroll,
             )
@@ -256,51 +205,209 @@ def _inspect_render(stdscr, cfg: Config, store: Store, item: StoredItem) -> None
                 scroll = new_scroll
                 continue
             k = chr(ch).lower() if 0 < ch < 256 else ""
-            if k == "q" or ch in (10, 13, 27):
-                return
-            if k == "m" and item.status == ItemStatus.CONFLICTED:
-                from ..committer import retry_merge
-                try:
-                    ok_msg = _run_with_progress(
-                        stdscr, f"  retry merge · {item.title}",
-                        lambda p: retry_merge(cfg, store, item, progress=p),
-                        hint="git worktree add + merge/rebase runs here.",
-                    )
-                    _, msg = ok_msg  # type: ignore[misc]
-                except Exception as e:  # git or state errors
-                    msg = f"retry failed: {e}"
+            if k == "q":
+                return "quit"
+            if ch in (10, 13, 27) or k == "n":
+                return ""
+            acted, msg = _inspect_dispatch(
+                stdscr, cfg, store, daemon, item, k,
+            )
+            if msg:
                 _flash(stdscr, msg)
-                # If it resolved, drop back to the list — the item is no
-                # longer conflicted so there's nothing more to inspect.
-                refreshed = store.get(item.id)
-                if refreshed and refreshed.status != ItemStatus.CONFLICTED:
-                    return
-            if k == "e" and item.status == ItemStatus.CONFLICTED:
-                from ..committer import resubmit_conflicted
-                try:
-                    resubmit_conflicted(cfg, store, item)
-                    msg = (f"resubmitted: {item.id[:8]} → queued "
-                           f"(agent will resolve)")
-                except Exception as e:
-                    msg = f"resubmit failed: {e}"
-                _flash(stdscr, msg)
-                refreshed = store.get(item.id)
-                if refreshed and refreshed.status != ItemStatus.CONFLICTED:
-                    return
-            if k == "r" and item.status == ItemStatus.ERRORED:
-                from ..committer import retry
-                try:
-                    retry(store, item)
-                    msg = f"retry: {item.id[:8]} → queued"
-                except Exception as e:
-                    msg = f"retry failed: {e}"
-                _flash(stdscr, msg)
-                refreshed = store.get(item.id)
-                if refreshed and refreshed.status != ItemStatus.ERRORED:
-                    return
+            if not acted:
+                continue
+            refreshed = store.get(item.id)
+            if cycle:
+                return ""
+            # Non-cycle: drop back to table once the item left its prior
+            # status so the operator sees the row moved. Stay put if the
+            # action didn't actually change state (e.g. retry_merge still
+            # conflicts) so the updated last_error is visible.
+            if refreshed is None or refreshed.status != item.status:
+                return ""
     finally:
-        # Restore the main loop's refresh cadence.
         stdscr.timeout(REFRESH_MS)
+
+
+def _inspect_footer(status: ItemStatus, *, cycle: bool) -> str:
+    """Compose the inspect-view action hint. Cycle mode adds [n]ext to
+    advance without acting; non-cycle mode uses [q/enter]close."""
+    action_label = _inspect_action_label(status)
+    nav = "[j/k]scroll · [space/pgdn]page · auto-refresh 1s"
+    close = "[n]ext  [q]uit" if cycle else "[q/enter]close"
+    parts = [action_label, close] if action_label else [close]
+    return " " + "  ".join(parts) + " · " + nav + " "
+
+
+def _inspect_dispatch(
+    stdscr, cfg: Config, store: Store, daemon: Daemon | None,
+    item: StoredItem, key: str,
+) -> tuple[bool, str]:
+    """Apply `key` against the item's current status. Returns
+    (acted, flash_message). `acted=True` means a state-changing committer
+    call was attempted; the caller reacts by advancing or refreshing.
+    `acted=False` is returned when the key isn't bound at this status or
+    when a prompt was cancelled."""
+    if not key:
+        return False, ""
+    valid = {k for k, _ in _ACTION_KEYS_BY_STATUS.get(item.status, [])}
+    if key not in valid:
+        return False, ""
+    # Lazy imports sidestep the circular committer ↔ store ↔ dashboard
+    # chain; see CLAUDE.md "Gotchas from prior runs".
+    from ..committer import (
+        approve_and_commit,
+        approve_plan,
+        defer,
+        delete_idea,
+        reject_and_retry,
+        restore_deferred,
+        resubmit_conflicted,
+        retry,
+        retry_merge,
+    )
+
+    status = item.status
+
+    if status == ItemStatus.AWAITING_PLAN_REVIEW:
+        if key == "a":
+            approve_plan(store, item)
+            if daemon is not None:
+                daemon.try_fill_pool()
+            return True, "plan approved → execute queued"
+        if key == "f":
+            feedback = _prompt_text(
+                stdscr, "feedback for execute phase (empty = cancel): "
+            )
+            if not feedback:
+                return False, ""
+            approve_plan(store, item, feedback=feedback)
+            if daemon is not None:
+                daemon.try_fill_pool()
+            return True, "plan approved with feedback"
+        if key == "r":
+            feedback = _prompt_text(
+                stdscr, "feedback (plan retry, empty=cancel): "
+            )
+            if not feedback:
+                return False, ""
+            reject_and_retry(store, item, feedback)
+            return True, "plan rejected — agent will re-plan"
+        if key == "s":
+            defer(store, item)
+            return True, "deferred"
+
+    if status == ItemStatus.AWAITING_REVIEW:
+        if key == "a":
+            msg = _build_commit_message(item)
+            try:
+                _run_with_progress(
+                    stdscr, f"  approve + merge · {item.title}",
+                    lambda p: approve_and_commit(
+                        cfg, store, item, msg, progress=p),
+                    hint="git worktree add + merge/rebase runs here.",
+                )
+            except Exception as e:  # git/state errors
+                return True, f"merge failed: {e}"
+            return True, "merge complete"
+        if key == "r":
+            feedback = _prompt_text(
+                stdscr, "feedback (code retry, empty=cancel): "
+            )
+            if not feedback:
+                return False, ""
+            reject_and_retry(store, item, feedback)
+            return True, "code rejected — agent will re-execute"
+        if key == "s":
+            defer(store, item)
+            return True, "deferred"
+        if key == "v":
+            if not item.worktree_path:
+                return False, "no worktree — nothing to diff"
+            wt = Path(item.worktree_path)
+            try:
+                diff = _run_with_progress(
+                    stdscr, f"  diff · {item.title}",
+                    lambda p: (p("git diff vs base"),
+                               diff_vs_base(wt, cfg.git.base_branch))[-1],
+                    hint="git diff against base branch.",
+                )
+            except Exception as e:
+                return False, f"diff failed: {e}"
+            text = diff if isinstance(diff, str) else ""
+            _view_text_in_curses(stdscr, text or "(empty diff)")
+            return False, ""
+
+    if status == ItemStatus.CONFLICTED:
+        if key == "m":
+            try:
+                ok_msg = _run_with_progress(
+                    stdscr, f"  retry merge · {item.title}",
+                    lambda p: retry_merge(cfg, store, item, progress=p),
+                    hint="git worktree add + merge/rebase runs here.",
+                )
+                _, msg = ok_msg  # type: ignore[misc]
+            except Exception as e:
+                msg = f"retry failed: {e}"
+            return True, msg
+        if key == "e":
+            try:
+                resubmit_conflicted(cfg, store, item)
+                msg = (f"resubmitted: {item.id[:8]} → queued "
+                       f"(agent will resolve)")
+            except Exception as e:
+                msg = f"resubmit failed: {e}"
+            return True, msg
+        if key == "s":
+            defer(store, item)
+            return True, "deferred"
+
+    if status in (ItemStatus.ERRORED, ItemStatus.REJECTED):
+        if key == "a":
+            try:
+                retry(store, item)
+            except Exception as e:
+                return False, f"retry failed: {e}"
+            return True, f"retry: {item.id[:8]} → queued"
+        if key == "s":
+            defer(store, item)
+            return True, "deferred"
+
+    if status == ItemStatus.DEFERRED:
+        if key == "a":
+            restored = restore_deferred(store, item)
+            if restored == ItemStatus.BACKLOG:
+                # Legacy rows whose history leads back to BACKLOG — the
+                # gate no longer exists, so skip it straight to QUEUED.
+                store.transition(
+                    item.id, ItemStatus.QUEUED,
+                    note="approved by user (legacy backlog → queued)",
+                )
+            if daemon is not None:
+                daemon.try_fill_pool()
+            return True, "restored"
+        if key == "x":
+            if not _prompt_yn(stdscr, "delete this idea?"):
+                return False, ""
+            delete_idea(store, item)
+            return True, "deleted"
+
+    if status == ItemStatus.BACKLOG:
+        if key == "a":
+            store.transition(
+                item.id, ItemStatus.QUEUED,
+                note="approved by user (backlog → queued)",
+            )
+            if daemon is not None:
+                daemon.try_fill_pool()
+            return True, "queued"
+        if key == "x":
+            if not _prompt_yn(stdscr, "delete this idea?"):
+                return False, ""
+            delete_idea(store, item)
+            return True, "deleted"
+
+    return False, ""
 
 
 def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str]:
@@ -335,6 +442,10 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
             out.append(f"event:    {event_type}")
     if transcript_path.exists():
         out.append(f"log:      {transcript_path}")
+    if item.feedback:
+        out.append("")
+        out.append("── pending feedback ──")
+        out.extend(item.feedback[:2000].splitlines())
     if not data:
         out.append("")
         out.append("(no agent result yet — no token data)")
@@ -349,6 +460,10 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
                 out.append("")
                 out.append("── transcript tail ──")
                 out.extend(tail)
+        if item.status == ItemStatus.AWAITING_PLAN_REVIEW:
+            out.append("")
+            out.append("── plan ──")
+            out.append("(no plan text captured)")
         return out
     out.append("")
     out.append("── agent run ──")
@@ -375,6 +490,22 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
                        f"{_fmt_tokens(r['output']):>10} "
                        f"{_fmt_tokens(r['cache_read']):>12} "
                        f"{_fmt_tokens(r['cache_create']):>10}")
+    if item.status == ItemStatus.AWAITING_PLAN_REVIEW:
+        plan_text = data.get("plan") or data.get("summary")
+        if plan_text:
+            out.append("")
+            out.append("── plan ──")
+            out.extend(str(plan_text)[:4000].splitlines())
+    if item.status == ItemStatus.AWAITING_REVIEW:
+        files = data.get("files_changed") or []
+        if files:
+            out.append("")
+            out.append(f"── files changed ({len(files)}) ──")
+            for f in files[:50]:
+                out.append(f"  {f}")
+            if len(files) > 50:
+                out.append(f"  ... and {len(files) - 50} more")
+        out.append(f"tokens:   {_tokens_total(item)}")
     summary = data.get("result") or data.get("summary")
     if summary:
         out.append("")
@@ -437,10 +568,11 @@ def _next_review_item(store: Store, seen_ids: set[str]) -> StoredItem | None:
 
 def _review_mode(stdscr, cfg: Config, store: Store, daemon: Daemon,
                  start_item: StoredItem | None = None) -> None:
-    """Cycle through plan + code reviews as curses-native single-item screens.
-    Rescans the queue each iteration so items that transition into
-    AWAITING_* mid-session are visited. Returns to the main list only when
-    the queue is empty (or the user presses q)."""
+    """Cycle through plan + code reviews as unified inspect screens. Each
+    iteration exposes the full review action set (approve/reject+feedback/
+    defer/diff). Rescans the queue each iteration so items that transition
+    into AWAITING_* mid-session are visited. Returns to the main list only
+    when the queue is empty (or the user presses q)."""
     seen_ids: set[str] = set()
     first: StoredItem | None = None
     if start_item is not None:
@@ -463,6 +595,12 @@ def _review_mode(stdscr, cfg: Config, store: Store, daemon: Daemon,
             fresh = store.get(item.id)
             if fresh is None:
                 continue
+            if fresh.status not in (
+                ItemStatus.AWAITING_PLAN_REVIEW, ItemStatus.AWAITING_REVIEW,
+            ):
+                # Item left the review queue between scan and render (e.g.
+                # agent retried). Fall through to pick the next one.
+                continue
             # Snapshot remaining queue size for the header hint. Counts items
             # not yet visited this cycle, excluding the one about to render.
             remaining = sum(
@@ -472,178 +610,14 @@ def _review_mode(stdscr, cfg: Config, store: Store, daemon: Daemon,
                 for candidate in store.list_by_status(st)
                 if candidate.id not in seen_ids
             )
-            if fresh.status == ItemStatus.AWAITING_PLAN_REVIEW:
-                if _review_plan_curses(
-                    stdscr, cfg, store, daemon, fresh, remaining=remaining,
-                ) == "quit":
-                    return
-            elif fresh.status == ItemStatus.AWAITING_REVIEW:
-                if _review_code_curses(
-                    stdscr, cfg, store, daemon, fresh, remaining=remaining,
-                ) == "quit":
-                    return
-            # Any other status: item left the review queue between scan and
-            # render (e.g. agent retried). Fall through to pick the next.
+            signal = _inspect_render(
+                stdscr, cfg, store, fresh, daemon,
+                cycle=True, remaining=remaining,
+            )
+            if signal == "quit":
+                return
     finally:
         stdscr.nodelay(True)
-
-
-def _review_plan_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
-                        item: StoredItem, remaining: int = 0) -> str:
-    """Plan review as a single-item curses screen. Returns "quit" if the user
-    pressed q, else "" to continue walking. `remaining` is the number of
-    other items awaiting review at screen-open, surfaced in the header so
-    the operator can see the cycle's depth."""
-    from ..committer import approve_plan, defer
-    data = _result_data(item) or {}
-    plan_text = data.get("plan") or data.get("summary") or "(no plan text)"
-    scroll = 0
-    while True:
-        h, w = stdscr.getmaxyx()
-        queue_suffix = f"  · {remaining} left" if remaining > 0 else ""
-        header = [
-            f"  plan review · {item.title}",
-            f"  id {item.id[:8]}  session "
-            f"{(item.session_id or '—')[:8]}  source "
-            f"{item.source_file}:{item.source_line}{queue_suffix}",
-        ]
-        content = _wrap(plan_text, w - 2)
-        _show_item_screen(
-            stdscr, header, content,
-            " [a]approve → execute  [f]approve+feedback  "
-            "[r]eject+feedback  [s]defer  [n]leave  [q]uit · [j/k]scroll ",
-            content_scroll=scroll,
-        )
-        ch = stdscr.getch()
-        new_scroll = _scroll_key(ch, scroll, len(content), max(1, h - 6))
-        if new_scroll >= 0:
-            scroll = new_scroll
-            continue
-        k = chr(ch).lower() if 0 < ch < 256 else ""
-        fresh = store.get(item.id)
-        if fresh is None:
-            return ""
-        if k == "q":
-            return "quit"
-        if k == "a":
-            approve_plan(store, fresh)
-            daemon.try_fill_pool()
-            return ""
-        if k == "f":
-            feedback = _prompt_text(
-                stdscr, "feedback for execute phase (empty = cancel): "
-            )
-            if not feedback:
-                continue
-            approve_plan(store, fresh, feedback=feedback)
-            daemon.try_fill_pool()
-            return ""
-        if k == "r":
-            _handle_reject_flow(stdscr, store, fresh, "plan")
-            return ""
-        if k == "s":
-            defer(store, fresh)
-            return ""
-        if k in ("n", ""):
-            return ""
-
-
-def _review_code_curses(stdscr, cfg: Config, store: Store, daemon: Daemon,
-                        item: StoredItem, remaining: int = 0) -> str:
-    """Code review (post-commit) as a single-item curses screen. `remaining`
-    is the queue depth excluding this item, surfaced in the header."""
-    from ..committer import approve_and_commit, defer
-    data = _result_data(item) or {}
-    summary = data.get("summary") or "(no summary)"
-    files = data.get("files_changed") or []
-    scroll = 0
-    while True:
-        h, w = stdscr.getmaxyx()
-        queue_suffix = f"  · {remaining} left" if remaining > 0 else ""
-        header = [
-            f"  code review · {item.title}",
-            f"  id {item.id[:8]}  branch {item.branch or '—'}  "
-            f"files {len(files)}  tokens {_tokens_total(item)}"
-            f"{queue_suffix}",
-        ]
-        content: list[str] = []
-        content += _wrap(summary, w - 2)
-        content.append("")
-        content.append("── files changed ──")
-        for f in files[:50]:
-            content.append(f"  {f}")
-        if len(files) > 50:
-            content.append(f"  ... and {len(files) - 50} more")
-        _show_item_screen(
-            stdscr, header, content,
-            " [a]approve+merge  [r]eject+feedback  [s]defer  [v]diff  "
-            "[n]leave  [q]uit · [j/k]scroll ",
-            content_scroll=scroll,
-        )
-        ch = stdscr.getch()
-        new_scroll = _scroll_key(ch, scroll, len(content), max(1, h - 6))
-        if new_scroll >= 0:
-            scroll = new_scroll
-            continue
-        k = chr(ch).lower() if 0 < ch < 256 else ""
-        fresh = store.get(item.id)
-        if fresh is None:
-            return ""
-        if k == "q":
-            return "quit"
-        if k == "a":
-            msg = _build_commit_message(fresh)
-            try:
-                _run_with_progress(
-                    stdscr, f"  approve + merge · {fresh.title}",
-                    lambda p: approve_and_commit(
-                        cfg, store, fresh, msg, progress=p),
-                    hint="git worktree add + merge/rebase runs here.",
-                )
-            except Exception as e:  # git/state errors shouldn't kill UI
-                _flash(stdscr, f"merge failed: {e}")
-            return ""
-        if k == "r":
-            _handle_reject_flow(stdscr, store, fresh, "code")
-            return ""
-        if k == "s":
-            defer(store, fresh)
-            return ""
-        if k == "v":
-            if item.worktree_path:
-                # Branches with large or binary-heavy diffs would otherwise
-                # block the curses main thread inside the synchronous git
-                # calls — exactly the "dashboard appears hung" shape this
-                # investigation is about. Route the shell-out through the
-                # progress overlay so the UI keeps repainting.
-                wt = Path(item.worktree_path)
-                try:
-                    diff = _run_with_progress(
-                        stdscr, f"  diff · {item.title}",
-                        lambda p: (p("git diff vs base"),
-                                   diff_vs_base(wt, cfg.git.base_branch))[-1],
-                        hint="git diff against base branch.",
-                    )
-                except Exception as e:
-                    _flash(stdscr, f"diff failed: {e}")
-                    continue
-                text = diff if isinstance(diff, str) else ""
-                _view_text_in_curses(stdscr, text or "(empty diff)")
-            continue
-        if k in ("n", ""):
-            return ""
-
-
-def _handle_reject_flow(stdscr, store: Store, item: StoredItem,
-                        kind: str) -> None:
-    """Collect feedback inline; enter submits it as a retry (reject_and_retry).
-    Empty feedback cancels — a silent rejection is almost always a mis-press.
-    `kind` is 'plan' or 'code', used only for the prompt wording."""
-    from ..committer import reject_and_retry
-    feedback = _prompt_text(stdscr, f"feedback ({kind} retry, empty=cancel): ")
-    if not feedback:
-        return
-    reject_and_retry(store, item, feedback)
 
 
 _NEW_ISSUE_PROMPT_FRONTMATTER = (
