@@ -8,9 +8,11 @@ the widget downgrades to `_prompt_text` on a very small terminal."""
 
 import curses
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from agentor.dashboard import render
+from agentor.dashboard import modes, render
 
 
 class _FakeStdscr:
@@ -220,6 +222,81 @@ class TestPromptMultiline(unittest.TestCase):
         self.assertEqual(out, "hi")
         self.assertIn("label", called["message"])
         self.assertIn("empty=cancel", called["message"])
+
+
+class TestNewIssueNoteIsMultiline(unittest.TestCase):
+    """Regression guard: the bug/idea note capture path must accept multi-line
+    input, because operators use it for real expansion prompts that benefit
+    from paragraph breaks. Earlier `_new_issue_mode` used the single-row
+    `_prompt_text` prompt and was called out in IMPROVEMENTS.md."""
+
+    def test_note_prompt_uses_multiline_and_preserves_newlines(self):
+        """Whatever `_prompt_multiline` returns (including embedded newlines)
+        must be forwarded verbatim to `_expand_note_via_claude`."""
+        typed = "first line\n\nsecond paragraph\nthird line"
+        seen_note: dict[str, str] = {}
+
+        cfg = SimpleNamespace(
+            sources=SimpleNamespace(watch=["docs/backlog/foo.md"]),
+            parsing=SimpleNamespace(mode="checkbox"),
+            project_root=Path("/tmp/_agentor_test_root"),
+        )
+
+        def fake_target(_cfg):
+            return Path("/tmp/_agentor_test_root/docs/backlog/foo.md"), "file"
+
+        def fake_multiline(_stdscr, _label, **_kw):
+            return typed
+
+        def fake_run_with_progress(_stdscr, _title, work, **_kw):
+            return work(lambda _msg: None)
+
+        def fake_expand(note, _cfg, _kind, timeout):  # noqa: ARG001
+            seen_note["note"] = note
+            return "- [ ] expanded\n  body"
+
+        def fake_append(_path, _block):
+            return None
+
+        def fake_scan_once(_cfg, _store):
+            return SimpleNamespace(new_items=0)
+
+        with patch.object(modes, "_new_issue_target", fake_target), \
+             patch.object(modes, "_prompt_multiline", fake_multiline), \
+             patch.object(modes, "_run_with_progress", fake_run_with_progress), \
+             patch.object(modes, "_expand_note_via_claude", fake_expand), \
+             patch.object(modes, "_append_checkbox_block", fake_append), \
+             patch.object(modes, "scan_once", fake_scan_once), \
+             patch.object(modes, "_flash", lambda *_a, **_kw: None):
+            modes._new_issue_mode(_FakeStdscr(), cfg, store=None, daemon=None)
+
+        self.assertEqual(seen_note.get("note"), typed)
+
+    def test_note_prompt_empty_cancel_skips_claude(self):
+        """Empty return from the overlay must short-circuit before any
+        Claude call — same contract as the prior `_prompt_text` path."""
+        called = {"expand": False}
+
+        cfg = SimpleNamespace(
+            sources=SimpleNamespace(watch=["docs/backlog/foo.md"]),
+            parsing=SimpleNamespace(mode="checkbox"),
+            project_root=Path("/tmp/_agentor_test_root"),
+        )
+
+        def fake_target(_cfg):
+            return Path("/tmp/_agentor_test_root/docs/backlog/foo.md"), "file"
+
+        def fake_expand(*_a, **_kw):
+            called["expand"] = True
+            return ""
+
+        with patch.object(modes, "_new_issue_target", fake_target), \
+             patch.object(modes, "_prompt_multiline", lambda *_a, **_kw: ""), \
+             patch.object(modes, "_expand_note_via_claude", fake_expand), \
+             patch.object(modes, "_flash", lambda *_a, **_kw: None):
+            modes._new_issue_mode(_FakeStdscr(), cfg, store=None, daemon=None)
+
+        self.assertFalse(called["expand"])
 
 
 if __name__ == "__main__":
