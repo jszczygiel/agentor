@@ -142,27 +142,40 @@ def fast_forward_to_base(
 
 def advance_user_checkout_allowed(
     repo: Path, base_branch: str, base_sha_before: str,
-) -> bool:
+) -> tuple[bool, str | None]:
     """Pre-CAS guard check for `advance_user_checkout`. Call BEFORE
     `merge_feature_into_base` runs its CAS ref update — once the ref has
     moved, HEAD symbolically follows it and both the HEAD and the clean-
     tree guards become unreliable (stale index reports spurious staged
     diffs against the new HEAD tree).
 
-    All three guards must hold, otherwise return False (silent — no error,
-    no warning):
-      - `repo`'s current branch is `base_branch` (detached HEAD returns
-        "HEAD" from `current_branch` and fails the equality check).
+    Returns `(True, None)` when every guard holds. Returns `(False,
+    reason)` otherwise; the reason string is short and dashboard-safe so
+    the caller can surface it on the MERGED transition note.
+
+    Guards (first failing one wins):
+      - `repo`'s current branch is `base_branch`. Detached HEAD is
+        detected via `current_branch` returning `"HEAD"` (git's
+        `rev-parse --abbrev-ref` shorthand) and reported as
+        `"detached HEAD"`; any other branch is reported as
+        `"checkout on <branch>"`.
       - working tree is clean (`git status --porcelain` empty) — never
-        risk clobbering uncommitted user work.
+        risk clobbering uncommitted user work. Reported as
+        `"dirty worktree"`.
       - HEAD resolves to `base_sha_before` — the checkout sits exactly at
-        the pre-merge base tip (no local commits above base)."""
-    if current_branch(repo) != base_branch:
-        return False
+        the pre-merge base tip. Reported as
+        `"HEAD diverged from pre-merge base"` when the user committed or
+        reset above base between dispatch and merge."""
+    current = current_branch(repo)
+    if current != base_branch:
+        return False, "detached HEAD" if current == "HEAD" \
+            else f"checkout on {current}"
     if run(repo, "status", "--porcelain", check=False).stdout.strip():
-        return False
+        return False, "dirty worktree"
     head = run(repo, "rev-parse", "HEAD", check=False).stdout.strip()
-    return head == base_sha_before
+    if head != base_sha_before:
+        return False, "HEAD diverged from pre-merge base"
+    return True, None
 
 
 def advance_user_checkout(repo: Path, new_sha: str) -> bool:
