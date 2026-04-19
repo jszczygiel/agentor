@@ -235,10 +235,18 @@ class TestTableRowFits(unittest.TestCase):
         self.assertNotIn("SOURCE", header)
         self.assertIn("STATE", header)
 
-    def test_wide_keeps_everything(self):
+    def test_wide_drops_source_keeps_state(self):
         header = _table_header("wide")
-        self.assertIn("SOURCE", header)
+        self.assertNotIn("SOURCE", header)
         self.assertIn("STATE", header)
+
+    def test_wide_row_omits_source_basename(self):
+        item = _make_item(title="hello", src="docs/backlog/unique-source.md")
+        row = _table_row("wide", item, ItemStatus.WORKING,
+                         "01:23", "45%", False, 120)
+        self.assertNotIn("unique-source", row)
+        self.assertNotIn("docs/backlog", row)
+        self.assertIn("hello", row)
 
     def test_error_marker_in_narrow(self):
         item = _make_item()

@@ -12,7 +12,6 @@ from .formatters import (
     _COL_CTX,
     _COL_ELAPSED,
     _COL_ID,
-    _COL_SOURCE,
     _COL_STATE,
     _ctx_fill_pct,
     _elapsed_for,
@@ -215,11 +214,10 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
 
 def _table_header(tier: str) -> str:
     """Header row for the main table. Narrow drops STATE label to a glyph
-    column; mid/narrow drop SOURCE entirely so TITLE gets the slack."""
+    column so TITLE gets the slack."""
     if tier == "wide":
         return (f" {'ID':<{_COL_ID-1}}{'STATE':<{_COL_STATE}}"
-                f"{'ELAPSED':<{_COL_ELAPSED}}{'CTX':<{_COL_CTX}}"
-                f"{'SOURCE':<{_COL_SOURCE}}TITLE")
+                f"{'ELAPSED':<{_COL_ELAPSED}}{'CTX':<{_COL_CTX}}TITLE")
     if tier == "mid":
         return (f" {'ID':<{_COL_ID-1}}{'STATE':<{_COL_STATE}}"
                 f"{'ELAPSED':<{_COL_ELAPSED}}{'CTX':<{_COL_CTX}}TITLE")
@@ -265,16 +263,13 @@ def _table_row(tier: str, item, st, elapsed_s: str, ctx_s: str,
                 f"{pri_cell}{title}")
 
     # wide
-    src = item.source_file
-    if len(src) > _COL_SOURCE - 1:
-        src = "…" + src[-(_COL_SOURCE - 2):]
     cols_used = (1 + (_COL_ID - 1) + _COL_STATE + _COL_ELAPSED
-                 + _COL_CTX + _COL_SOURCE + len(pri_cell))
+                 + _COL_CTX + len(pri_cell))
     title_max = max(0, w - cols_used)
     title = item.title[:title_max]
     return (f" {item.id[:8]:<{_COL_ID-1}}{state_cell:<{_COL_STATE}}"
             f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
-            f"{src:<{_COL_SOURCE}}{pri_cell}{title}")
+            f"{pri_cell}{title}")
 
 
 def _build_alert_banner(alert: str, w: int) -> str:
