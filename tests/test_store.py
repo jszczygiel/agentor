@@ -690,5 +690,67 @@ class TestAggregateTokenUsage(unittest.TestCase):
         self.assertEqual(buckets["input"], 4)
 
 
+class TestDeleteItem(unittest.TestCase):
+    """Pins the `delete_item` contract: dependent rows (failures,
+    transitions) and the items row itself are cleared in a single
+    transaction, a tombstone survives in `deletions`, and the scanner
+    refuses to resurrect the id on its next pass."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.store = Store(Path(self.td.name) / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def test_delete_removes_rows_and_writes_tombstone(self):
+        self.store.upsert_discovered(_mk_item(id="doomed"))
+        self.store.transition("doomed", ItemStatus.DEFERRED, note="park")
+        self.store.record_failure("doomed", attempt=1, phase="plan",
+                                  error="boom")
+        self.store.record_failure("doomed", attempt=2, phase="execute",
+                                  error="boom2")
+        self.store.delete_item("doomed", note="operator nuked")
+
+        self.assertIsNone(self.store.get("doomed"))
+        self.assertTrue(self.store.is_deleted("doomed"))
+        self.assertEqual(self.store.list_failures("doomed"), [])
+        self.assertEqual(self.store.transitions_for("doomed"), [])
+
+        row = self.store.conn.execute(
+            "SELECT title, source_file, last_status, note "
+            "FROM deletions WHERE item_id = ?",
+            ("doomed",),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["title"], "A thing")
+        self.assertEqual(row["source_file"], "backlog.md")
+        self.assertEqual(row["last_status"], ItemStatus.DEFERRED.value)
+        self.assertEqual(row["note"], "operator nuked")
+
+    def test_delete_unknown_item_raises(self):
+        with self.assertRaises(KeyError):
+            self.store.delete_item("nope")
+
+    def test_upsert_discovered_skips_tombstoned_id(self):
+        item = _mk_item(id="ghost")
+        self.assertTrue(self.store.upsert_discovered(item))
+        self.store.delete_item("ghost")
+        # Re-discovery attempt — same id hashes to same primary key.
+        self.assertFalse(self.store.upsert_discovered(item))
+        self.assertIsNone(self.store.get("ghost"))
+
+    def test_delete_leaves_other_items_untouched(self):
+        self.store.upsert_discovered(_mk_item(id="keep"))
+        self.store.upsert_discovered(_mk_item(id="drop"))
+        self.store.record_failure("keep", attempt=1, phase="plan",
+                                  error="x")
+        self.store.delete_item("drop")
+        self.assertIsNotNone(self.store.get("keep"))
+        self.assertEqual(len(self.store.list_failures("keep")), 1)
+        self.assertFalse(self.store.is_deleted("keep"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -72,6 +72,23 @@ class TestWatcher(unittest.TestCase):
             self.assertIsNone(history[0].from_status)
             self.assertEqual(history[0].to_status, ItemStatus.QUEUED)
 
+    def test_scan_once_respects_deletion_tombstone(self):
+        """A tombstoned id must not be resurrected by a later scan of the
+        same source markdown. Mirrors the operator flow where deferred-
+        mode delete hard-removes rows but the backlog file still carries
+        the original checkbox entry."""
+        (self.root / "backlog.md").write_text("- [ ] First\n")
+        cfg = _mk_config(self.root, ["backlog.md"])
+        scan_once(cfg, self.store)
+        queued = self.store.list_by_status(ItemStatus.QUEUED)
+        self.assertEqual(len(queued), 1)
+        victim_id = queued[0].id
+        self.store.delete_item(victim_id, note="test")
+        result = scan_once(cfg, self.store)
+        self.assertEqual(result.new_items, 0)
+        self.assertIsNone(self.store.get(victim_id))
+        self.assertTrue(self.store.is_deleted(victim_id))
+
     def test_rescan_idempotent(self):
         (self.root / "backlog.md").write_text("- [ ] First\n")
         cfg = _mk_config(self.root, ["backlog.md"])

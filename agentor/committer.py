@@ -392,29 +392,34 @@ def delete_idea(
     config: Config | None, store: Store, daemon: "Daemon | None",
     item: StoredItem,
 ) -> bool:
-    """Unified delete for the inspect view. Parks `item` in CANCELLED from
-    any status, tearing down live runner state on the way. Returns True when
-    a transition happened, False when the item was already CANCELLED.
+    """Unified delete for the inspect view. Hard-removes the item from
+    the store (via `Store.delete_item` — row + failures + transitions
+    cleared, tombstoned in `deletions`) after tearing down any live
+    runner state. Returns True when the deletion happened, False when
+    the row was already tombstoned or vanished between read and write.
 
     Teardown order matters:
       1. If WORKING, signal the registered subprocess via
          `daemon.proc_registry.kill_one(item.id)` and poll the store until
-         the runner's own error path writes a terminal-ish status (ERRORED /
-         QUEUED / AWAITING_*). Bounded at ~5s so a wedged runner can't hang
-         the dashboard.
+         the runner's own error path writes a terminal-ish status (ERRORED
+         / QUEUED / AWAITING_*). Bounded at ~5s so a wedged runner can't
+         hang the dashboard. Waiting here narrows (but does not eliminate)
+         the window where a late runner write hits a tombstoned row and
+         raises KeyError; the worker swallows that via
+         `Daemon._run_worker`'s broad `except Exception`.
       2. If a worktree_path is recorded (live, resumable, or forensic),
          force-remove the git worktree, prune stale registrations, and
          force-delete the feature branch. Best-effort — git errors don't
-         block the CANCELLED transition.
-      3. Write the final transition LAST. Any error-path row the runner
-         dropped in step 1 is shadowed by this write, so CANCELLED wins.
+         block the hard-delete.
+      3. Call `store.delete_item` LAST. This drops dependent rows + the
+         items row and records a `deletions` tombstone so `scan_once`
+         refuses to re-enqueue the id from the unchanged source markdown.
 
-    `config` is only required for worktree/branch cleanup; callers that
-    know the item has no worktree (e.g. legacy DEFERRED-only pickups) may
-    pass None. `daemon` is only needed to kill a live subprocess; None is
-    safe for non-WORKING items."""
+    `config` is only required for worktree/branch cleanup; callers with
+    no worktree can pass None. `daemon` is only needed to kill a live
+    subprocess; None is safe for non-WORKING items."""
     prev_status = item.status
-    if prev_status == ItemStatus.CANCELLED:
+    if store.is_deleted(item.id) or store.get(item.id) is None:
         return False
 
     if prev_status == ItemStatus.WORKING and daemon is not None:
@@ -441,11 +446,17 @@ def delete_idea(
             except git_ops.GitError:
                 pass
 
-    store.transition(
-        item.id, ItemStatus.CANCELLED,
-        worktree_path=None, branch=None, session_id=None, last_error=None,
-        note=f"deleted from {prev_status.value}",
-    )
+    try:
+        store.delete_item(
+            item.id, note=f"deleted from {prev_status.value}",
+        )
+    except KeyError:
+        # Runner thread raced us and tombstoned the row (or removed it
+        # via some other path) between our precheck and the write. Treat
+        # as a no-op rather than propagating — the end state the operator
+        # wanted is already in place.
+        return False
+    return True
     return True
 
 

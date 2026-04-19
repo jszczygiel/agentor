@@ -2,9 +2,10 @@
 
 The dashboard-level dispatch tests in
 `test_dashboard_inspect_dispatch.py` cover the key routing and
-transition outcomes; this file drills into the branch that
+end-to-end outcomes; this file drills into the branch that
 `_inspect_dispatch` intentionally skips with `cfg=None`: git worktree
-and branch teardown when the item still holds a worktree_path."""
+and branch teardown when the item still holds a worktree_path, and the
+WORKING-wait semantics around the runner-race window."""
 
 import unittest
 from pathlib import Path
@@ -57,33 +58,39 @@ class TestDeleteIdea(unittest.TestCase):
         assert got is not None
         return got
 
-    def test_deferred_delete_transitions_to_cancelled(self):
-        """Baseline: the legacy DEFERRED delete call site still lands the
-        item in CANCELLED with the prior status captured in the note."""
+    def test_deferred_delete_hard_deletes_and_tombstones(self):
+        """Baseline: DEFERRED → hard-delete. Row + transitions gone,
+        tombstone recorded with the prior status captured in the note so
+        the scanner can't resurrect the id."""
         self._seed("d1")
         self.store.transition("d1", ItemStatus.WORKING, note="t")
         self.store.transition("d1", ItemStatus.DEFERRED, note="t")
-        changed = delete_idea(None, self.store, None, self._fresh("d1"))
-        self.assertTrue(changed)
-        got = self.store.get("d1")
-        self.assertEqual(got.status, ItemStatus.CANCELLED)
-        note = self.store.transitions_for("d1")[-1].note or ""
-        self.assertIn("deferred", note)
+        deleted = delete_idea(None, self.store, None, self._fresh("d1"))
+        self.assertTrue(deleted)
+        self.assertIsNone(self.store.get("d1"))
+        self.assertTrue(self.store.is_deleted("d1"))
+        row = self.store.conn.execute(
+            "SELECT note, last_status FROM deletions WHERE item_id = ?",
+            ("d1",),
+        ).fetchone()
+        self.assertEqual(row["last_status"], ItemStatus.DEFERRED.value)
+        self.assertEqual(row["note"], "deleted from deferred")
 
-    def test_already_cancelled_short_circuits(self):
-        """Repeat deletes are idempotent no-ops. `delete_idea` returns
-        False and does not write another transition."""
+    def test_already_tombstoned_short_circuits(self):
+        """Pre-tombstoned id: `delete_idea` returns False and does not
+        retry `store.delete_item` (which would raise KeyError)."""
         self._seed("c1")
-        self.store.transition("c1", ItemStatus.CANCELLED, note="t")
-        before = len(self.store.transitions_for("c1"))
-        changed = delete_idea(None, self.store, None, self._fresh("c1"))
-        self.assertFalse(changed)
-        self.assertEqual(len(self.store.transitions_for("c1")), before)
+        stale = self._fresh("c1")
+        self.store.delete_item("c1", note="pre")
+        deleted = delete_idea(None, self.store, None, stale)
+        self.assertFalse(deleted)
+        self.assertIsNone(self.store.get("c1"))
 
     def test_worktree_cleanup_fires_when_path_present(self):
         """ERRORED items keep worktree_path/branch for forensics. Delete
         must force-remove the worktree, prune, and force-delete the
-        branch — all against `config.project_root`."""
+        branch — all against `config.project_root` — before the hard
+        delete writes the tombstone."""
         self._seed("e1")
         self.store.transition(
             "e1", ItemStatus.WORKING,
@@ -97,43 +104,39 @@ class TestDeleteIdea(unittest.TestCase):
         with patch.object(git_ops, "worktree_remove") as rm, \
                 patch.object(git_ops, "worktree_prune") as prune, \
                 patch.object(git_ops, "branch_delete") as bd:
-            changed = delete_idea(
+            deleted = delete_idea(
                 _cfg(self.root), self.store, self.daemon,
                 self._fresh("e1"),
             )
-        self.assertTrue(changed)
+        self.assertTrue(deleted)
         rm.assert_called_once()
-        _, kwargs = rm.call_args[:2], rm.call_args[1]
         self.assertTrue(rm.call_args.kwargs.get("force"))
         prune.assert_called_once_with(self.root)
         bd.assert_called_once()
         self.assertTrue(bd.call_args.kwargs.get("force"))
-        got = self.store.get("e1")
-        self.assertEqual(got.status, ItemStatus.CANCELLED)
-        self.assertIsNone(got.worktree_path)
-        self.assertIsNone(got.branch)
+        self.assertIsNone(self.store.get("e1"))
+        self.assertTrue(self.store.is_deleted("e1"))
 
     def test_worktree_cleanup_skipped_when_no_path(self):
         """Vanilla QUEUED items have no worktree yet — no git calls
-        should fire."""
+        should fire, but the hard delete still lands."""
         self._seed("q1")
         with patch.object(git_ops, "worktree_remove") as rm, \
                 patch.object(git_ops, "branch_delete") as bd:
-            changed = delete_idea(
+            deleted = delete_idea(
                 _cfg(self.root), self.store, self.daemon,
                 self._fresh("q1"),
             )
-        self.assertTrue(changed)
+        self.assertTrue(deleted)
         rm.assert_not_called()
         bd.assert_not_called()
-        self.assertEqual(
-            self.store.get("q1").status, ItemStatus.CANCELLED,
-        )
+        self.assertIsNone(self.store.get("q1"))
+        self.assertTrue(self.store.is_deleted("q1"))
 
     def test_git_errors_are_swallowed(self):
-        """A broken worktree registration must not block the CANCELLED
-        transition — operators chose to delete, git failures are
-        best-effort cleanup."""
+        """A broken worktree registration must not block the hard
+        delete — operators chose to delete, git failures are best-effort
+        cleanup."""
         self._seed("g1")
         self.store.transition(
             "g1", ItemStatus.WORKING,
@@ -151,19 +154,18 @@ class TestDeleteIdea(unittest.TestCase):
             git_ops, "branch_delete",
             side_effect=git_ops.GitError("gone"),
         ):
-            changed = delete_idea(
+            deleted = delete_idea(
                 _cfg(self.root), self.store, self.daemon,
                 self._fresh("g1"),
             )
-        self.assertTrue(changed)
-        self.assertEqual(
-            self.store.get("g1").status, ItemStatus.CANCELLED,
-        )
+        self.assertTrue(deleted)
+        self.assertIsNone(self.store.get("g1"))
+        self.assertTrue(self.store.is_deleted("g1"))
 
     def test_working_kill_one_called_with_item_id(self):
         """WORKING teardown must signal `proc_registry.kill_one(item.id)`
-        so the in-flight subprocess stops burning tokens before we write
-        CANCELLED."""
+        so the in-flight subprocess stops burning tokens before the
+        hard-delete runs."""
         self._seed("w1")
         self.store.transition(
             "w1", ItemStatus.WORKING,
@@ -173,20 +175,18 @@ class TestDeleteIdea(unittest.TestCase):
         kill_one = MagicMock(return_value=False)
         self.registry.kill_one = kill_one  # type: ignore[assignment]
         with patch("agentor.committer._DELETE_WAIT_SECONDS", 0.1):
-            changed = delete_idea(
+            deleted = delete_idea(
                 None, self.store, self.daemon, self._fresh("w1"),
             )
-        self.assertTrue(changed)
+        self.assertTrue(deleted)
         kill_one.assert_called_once_with("w1")
-        self.assertEqual(
-            self.store.get("w1").status, ItemStatus.CANCELLED,
-        )
+        self.assertIsNone(self.store.get("w1"))
 
     def test_working_wait_exits_early_once_runner_transitions(self):
-        """If the runner's error path transitions the item out of WORKING
-        before the poll budget elapses, the wait loop exits and the final
-        CANCELLED write still lands (shadowing whatever the runner
-        wrote)."""
+        """If the runner's error path transitions the item out of
+        WORKING before the poll budget elapses, the wait loop exits
+        promptly. The hard-delete then lands (clearing even the
+        runner-written ERRORED row via the tombstone path)."""
         self._seed("w2")
         self.store.transition(
             "w2", ItemStatus.WORKING, note="t",
@@ -204,21 +204,38 @@ class TestDeleteIdea(unittest.TestCase):
         self.registry.kill_one = _flip_status  # type: ignore[assignment]
         with patch("agentor.committer._DELETE_WAIT_SECONDS", 5.0), \
                 patch("agentor.committer._DELETE_POLL_INTERVAL", 0.01):
-            changed = delete_idea(
+            deleted = delete_idea(
                 None, self.store, self.daemon, self._fresh("w2"),
             )
-        self.assertTrue(changed)
-        got = self.store.get("w2")
-        self.assertEqual(got.status, ItemStatus.CANCELLED)
-        # Transition history records BOTH the runner's ERRORED write and
-        # our CANCELLED shadow — the final status wins.
-        tos = [t.to_status for t in self.store.transitions_for("w2")]
-        self.assertIn(ItemStatus.ERRORED, tos)
-        self.assertEqual(tos[-1], ItemStatus.CANCELLED)
+        self.assertTrue(deleted)
+        self.assertIsNone(self.store.get("w2"))
+        self.assertTrue(self.store.is_deleted("w2"))
+
+    def test_working_wait_returns_when_row_vanishes(self):
+        """Edge: a concurrent `store.delete_item` removes the row during
+        the wait loop. `delete_idea` should notice the row is gone and
+        report the no-op (False) without raising."""
+        self._seed("w3")
+        self.store.transition("w3", ItemStatus.WORKING, note="t")
+
+        def _concurrent_delete(_key: str) -> bool:
+            self.store.delete_item("w3", note="concurrent")
+            return True
+
+        self.registry.kill_one = _concurrent_delete  # type: ignore[assignment]
+        with patch("agentor.committer._DELETE_WAIT_SECONDS", 1.0), \
+                patch("agentor.committer._DELETE_POLL_INTERVAL", 0.01):
+            deleted = delete_idea(
+                None, self.store, self.daemon, self._fresh("w3"),
+            )
+        # Row is already gone — result is False, not True (we didn't
+        # delete it, the concurrent writer did).
+        self.assertFalse(deleted)
+        self.assertIsNone(self.store.get("w3"))
 
 
 class TestProcRegistryKillOne(unittest.TestCase):
-    """`kill_one` is the new per-item teardown hook. These tests pin its
+    """`kill_one` is the per-item teardown hook. These tests pin its
     behavior on registered/unregistered/already-exited keys so operator
     delete doesn't hang on phantom entries."""
 

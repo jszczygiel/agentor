@@ -824,5 +824,48 @@ class TestConcurrentIntegration(unittest.TestCase):
         )
 
 
+class TestDeleteIdea(unittest.TestCase):
+    """`delete_idea` is the committer-layer wrapper the dashboard calls
+    when the operator confirms `x` in the inspect view. It must
+    hard-delete (not just CANCELLED-transition) and tombstone the id,
+    tearing down any live runner state on the way."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.store = Store(Path(self.td.name) / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _seed_deferred(self, id: str = "d1") -> None:
+        from agentor.models import Item
+        self.store.upsert_discovered(Item(
+            id=id, title="idea", body="b",
+            source_file="backlog.md", source_line=1, tags={},
+        ))
+        self.store.transition(id, ItemStatus.DEFERRED, note="park")
+
+    def test_delete_idea_removes_row_and_records_tombstone(self):
+        from agentor.committer import delete_idea
+        self._seed_deferred("d1")
+        item = self.store.get("d1")
+        self.assertIsNotNone(item)
+
+        # DEFERRED items have no worktree and no live subprocess, so
+        # config/daemon can be None — the cross-status inspect delete
+        # exercises the other branches.
+        delete_idea(None, self.store, None, item)
+
+        self.assertIsNone(self.store.get("d1"))
+        self.assertTrue(self.store.is_deleted("d1"))
+        row = self.store.conn.execute(
+            "SELECT note, last_status FROM deletions WHERE item_id = ?",
+            ("d1",),
+        ).fetchone()
+        self.assertEqual(row["last_status"], ItemStatus.DEFERRED.value)
+        self.assertEqual(row["note"], "deleted from deferred")
+
+
 if __name__ == "__main__":
     unittest.main()

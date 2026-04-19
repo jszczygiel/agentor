@@ -187,6 +187,32 @@ class TestInspectDispatch(unittest.TestCase):
         )
         self.assertEqual(self.daemon.filled, 1)
 
+    def test_deferred_delete_confirmed_removes_item(self):
+        self._seed("del1", ItemStatus.DEFERRED)
+        with patch("agentor.dashboard.modes._prompt_yn", return_value=True):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("del1"), "x",
+            )
+        self.assertTrue(acted)
+        self.assertEqual(msg, "deleted")
+        self.assertIsNone(self.store.get("del1"))
+        self.assertTrue(self.store.is_deleted("del1"))
+
+    def test_deferred_delete_cancelled_leaves_item(self):
+        self._seed("del2", ItemStatus.DEFERRED)
+        with patch("agentor.dashboard.modes._prompt_yn", return_value=False):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("del2"), "x",
+            )
+        self.assertFalse(acted)
+        self.assertEqual(msg, "")
+        got = self.store.get("del2")
+        self.assertIsNotNone(got)
+        self.assertEqual(got.status, ItemStatus.DEFERRED)
+        self.assertFalse(self.store.is_deleted("del2"))
+
     def test_terminal_status_ignores_non_delete_keys(self):
         """MERGED is view-only for every action key except the new unified
         `x` delete, which must still work at every status."""
@@ -203,8 +229,8 @@ class TestInspectDispatch(unittest.TestCase):
                     self._fresh("done1"), key,
                 )
                 self.assertFalse(acted)
-        # MERGED → CANCELLED via `x`. stdscr=None works because
-        # `_prompt_yn` is patched to auto-confirm.
+        # MERGED → hard-deleted + tombstoned via `x`. stdscr=None works
+        # because `_prompt_yn` is patched to auto-confirm.
         with patch(
             "agentor.dashboard.modes._prompt_yn", return_value=True,
         ):
@@ -214,14 +240,13 @@ class TestInspectDispatch(unittest.TestCase):
             )
         self.assertTrue(acted)
         self.assertEqual(msg, "deleted")
-        self.assertEqual(
-            self.store.get("done1").status, ItemStatus.CANCELLED,
-        )
+        self.assertIsNone(self.store.get("done1"))
+        self.assertTrue(self.store.is_deleted("done1"))
 
-    def test_delete_cancels_item_from_every_status(self):
-        """`x` must transition to CANCELLED regardless of where the item
-        started. Seed one item per non-terminal status and drive the
-        dispatcher with the confirmation prompt patched to auto-yes."""
+    def test_delete_tombstones_item_from_every_status(self):
+        """`x` must hard-delete regardless of where the item started.
+        Seed one item per status and drive the dispatcher with the
+        confirmation prompt patched to auto-yes."""
         cases = {
             ItemStatus.QUEUED: lambda sid: None,
             ItemStatus.WORKING: lambda sid: self.store.transition(
@@ -294,28 +319,26 @@ class TestInspectDispatch(unittest.TestCase):
                     )
                 self.assertTrue(acted)
                 self.assertEqual(msg, "deleted")
-                self.assertEqual(
-                    self.store.get(sid).status, ItemStatus.CANCELLED,
-                )
+                self.assertIsNone(self.store.get(sid))
+                self.assertTrue(self.store.is_deleted(sid))
 
-    def test_delete_already_cancelled_is_noop(self):
-        """Pressing `x` on an already-CANCELLED item reports the no-op
-        without re-transitioning — `delete_idea` short-circuits."""
+    def test_delete_already_tombstoned_is_noop(self):
+        """Pressing `x` on an id that's already been tombstoned reports
+        the no-op without raising — `delete_idea` short-circuits when the
+        row is gone."""
         self._seed("can1", ItemStatus.QUEUED)
-        self.store.transition("can1", ItemStatus.CANCELLED, note="t")
-        transitions_before = len(self.store.transitions_for("can1"))
+        stale = self._fresh("can1")
+        self.store.delete_item("can1", note="pre-tombstoned")
+        self.assertTrue(self.store.is_deleted("can1"))
         with patch(
             "agentor.dashboard.modes._prompt_yn", return_value=True,
         ):
             acted, msg = _inspect_dispatch(
-                None, None, self.store, self.daemon,
-                self._fresh("can1"), "x",
+                None, None, self.store, self.daemon, stale, "x",
             )
         self.assertTrue(acted)
-        self.assertEqual(msg, "already cancelled")
-        self.assertEqual(
-            len(self.store.transitions_for("can1")), transitions_before,
-        )
+        self.assertEqual(msg, "already deleted")
+        self.assertIsNone(self.store.get("can1"))
 
     def test_delete_prompt_cancel_leaves_item_alone(self):
         """User answers no to the confirm prompt → no transition, no proc
@@ -336,11 +359,10 @@ class TestInspectDispatch(unittest.TestCase):
         )
         self.assertEqual(self.daemon.proc_registry.killed, [])
 
-    def test_delete_working_kills_subprocess_and_clears_fields(self):
+    def test_delete_working_kills_subprocess_and_tombstones(self):
         """WORKING delete must (a) invoke `proc_registry.kill_one(item.id)`,
-        (b) null out worktree_path/branch/session_id, (c) land in
-        CANCELLED. cfg=None skips git cleanup — exercised separately by
-        the committer-level test."""
+        (b) hard-delete the row, (c) record a tombstone. cfg=None skips
+        git cleanup — exercised separately by the committer-level test."""
         self._seed("live1", ItemStatus.QUEUED)
         self.store.transition(
             "live1", ItemStatus.WORKING,
@@ -358,11 +380,8 @@ class TestInspectDispatch(unittest.TestCase):
             )
         self.assertTrue(acted)
         self.assertEqual(self.daemon.proc_registry.killed, ["live1"])
-        got = self.store.get("live1")
-        self.assertEqual(got.status, ItemStatus.CANCELLED)
-        self.assertIsNone(got.worktree_path)
-        self.assertIsNone(got.branch)
-        self.assertIsNone(got.session_id)
+        self.assertIsNone(self.store.get("live1"))
+        self.assertTrue(self.store.is_deleted("live1"))
 
 
 class TestIsAutoResolveChain(unittest.TestCase):

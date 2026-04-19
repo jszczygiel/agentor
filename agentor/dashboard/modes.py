@@ -46,8 +46,9 @@ from .transcript import (
 # against the set so a key only fires when the status allows it.
 # `[x]delete` is bound on every status — operators want one consistent
 # way to remove the current row regardless of lifecycle position. The
-# dispatcher tears down live runner state (subprocess, worktree, branch)
-# before transitioning to CANCELLED (see `_inspect_dispatch`).
+# dispatcher tears down live runner state (subprocess, worktree, branch),
+# then hard-deletes the row and writes a deletion tombstone via
+# `delete_idea` → `Store.delete_item` (see `_inspect_dispatch`).
 _ACTION_KEYS_BY_STATUS: dict[ItemStatus, list[tuple[str, str]]] = {
     ItemStatus.QUEUED: [
         ("x", "[x]delete"),
@@ -311,13 +312,14 @@ def _inspect_dispatch(
     # Delete is wired on every status — handle it once here so every
     # per-status branch doesn't need to duplicate the confirm + teardown
     # dance. `delete_idea` kills any live runner subprocess, removes the
-    # worktree + branch, and transitions to CANCELLED.
+    # worktree + branch, then hard-deletes the row + writes a tombstone
+    # so the scanner can't resurrect the id on the next pass.
     if key == "x":
         if not _prompt_yn(stdscr, "delete this item?"):
             return False, ""
-        changed = delete_idea(cfg, store, daemon, item)
-        if not changed:
-            return True, "already cancelled"
+        deleted = delete_idea(cfg, store, daemon, item)
+        if not deleted:
+            return True, "already deleted"
         return True, "deleted"
 
     if status == ItemStatus.AWAITING_PLAN_REVIEW:
@@ -862,9 +864,7 @@ def _new_issue_mode(
     mode = cfg.parsing.mode
     expand_kind = "frontmatter" if (mode == "frontmatter" and kind == "dir") \
         else "checkbox"
-    note = _prompt_text(
-        stdscr, "bug/idea note (enter=submit, empty=cancel): ",
-    )
+    note = _prompt_multiline(stdscr, "bug/idea note")
     if not note:
         return
     def _expand_work(p: Callable[[str], None]) -> str:

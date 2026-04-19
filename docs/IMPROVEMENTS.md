@@ -21,6 +21,9 @@ the current task's scope.
   `ParsingConfig`, `SourcesConfig` on lines 9-10). CI runs `ruff check` so these
   should already be failing the workflow — check whether the CI config ignores
   these or whether the suite was pre-broken before ruff was wired in.
+- `tests/test_dashboard_resize.py` has two F401 unused-import errors (`SimpleNamespace`
+  at line 9, `ItemStatus` at line 174) introduced in `6cde420`. Same story as the
+  `test_config.py` bullet — noisy on `ruff check` but doesn't block tests.
 - When `git.auto_resolve_conflicts` chains a CONFLICTED item back into QUEUED,
   the dashboard inspect view shows no explicit signal that the re-queue was
   automatic. Consider tagging the transition note (or surfacing an auto-resolve
@@ -34,11 +37,6 @@ the current task's scope.
   reconciling the force-execute branch (needed to run the test suite), but a
   wider grep + mypy `strict_optional=True` + per-member enum exhaustiveness
   check should be considered so this class of drift is caught pre-merge.
-- The new-issue bug/idea note prompt at `dashboard/modes.py:784` is still
-  single-line (`_prompt_text`). Same long-form argument as the feedback paths
-  that moved to `_prompt_multiline` — operators would benefit from newlines
-  and wrapping. Deferred to keep the multi-line-feedback task on its stated
-  scope ("at least the feedback-reject paths").
 - `_prompt_multiline` (`dashboard/render.py`) does not reflow on terminal
   resize: `curses.textpad.Textbox.edit` blocks inside a validator loop, and
   KEY_RESIZE (410) is treated as a literal input char. Minimum-viable fix
