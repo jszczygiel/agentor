@@ -58,6 +58,15 @@ CREATE TABLE IF NOT EXISTS failures (
     at                 REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_failures_item ON failures(item_id);
+
+CREATE TABLE IF NOT EXISTS deletions (
+    item_id     TEXT PRIMARY KEY,
+    title       TEXT,
+    source_file TEXT,
+    last_status TEXT,
+    note        TEXT,
+    at          REAL NOT NULL
+);
 """
 
 
@@ -205,8 +214,14 @@ class Store:
         """Insert an item seen in a source file if not already present.
         New items land directly at QUEUED — the daemon picks them up on the
         next dispatch tick.
-        Returns True if this was a new item, False if it already existed."""
+        Returns True if this was a new item, False if it already existed
+        or has been tombstoned via `delete_item`."""
         now = time.time()
+        cur = self.conn.execute(
+            "SELECT 1 FROM deletions WHERE item_id = ?", (item.id,)
+        )
+        if cur.fetchone() is not None:
+            return False
         cur = self.conn.execute(
             "SELECT id FROM items WHERE id = ?", (item.id,)
         )
@@ -370,6 +385,41 @@ class Store:
                 (new_val, now, item_id),
             )
         return new_val
+
+    def delete_item(self, item_id: str, note: str | None = None) -> None:
+        """Permanently remove an item and its dependent rows, writing a
+        tombstone to `deletions` so the scanner will not re-enqueue the id
+        from its source markdown on a later pass.
+
+        Order is load-bearing: `failures` and `transitions` hold FKs to
+        `items.id` and `PRAGMA foreign_keys = ON` is set, so they must be
+        cleared before the items row."""
+        now = time.time()
+        with self.tx() as c:
+            row = c.execute(
+                "SELECT title, source_file, status FROM items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"no such item: {item_id}")
+            c.execute(
+                """INSERT OR REPLACE INTO deletions
+                   (item_id, title, source_file, last_status, note, at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (item_id, row["title"], row["source_file"],
+                 row["status"], note, now),
+            )
+            c.execute("DELETE FROM failures WHERE item_id = ?", (item_id,))
+            c.execute("DELETE FROM transitions WHERE item_id = ?", (item_id,))
+            c.execute("DELETE FROM items WHERE id = ?", (item_id,))
+
+    def is_deleted(self, item_id: str) -> bool:
+        """True when `delete_item` has tombstoned this id."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM deletions WHERE item_id = ?", (item_id,)
+            ).fetchone()
+        return row is not None
 
     def aggregate_token_usage(self, since: float | None = None) -> dict:
         """Sum token usage across all items whose `result_json` carries one.

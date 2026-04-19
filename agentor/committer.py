@@ -381,12 +381,13 @@ def retry(store: Store, item: StoredItem) -> None:
 
 
 def delete_idea(store: Store, item: StoredItem) -> None:
-    """User rejected an idea at pickup — park it in CANCELLED so scan_once
-    doesn't re-enqueue it from the source markdown on the next pass. Source
-    file is left intact; user can remove the markdown entry whenever."""
-    store.transition(
-        item.id, ItemStatus.CANCELLED,
-        note=f"deleted from pickup (was {item.status.value})",
+    """Permanently remove an item from the store. Drops the items row,
+    its failures, and its transitions; writes a tombstone in `deletions`
+    so `scan_once` does not re-enqueue the id if the source markdown
+    still carries it. Source file is left intact."""
+    store.delete_item(
+        item.id,
+        note=f"deleted from {item.status.value}",
     )
 
 
