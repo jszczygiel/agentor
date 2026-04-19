@@ -10,6 +10,8 @@ from agentor.dashboard.formatters import (
     _ctx_fill_pct,
     _fmt_elapsed,
     _fmt_token_line,
+    _fmt_token_line_mid,
+    _fmt_token_line_narrow,
     _fmt_tokens,
     _token_breakdown,
     _token_windows,
@@ -318,6 +320,36 @@ class TestTokenWindowsCache(unittest.TestCase):
         _token_windows(store, daemon_started_at=0.0)
         _token_windows(store, daemon_started_at=123.0)
         self.assertEqual(len(store.calls), 6)
+
+
+class TestFmtTokenLineTiers(unittest.TestCase):
+    """Tier-specific token-panel line formatters must fit their own
+    minimum width so the dashboard doesn't silently clip the totals."""
+
+    totals = {"input": 1_500_000, "output": 120_000,
+              "cache_read": 8_000_000, "cache_create": 350_000,
+              "total": 10_000_000}
+
+    def test_wide_line_fits_80(self):
+        line = _fmt_token_line("session", self.totals)
+        self.assertLessEqual(len(line) + 1, 80)  # leading space
+
+    def test_mid_line_fits_60(self):
+        line = _fmt_token_line_mid("session", self.totals)
+        self.assertLessEqual(len(line) + 1, 60)
+        # Σ survives in mid tier — most operator-relevant datum.
+        self.assertIn("Σ", line)
+
+    def test_narrow_line_fits_40(self):
+        line = _fmt_token_line_narrow("session", self.totals)
+        self.assertLessEqual(len(line) + 1, 40)
+        self.assertIn("Σ", line)
+
+    def test_narrow_truncates_long_label(self):
+        line = _fmt_token_line_narrow("session", self.totals)
+        # Narrow truncates `session` to 4 chars so Σ never clips.
+        self.assertIn("sess", line)
+        self.assertNotIn("session", line)
 
 
 if __name__ == "__main__":
