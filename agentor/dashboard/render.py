@@ -17,6 +17,7 @@ from .formatters import (
     _ctx_fill_pct,
     _elapsed_for,
     _fmt_elapsed,
+    _fmt_token_compact,
     _fmt_token_line,
     _phase_for,
     _token_windows,
@@ -130,6 +131,9 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     # unresolved last_error. Surfaces stuck/faulty items in the header
     # even when the default 'all' filter would visually smear them into
     # the rest of the queue.
+    # Compute once and reuse — the token-windows cache makes the second
+    # call free but explicit sharing keeps the data-flow obvious.
+    token_windows = _token_windows(store, daemon.started_at)
     status_line = (
         f" {cfg.agent.runner}  pool={cfg.agent.pool_size}  "
         f"workers={len(daemon.workers)}  "
@@ -141,11 +145,13 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
         f"awaiting={counts[ItemStatus.AWAITING_REVIEW]}  "
         f"deferred={counts[ItemStatus.DEFERRED]}  "
         f"merged={counts[ItemStatus.MERGED]}  "
-        f"rejected={counts[ItemStatus.REJECTED]}"
+        f"rejected={counts[ItemStatus.REJECTED]}  │  "
+        f"{_fmt_token_compact(token_windows)}"
     )
     _safe_addstr(stdscr, row, 0, status_line, w)
     row += 1
-    row = _render_token_panel(stdscr, row, w, store, daemon)
+    row = _render_token_panel(stdscr, row, w, store, daemon,
+                              windows=token_windows)
     _safe_addstr(stdscr, row, 0, "─" * w, w, curses.A_DIM)
     row += 1
 
@@ -178,11 +184,17 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     return rendered
 
 
-def _render_token_panel(stdscr, row: int, w: int, store, daemon) -> int:
+def _render_token_panel(stdscr, row: int, w: int, store, daemon,
+                        windows: dict | None = None) -> int:
     """Draw the cumulative token-usage panel: one line per time window
     (session / today / 7d), each showing input / output / cache_read /
-    cache_create totals. Returns the next free row."""
-    windows = _token_windows(store, daemon.started_at)
+    cache_create totals. Returns the next free row.
+
+    `windows` may be pre-computed by the caller to avoid a second
+    `_token_windows` call in the same render tick (the 2s cache also
+    deduplicates, but explicit sharing keeps call-ownership obvious)."""
+    if windows is None:
+        windows = _token_windows(store, daemon.started_at)
     _safe_addstr(stdscr, row, 0, " tokens".ljust(w), w,
                  curses.A_DIM | curses.A_BOLD)
     row += 1

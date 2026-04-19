@@ -9,6 +9,7 @@ from agentor.dashboard import formatters
 from agentor.dashboard.formatters import (
     _ctx_fill_pct,
     _fmt_elapsed,
+    _fmt_token_compact,
     _fmt_token_line,
     _fmt_tokens,
     _token_breakdown,
@@ -200,6 +201,33 @@ class TestFmtTokenLine(unittest.TestCase):
         line = _fmt_token_line("today", totals)
         # All buckets should read 0, not "—".
         self.assertEqual(line.count("     0"), 5)
+
+
+class TestFmtTokenCompact(unittest.TestCase):
+    def test_session_and_weekly_totals(self):
+        windows = {
+            "session": {"total": 1500},
+            "today": {"total": 900},
+            "7d": {"total": 2_300_000},
+        }
+        self.assertEqual(
+            _fmt_token_compact(windows),
+            "tok sess=1.5k  wk=2.3M",
+        )
+
+    def test_missing_windows_render_zero(self):
+        self.assertEqual(
+            _fmt_token_compact({}),
+            "tok sess=0  wk=0",
+        )
+
+    def test_missing_total_key_renders_zero(self):
+        # `total` may be absent if aggregate returned an empty dict for the
+        # window; must not raise.
+        self.assertEqual(
+            _fmt_token_compact({"session": {}, "7d": {}}),
+            "tok sess=0  wk=0",
+        )
 
 
 class TestTokenWindows(unittest.TestCase):

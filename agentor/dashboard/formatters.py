@@ -303,6 +303,15 @@ def _fmt_token_line(label: str, totals: dict) -> str:
             f"Σ {_fmt_tokens(int(totals.get('total', 0))):>6}")
 
 
+def _fmt_token_compact(windows: dict) -> str:
+    """One-glance session + weekly totals for the status line. Full breakdown
+    stays in the token panel; this is the at-a-glance "am I burning tokens
+    faster than last week?" readout."""
+    sess = int(windows.get("session", {}).get("total", 0))
+    wk = int(windows.get("7d", {}).get("total", 0))
+    return f"tok sess={_fmt_tokens(sess)}  wk={_fmt_tokens(wk)}"
+
+
 def _build_commit_message(item: StoredItem) -> str:
     """Commit message sourced from the agent's own summary, not the user.
     Falls back to the item title if no summary is available."""
