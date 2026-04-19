@@ -3,6 +3,9 @@ import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+from .checkpoint import (DEFAULT_HARD_TEMPLATE, DEFAULT_SOFT_TEMPLATE,
+                         DEFAULT_TOKENS_TEMPLATE)
+
 
 @dataclass
 class SourcesConfig:
@@ -154,6 +157,19 @@ class AgentConfig:
     # system-prompt cache before siblings race for the same prefix.
     # 0 disables (back-compat default).
     dispatch_stagger_seconds: float = 0.0
+    # Mid-run advisory checkpoints. When the live turn count or cumulative
+    # output-token total crosses a threshold, the runner injects a user-role
+    # nudge suggesting the agent delegate discovery to a subagent. Each
+    # threshold fires at most once per run. Set any to 0 to disable that
+    # gate; setting all three to 0 disables checkpoints entirely. Only the
+    # Claude stream-json-stdin path acts on the emissions; legacy `-p
+    # {prompt}` command shapes still observe but do not inject.
+    turn_checkpoint_soft: int = 60
+    turn_checkpoint_hard: int = 100
+    output_token_checkpoint: int = 50_000
+    checkpoint_soft_template: str = DEFAULT_SOFT_TEMPLATE
+    checkpoint_hard_template: str = DEFAULT_HARD_TEMPLATE
+    checkpoint_tokens_template: str = DEFAULT_TOKENS_TEMPLATE
     build_cmd: str | None = None
     test_cmd: str | None = None
     # Threshold (in lines) above which a `Read` tool call MUST pass

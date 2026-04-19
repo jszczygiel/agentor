@@ -1542,6 +1542,238 @@ sleep 3
         # nothing to kill on a subsequent shutdown sweep.
         self.assertEqual(reg.kill_all(log=lambda m: None), 0)
 
+    def test_stdin_payload_is_written(self):
+        from agentor.runner import _run_stream_json_subprocess
+
+        # Fake CLI echoes stdin back as a JSON event, then exits.
+        cli = self._fake_cli(
+            'read line\n'
+            'printf \'{"type":"echo","line":"%s"}\\n\' "$line"\n'
+        )
+        events: list[dict] = []
+        _run_stream_json_subprocess(
+            args=[str(cli)],
+            cwd=self.root,
+            timeout_seconds=5,
+            transcript_path=self.transcript,
+            proc_registry=None,
+            item_key="k",
+            fnfe_hint="missing",
+            on_event=lambda ev: events.append(ev) or None,
+            stdin_payload="hello-from-test\n",
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "echo")
+        self.assertEqual(events[0]["line"], "hello-from-test")
+
+    def test_stdin_holder_injects_mid_run(self):
+        from agentor.runner import (ChildStdinHolder,
+                                    _run_stream_json_subprocess)
+
+        # Fake CLI: emit one event, read a second line from stdin and echo
+        # it back as a second event. Proves mid-run injection actually
+        # reaches the child before it exits.
+        cli = self._fake_cli(
+            'printf \'{"type":"first"}\\n\'\n'
+            'read injected\n'
+            'printf \'{"type":"second","line":"%s"}\\n\' "$injected"\n'
+        )
+        holder = ChildStdinHolder()
+        events: list[dict] = []
+
+        def on_event(ev: dict):
+            events.append(ev)
+            if ev.get("type") == "first":
+                holder.write_line("nudge-payload")
+            return None
+
+        _run_stream_json_subprocess(
+            args=[str(cli)],
+            cwd=self.root,
+            timeout_seconds=5,
+            transcript_path=self.transcript,
+            proc_registry=None,
+            item_key="k",
+            fnfe_hint="missing",
+            on_event=on_event,
+            stdin_holder=holder,
+        )
+        self.assertEqual([e["type"] for e in events], ["first", "second"])
+        self.assertEqual(events[1]["line"], "nudge-payload")
+
+
+class TestClaudeRunnerCheckpointInjection(unittest.TestCase):
+    """Drive `_invoke_claude_streaming` with a stubbed stream-json helper
+    so we can assert the emitter wires into the stdin holder without
+    depending on a real claude CLI."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] Big refactor\n  body\n")
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _mk_claude_cfg(self, **agent_overrides) -> Config:
+        agent = AgentConfig(
+            pool_size=1, runner="claude",
+            turn_checkpoint_soft=3,
+            turn_checkpoint_hard=0,
+            output_token_checkpoint=0,
+            **agent_overrides,
+        )
+        return Config(
+            project_name=self.root.name,
+            project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=agent,
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+
+    def _stub_helper(self, events: list[dict], captured_writes: list[str],
+                     captured_stdin_payload: list[str]):
+        """Replacement for `_run_stream_json_subprocess` that feeds the
+        caller-provided `on_event` with a canned event list and records any
+        mid-run stdin writes through the supplied holder."""
+        def helper(*, args, cwd, timeout_seconds, transcript_path,
+                   proc_registry, item_key, fnfe_hint, on_event,
+                   stdin_payload=None, stdin_holder=None):
+            if stdin_payload is not None:
+                captured_stdin_payload.append(stdin_payload)
+            # Wire the holder to a local sink — mirrors the real helper's
+            # `attach` step so `on_event` can write_line() through it.
+            if stdin_holder is not None:
+                class _Sink:
+                    def write(self, text):
+                        captured_writes.append(text)
+                    def flush(self):
+                        pass
+                stdin_holder.attach(_Sink())
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text("")
+            for ev in events:
+                on_event(ev)
+            if stdin_holder is not None:
+                stdin_holder.close()
+            return "", "", 0, False, None
+        return helper
+
+    def _assistant_event(self, output_tokens: int = 10) -> dict:
+        return {
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-4-6",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": output_tokens,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+                "content": [],
+            },
+        }
+
+    def test_soft_threshold_injected_via_stdin_holder(self):
+        from agentor import runner as runner_mod
+        from agentor.runner import ClaudeRunner
+
+        cfg = self._mk_claude_cfg()
+        runner = ClaudeRunner(cfg, self.store)
+
+        scan_once(cfg, self.store)
+        item_id = self.store.list_by_status(ItemStatus.QUEUED)[0].id
+        wt = self.root / "wt"
+        wt.mkdir()
+        claimed = self.store.claim_next_queued(str(wt), "agent/big-refactor")
+
+        events = [self._assistant_event() for _ in range(5)]
+        captured_writes: list[str] = []
+        captured_stdin_payload: list[str] = []
+        stub = self._stub_helper(events, captured_writes, captured_stdin_payload)
+
+        original = runner_mod._run_stream_json_subprocess
+        runner_mod._run_stream_json_subprocess = stub
+        try:
+            runner._invoke_claude_streaming(
+                claimed,
+                ["claude", "-p", "--input-format", "stream-json",
+                 "--output-format", "stream-json", "--verbose"],
+                wt,
+                self.root / ".agentor" / "transcripts" / f"{item_id}.plan.log",
+                "plan",
+                stdin_prompt="THE-PROMPT",
+            )
+        finally:
+            runner_mod._run_stream_json_subprocess = original
+
+        # Initial prompt framed as a single user JSONL line.
+        self.assertEqual(len(captured_stdin_payload), 1)
+        initial = json.loads(captured_stdin_payload[0].strip())
+        self.assertEqual(initial["type"], "user")
+        self.assertEqual(initial["message"]["content"], "THE-PROMPT")
+
+        # Exactly one nudge injected when turn count crossed the soft
+        # threshold (soft=3, five assistant events → fires once at turn 3).
+        user_lines = [
+            json.loads(w.strip()) for w in captured_writes if w.strip()
+        ]
+        self.assertEqual(len(user_lines), 1)
+        self.assertEqual(user_lines[0]["type"], "user")
+        self.assertIn("turn", user_lines[0]["message"]["content"].lower())
+
+    def test_legacy_prompt_template_skips_injection(self):
+        from agentor import runner as runner_mod
+        from agentor.runner import ClaudeRunner
+
+        cfg = self._mk_claude_cfg(
+            command=["claude", "-p", "{prompt}", "--output-format",
+                     "stream-json", "--verbose"],
+        )
+        runner = ClaudeRunner(cfg, self.store)
+
+        scan_once(cfg, self.store)
+        item_id = self.store.list_by_status(ItemStatus.QUEUED)[0].id
+        wt = self.root / "wt"
+        wt.mkdir()
+        claimed = self.store.claim_next_queued(str(wt), "agent/big-refactor")
+
+        events = [self._assistant_event() for _ in range(5)]
+        captured_writes: list[str] = []
+        captured_stdin_payload: list[str] = []
+        stub = self._stub_helper(events, captured_writes, captured_stdin_payload)
+
+        original = runner_mod._run_stream_json_subprocess
+        runner_mod._run_stream_json_subprocess = stub
+        try:
+            # Legacy path: stdin_prompt is None → no holder, no stdin writes
+            # even though the emitter still observes and crosses threshold.
+            runner._invoke_claude_streaming(
+                claimed,
+                ["claude", "-p", "THE-PROMPT", "--output-format",
+                 "stream-json", "--verbose"],
+                wt,
+                self.root / ".agentor" / "transcripts" / f"{item_id}.plan.log",
+                "plan",
+                stdin_prompt=None,
+            )
+        finally:
+            runner_mod._run_stream_json_subprocess = original
+
+        self.assertEqual(captured_writes, [])
+        self.assertEqual(captured_stdin_payload, [])
+        # Transcript still got a dry-run observation marker for the crossed
+        # soft threshold so operators can see where injection would've landed.
+        transcript = (
+            self.root / ".agentor" / "transcripts" / f"{item_id}.plan.log"
+        ).read_text()
+        self.assertIn("checkpoint-observed-dry-run", transcript)
+
 
 class TestClaudeSettingsHookWiring(unittest.TestCase):
     """The Claude runner must write a per-run settings JSON that registers
