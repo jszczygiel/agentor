@@ -525,5 +525,129 @@ class TestLatestTransitionAt(unittest.TestCase):
         )
 
 
+class TestAggregateTokenUsage(unittest.TestCase):
+    """Dashboard's cumulative token panel relies on this aggregation over
+    items.result_json. Survives daemon restarts because result_json is on
+    disk; re-attempted items overwrite prior runs (current-state total)."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.store = Store(Path(self.td.name) / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _seed(self, item_id: str, result_json: str,
+              updated_at: float | None = None) -> None:
+        self.store.upsert_discovered(_mk_item(id=item_id))
+        self.store.update_result_json(item_id, result_json)
+        if updated_at is not None:
+            self.store.conn.execute(
+                "UPDATE items SET updated_at = ? WHERE id = ?",
+                (updated_at, item_id),
+            )
+
+    def test_empty_store_returns_zeros(self):
+        buckets = self.store.aggregate_token_usage()
+        self.assertEqual(buckets, {
+            "input": 0, "output": 0,
+            "cache_read": 0, "cache_create": 0, "total": 0,
+        })
+
+    def test_prefers_modelusage(self):
+        import json as _json
+        blob = _json.dumps({
+            "modelUsage": {
+                "claude-opus-4-7": {
+                    "inputTokens": 100,
+                    "outputTokens": 50,
+                    "cacheReadInputTokens": 2000,
+                    "cacheCreationInputTokens": 300,
+                },
+            },
+            # Flat usage that should be ignored when modelUsage is present —
+            # prevents double-counting.
+            "usage": {
+                "input_tokens": 999,
+                "output_tokens": 999,
+                "cache_read_input_tokens": 999,
+                "cache_creation_input_tokens": 999,
+            },
+        })
+        self._seed("a", blob)
+        buckets = self.store.aggregate_token_usage()
+        self.assertEqual(buckets["input"], 100)
+        self.assertEqual(buckets["output"], 50)
+        self.assertEqual(buckets["cache_read"], 2000)
+        self.assertEqual(buckets["cache_create"], 300)
+        self.assertEqual(buckets["total"], 100 + 50 + 2000 + 300)
+
+    def test_sums_across_models(self):
+        import json as _json
+        blob = _json.dumps({
+            "modelUsage": {
+                "claude-opus-4-7": {
+                    "inputTokens": 10, "outputTokens": 20,
+                    "cacheReadInputTokens": 30,
+                    "cacheCreationInputTokens": 40,
+                },
+                "claude-haiku-4-5": {
+                    "inputTokens": 1, "outputTokens": 2,
+                    "cacheReadInputTokens": 3,
+                    "cacheCreationInputTokens": 4,
+                },
+            },
+        })
+        self._seed("a", blob)
+        buckets = self.store.aggregate_token_usage()
+        self.assertEqual(buckets["input"], 11)
+        self.assertEqual(buckets["output"], 22)
+        self.assertEqual(buckets["cache_read"], 33)
+        self.assertEqual(buckets["cache_create"], 44)
+
+    def test_falls_back_to_flat_usage(self):
+        import json as _json
+        blob = _json.dumps({
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 9,
+                "cache_creation_input_tokens": 11,
+            },
+        })
+        self._seed("a", blob)
+        buckets = self.store.aggregate_token_usage()
+        self.assertEqual(buckets["input"], 5)
+        self.assertEqual(buckets["output"], 7)
+        self.assertEqual(buckets["cache_read"], 9)
+        self.assertEqual(buckets["cache_create"], 11)
+        self.assertEqual(buckets["total"], 32)
+
+    def test_since_filter_excludes_older_rows(self):
+        import json as _json
+        old_blob = _json.dumps({"usage": {"input_tokens": 100}})
+        new_blob = _json.dumps({"usage": {"input_tokens": 3}})
+        self._seed("old", old_blob, updated_at=1000.0)
+        self._seed("new", new_blob, updated_at=2000.0)
+        all_buckets = self.store.aggregate_token_usage()
+        self.assertEqual(all_buckets["input"], 103)
+        recent = self.store.aggregate_token_usage(since=1500.0)
+        self.assertEqual(recent["input"], 3)
+
+    def test_malformed_json_skipped(self):
+        self.store.upsert_discovered(_mk_item(id="a"))
+        self.store.update_result_json("a", "{not: json")
+        buckets = self.store.aggregate_token_usage()
+        self.assertEqual(buckets["total"], 0)
+
+    def test_skips_items_without_result_json(self):
+        self.store.upsert_discovered(_mk_item(id="a"))
+        import json as _json
+        self._seed("b", _json.dumps({"usage": {"input_tokens": 4}}))
+        buckets = self.store.aggregate_token_usage()
+        self.assertEqual(buckets["input"], 4)
+
+
 if __name__ == "__main__":
     unittest.main()
