@@ -261,8 +261,13 @@ def _render_table(
         src = it.source_file
         if len(src) > _COL_SOURCE - 1:
             src = "…" + src[-(_COL_SOURCE - 2):]
+        # Priority glyph lives inside the TITLE column: 1 char glyph + 1
+        # space, always reserved so priority==0 rows keep title columns
+        # aligned with pinned rows. `*` flags priority>0; negatives are
+        # clamped by bump_priority so they render as blank today.
         title_max = max(0, w - 1 - _COL_ID - _COL_STATE - _COL_ELAPSED
-                          - _COL_CTX - _COL_SOURCE)
+                          - _COL_CTX - _COL_SOURCE - 2)
+        pri_glyph = "*" if it.priority > 0 else " "
         marker = "!" if has_err else " "
         state_label = st.value
         if st == ItemStatus.WORKING:
@@ -274,7 +279,7 @@ def _render_table(
         title = it.title[:title_max]
         line = (f" {it.id[:8]:<{_COL_ID-1}}{state_cell:<{_COL_STATE}}"
                 f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
-                f"{src:<{_COL_SOURCE}}{title}")
+                f"{src:<{_COL_SOURCE}}{pri_glyph} {title}")
         if has_err:
             attr = curses.color_pair(4) | curses.A_BOLD
         else:
