@@ -2284,5 +2284,74 @@ class TestClaudeSettingsHookWiring(unittest.TestCase):
         self.assertIn(str(settings), args)
 
 
+class TestStreamStateRateLimitHarvester(unittest.TestCase):
+    """Passive capture of any `rate_limit`/`ratelimits`/`anthropic-ratelimit-*`
+    fields the claude CLI might surface on future versions. Current CLI strips
+    these so the happy path is "absent → no envelope key"."""
+
+    def _new(self):
+        from agentor.runner import _StreamState
+        return _StreamState(item_id="i1", phase="execute")
+
+    def test_absent_fields_leave_envelope_clean(self):
+        state = self._new()
+        state.ingest({"type": "system", "subtype": "init",
+                      "session_id": "s"})
+        state.ingest({"type": "result", "num_turns": 1,
+                      "stop_reason": "end_turn"})
+        env = state.envelope()
+        self.assertNotIn("rate_limits", env)
+
+    def test_rate_limit_on_result_event_captured(self):
+        state = self._new()
+        sample = {
+            "session": {"used": 123, "limit": 1000,
+                        "reset_at": "2026-04-19T22:00:00Z"},
+            "weekly": {"used": 4500, "limit": 10000,
+                       "reset_at": "2026-04-26T00:00:00Z"},
+        }
+        state.ingest({"type": "result", "num_turns": 1,
+                      "stop_reason": "end_turn",
+                      "rate_limit": sample})
+        self.assertEqual(state.envelope()["rate_limits"], sample)
+
+    def test_rate_limit_nested_in_message_usage(self):
+        # Future CLI may drop the hint onto `message.usage` like Anthropic's
+        # raw responses do — harvester checks both nesting points.
+        state = self._new()
+        sample = {"tokens_remaining": 50_000}
+        state.ingest({
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-4-7",
+                "usage": {
+                    "input_tokens": 10, "output_tokens": 20,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "ratelimits": sample,
+                },
+            },
+        })
+        self.assertEqual(state.envelope()["rate_limits"], sample)
+
+    def test_latest_wins_when_multiple_samples(self):
+        state = self._new()
+        first = {"session": {"used": 100, "limit": 1000}}
+        second = {"session": {"used": 200, "limit": 1000}}
+        state.ingest({"type": "system", "subtype": "init",
+                      "session_id": "s", "rate_limit": first})
+        state.ingest({"type": "result", "num_turns": 1,
+                      "stop_reason": "end_turn",
+                      "rate_limit": second})
+        self.assertEqual(state.envelope()["rate_limits"], second)
+
+    def test_non_dict_rate_limit_ignored(self):
+        state = self._new()
+        state.ingest({"type": "result", "num_turns": 1,
+                      "stop_reason": "end_turn",
+                      "rate_limit": "not-a-dict"})
+        self.assertNotIn("rate_limits", state.envelope())
+
+
 if __name__ == "__main__":
     unittest.main()

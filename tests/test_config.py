@@ -177,6 +177,27 @@ class TestLoadConfig(unittest.TestCase):
         self.assertIn("unknown key [agent].pickup_mode", buf.getvalue())
         self.assertFalse(hasattr(cfg.agent, "pickup_mode"))
 
+    def test_token_budgets_parse_and_default_zero(self):
+        cfg_path = self._write(
+            "agentor.toml",
+            '[agent]\n'
+            'runner = "stub"\n'
+            'session_token_budget = 500000\n'
+            'weekly_token_budget = 5000000\n',
+        )
+        cfg = load(cfg_path)
+        self.assertEqual(cfg.agent.session_token_budget, 500_000)
+        self.assertEqual(cfg.agent.weekly_token_budget, 5_000_000)
+
+    def test_token_budgets_default_zero_when_absent(self):
+        cfg_path = self._write(
+            "agentor.toml",
+            '[agent]\nrunner = "stub"\n',
+        )
+        cfg = load(cfg_path)
+        self.assertEqual(cfg.agent.session_token_budget, 0)
+        self.assertEqual(cfg.agent.weekly_token_budget, 0)
+
     def test_missing_file_raises(self):
         with self.assertRaises(FileNotFoundError):
             load(self.dir / "does-not-exist.toml")
