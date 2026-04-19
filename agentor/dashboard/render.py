@@ -65,13 +65,14 @@ def _state_glyph(status: ItemStatus) -> str:
     return _STATE_GLYPHS.get(status, "?")
 
 # Filter views: ordered list cycled by Tab. Each entry maps a filter name
-# to the statuses to display (None = all).
+# to the statuses to display (None = every ItemStatus member).
+# "active" is the default (index 0): work the operator can still act on —
+# terminal states (merged/rejected/errored/cancelled) and deferred are
+# hidden and only surface via the explicit per-status filters or "all".
 FILTERS: list[tuple[str, list[ItemStatus] | None]] = [
-    ("all", [ItemStatus.WORKING, ItemStatus.AWAITING_PLAN_REVIEW,
-             ItemStatus.AWAITING_REVIEW, ItemStatus.CONFLICTED,
-             ItemStatus.QUEUED, ItemStatus.ERRORED,
-             ItemStatus.REJECTED, ItemStatus.MERGED, ItemStatus.CANCELLED,
-             ItemStatus.DEFERRED]),
+    ("active", [ItemStatus.WORKING, ItemStatus.AWAITING_PLAN_REVIEW,
+                ItemStatus.AWAITING_REVIEW, ItemStatus.CONFLICTED,
+                ItemStatus.QUEUED, ItemStatus.APPROVED]),
     ("errored", [ItemStatus.ERRORED]),
     ("conflicted", [ItemStatus.CONFLICTED]),
     ("queued", [ItemStatus.QUEUED]),
@@ -81,6 +82,7 @@ FILTERS: list[tuple[str, list[ItemStatus] | None]] = [
     ("deferred", [ItemStatus.DEFERRED]),
     ("merged", [ItemStatus.MERGED]),
     ("rejected", [ItemStatus.REJECTED]),
+    ("all", None),
 ]
 REFRESH_MS = 500
 

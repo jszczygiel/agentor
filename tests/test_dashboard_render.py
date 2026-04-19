@@ -14,6 +14,7 @@ from agentor.dashboard.render import (
     ACTIONS_MID,
     ACTIONS_NARROW,
     ACTIONS_WIDE,
+    FILTERS,
     _build_alert_banner,
     _build_status_line,
     _layout_tier,
@@ -567,6 +568,119 @@ class TestPriorityGlyph(unittest.TestCase):
             plain_line.index("PlainTitle"),
             "pinned and plain rows must align titles at the same column",
         )
+
+
+class TestDefaultFilter(unittest.TestCase):
+    """Default dashboard filter (index 0 in FILTERS) must show active work
+    only — QUEUED/WORKING/AWAITING_*/CONFLICTED/APPROVED — and hide
+    terminal states and deferred. An explicit `all` entry still exists for
+    operators who want the full set."""
+
+    _ACTIVE_STATUSES = {
+        ItemStatus.QUEUED,
+        ItemStatus.WORKING,
+        ItemStatus.AWAITING_PLAN_REVIEW,
+        ItemStatus.AWAITING_REVIEW,
+        ItemStatus.CONFLICTED,
+        ItemStatus.APPROVED,
+    }
+
+    def test_default_filter_is_active(self):
+        name, statuses = FILTERS[0]
+        self.assertEqual(name, "active")
+        self.assertIsNotNone(statuses)
+        self.assertEqual(set(statuses), self._ACTIVE_STATUSES)
+
+    def test_all_filter_covers_every_status(self):
+        entry = next((e for e in FILTERS if e[0] == "all"), None)
+        self.assertIsNotNone(entry, "FILTERS must expose an 'all' entry")
+        _, statuses = entry
+        # None resolves to `list(ItemStatus)` in _render; both representations
+        # are valid "every status" sentinels.
+        resolved = set(statuses) if statuses is not None else set(ItemStatus)
+        self.assertEqual(resolved, set(ItemStatus))
+
+    def test_terminal_statuses_hidden_by_default(self):
+        td = TemporaryDirectory()
+        try:
+            store = Store(Path(td.name) / "state.db")
+            hidden = {
+                "m_id": ItemStatus.MERGED,
+                "r_id": ItemStatus.REJECTED,
+                "e_id": ItemStatus.ERRORED,
+                "c_id": ItemStatus.CANCELLED,
+                "d_id": ItemStatus.DEFERRED,
+            }
+            for item_id, st in hidden.items():
+                store.upsert_discovered(Item(
+                    id=item_id, title=item_id, body="",
+                    source_file="s.md", source_line=1, tags={},
+                ))
+                store.transition(item_id, st)
+            store.upsert_discovered(Item(
+                id="q_id", title="q_id", body="",
+                source_file="s.md", source_line=2, tags={},
+            ))
+
+            stdscr = _FakeStdscr(width=200)
+            cfg = SimpleNamespace(
+                project_name="demo",
+                agent=SimpleNamespace(runner="stub", pool_size=1,
+                                      context_window=200_000),
+            )
+            daemon = SimpleNamespace(
+                stats=SimpleNamespace(completed=0),
+                system_alert=None,
+                started_at=0.0,
+                workers=set(),
+            )
+            _token_windows_invalidate()
+            with patch("agentor.dashboard.render.curses.color_pair",
+                       return_value=0), \
+                 patch("agentor.dashboard.render._set_terminal_title"):
+                rendered = _render(stdscr, cfg, store, daemon, log_ring=[],
+                                   filter_idx=0, selected_id=None)
+            rendered_ids = {it.id for it in rendered}
+            self.assertEqual(rendered_ids, {"q_id"})
+            for hidden_id in hidden:
+                self.assertNotIn(hidden_id, rendered_ids)
+            store.close()
+        finally:
+            td.cleanup()
+
+    def test_all_filter_reveals_hidden_statuses(self):
+        td = TemporaryDirectory()
+        try:
+            store = Store(Path(td.name) / "state.db")
+            store.upsert_discovered(Item(
+                id="merged_id", title="merged_id", body="",
+                source_file="s.md", source_line=1, tags={},
+            ))
+            store.transition("merged_id", ItemStatus.MERGED)
+
+            all_idx = next(i for i, e in enumerate(FILTERS) if e[0] == "all")
+            stdscr = _FakeStdscr(width=200)
+            cfg = SimpleNamespace(
+                project_name="demo",
+                agent=SimpleNamespace(runner="stub", pool_size=1,
+                                      context_window=200_000),
+            )
+            daemon = SimpleNamespace(
+                stats=SimpleNamespace(completed=0),
+                system_alert=None,
+                started_at=0.0,
+                workers=set(),
+            )
+            _token_windows_invalidate()
+            with patch("agentor.dashboard.render.curses.color_pair",
+                       return_value=0), \
+                 patch("agentor.dashboard.render._set_terminal_title"):
+                rendered = _render(stdscr, cfg, store, daemon, log_ring=[],
+                                   filter_idx=all_idx, selected_id=None)
+            self.assertIn("merged_id", {it.id for it in rendered})
+            store.close()
+        finally:
+            td.cleanup()
 
 
 if __name__ == "__main__":
