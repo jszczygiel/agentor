@@ -161,6 +161,28 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
                      curses.color_pair(4) | curses.A_BOLD | curses.A_REVERSE)
         row += 1
 
+    # Stale-session banners — informational (no pause). Capped at 3 rows
+    # so a runaway pool doesn't eat the table on narrow terminals; beyond
+    # the cap, a compact roll-up summarises the rest.
+    stale = getattr(daemon, "stale_session_alerts", {}) or {}
+    if stale:
+        now_ns = time.time_ns()
+        entries = sorted(stale.items(), key=lambda kv: kv[1])  # oldest first
+        cap = 3
+        shown = entries[:cap]
+        for item_id, mtime_ns in shown:
+            mins = max(0, (now_ns - mtime_ns) // 60_000_000_000)
+            line = _build_stale_banner(item_id, mins, w)
+            _safe_addstr(stdscr, row, 0, line.ljust(w), w,
+                         curses.color_pair(3) | curses.A_BOLD | curses.A_REVERSE)
+            row += 1
+        extra = len(entries) - len(shown)
+        if extra > 0:
+            line = f" ⚠ +{extra} more stale session(s) — press [u] to ack "
+            _safe_addstr(stdscr, row, 0, line[:w].ljust(w), w,
+                         curses.color_pair(3) | curses.A_BOLD | curses.A_REVERSE)
+            row += 1
+
     # combined status + counts line
     s = daemon.stats
     counts = {st: store.count_by_status(st) for st in ItemStatus}
@@ -292,6 +314,21 @@ def _build_alert_banner(alert: str, w: int) -> str:
     if msg and len(msg) > budget:
         msg = msg[: max(0, budget - 3)] + "..."
     return f"{prefix}{msg}{suffix}"
+
+
+def _build_stale_banner(item_id: str, minutes: int, w: int) -> str:
+    """Compose the stale-session sticky banner. Kept short so three of
+    these can share the header on a narrow terminal without pushing the
+    table off-screen."""
+    short = item_id[:8]
+    if w < 33:
+        return f" ⚠ stale {short} "[:w]
+    prefix = f" ⚠ stale session {short} — {minutes}m idle"
+    suffix = "  [u] to ack "
+    budget = w - len(prefix) - len(suffix)
+    if budget < 0:
+        return (prefix + suffix)[:w]
+    return f"{prefix}{' ' * budget}{suffix}"
 
 
 def _build_status_line(tier: str, cfg, stats, counts: dict,

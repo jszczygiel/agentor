@@ -57,6 +57,7 @@ class TestLoadConfig(unittest.TestCase):
         self.assertEqual(cfg.parsing.mode, "frontmatter")
         self.assertEqual(cfg.git.base_branch, "main")
         self.assertEqual(cfg.git.merge_mode, "merge")
+        self.assertIs(cfg.git.auto_resolve_conflicts, True)
         self.assertEqual(cfg.sources.watch,
                          ["docs/backlog/*.md", "docs/ideas/*.md"])
 
@@ -197,6 +198,21 @@ class TestLoadConfig(unittest.TestCase):
         cfg = load(cfg_path)
         self.assertEqual(cfg.agent.session_token_budget, 0)
         self.assertEqual(cfg.agent.weekly_token_budget, 0)
+
+    def test_auto_resolve_conflicts_default_on(self):
+        """GitConfig() default flipped to True: failed integrations bounce
+        back to the agent without operator intervention by default."""
+        self.assertIs(GitConfig().auto_resolve_conflicts, True)
+
+    def test_auto_resolve_conflicts_opt_out(self):
+        """Operators who want manual control over CONFLICTED items can
+        still set `auto_resolve_conflicts = false` in agentor.toml."""
+        cfg_path = self._write(
+            "agentor.toml",
+            '[git]\nauto_resolve_conflicts = false\n',
+        )
+        cfg = load(cfg_path)
+        self.assertIs(cfg.git.auto_resolve_conflicts, False)
 
     def test_missing_file_raises(self):
         with self.assertRaises(FileNotFoundError):
