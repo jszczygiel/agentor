@@ -1,4 +1,5 @@
 import subprocess
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -535,6 +536,156 @@ class TestApproveFeedbackSplit(unittest.TestCase):
         final = self.store.get(item.id)
         self.assertEqual(final.status, ItemStatus.QUEUED)
         self.assertIsNone(final.feedback)
+
+
+class TestConcurrentIntegration(unittest.TestCase):
+    """Two AWAITING_REVIEW items approved simultaneously must both reach
+    MERGED with distinct commits on base. Without `_INTEGRATION_LOCK` this
+    races: both threads capture the same `base_sha` via `rev-parse`, the
+    first wins the CAS `update-ref OLD NEW`, and the second transitions
+    CONFLICTED with a spurious ref-changed summary for work that didn't
+    actually conflict."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text(
+            "- [ ] First item\n  details A\n"
+            "- [ ] Second item\n  details B\n"
+        )
+        self.cfg = _mk_config(self.root)
+        self.cfg.agent.pool_size = 2
+        self.store = Store(self.root / ".agentor" / "state.db")
+        scan_once(self.cfg, self.store)
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _drive_to_awaiting_review(self) -> list:
+        queued = self.store.list_by_status(ItemStatus.QUEUED)
+        self.assertEqual(len(queued), 2)
+        items = []
+        for q in queued:
+            wt, br = plan_worktree(self.cfg, q)
+            claimed = self.store.claim_next_queued(str(wt), br)
+            StubRunner(self.cfg, self.store).run(claimed)
+            items.append(self.store.get(claimed.id))
+        for item in items:
+            self.assertEqual(item.status, ItemStatus.AWAITING_REVIEW)
+        return items
+
+    def test_concurrent_approvals_both_merge(self):
+        import threading as _t
+        items = self._drive_to_awaiting_review()
+        base_before = _main_sha(self.root)
+        barrier = _t.Barrier(len(items))
+        results: dict[str, object] = {}
+        errors: dict[str, BaseException] = {}
+
+        def work(it):
+            try:
+                barrier.wait(timeout=5)
+                results[it.id] = approve_and_commit(
+                    self.cfg, self.store, it, f"stub commit {it.id[:6]}",
+                )
+            except BaseException as e:  # noqa: BLE001 — surface in test
+                errors[it.id] = e
+
+        threads = [_t.Thread(target=work, args=(it,)) for it in items]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+            self.assertFalse(t.is_alive(), "worker thread stuck")
+
+        self.assertEqual(errors, {}, f"unexpected errors: {errors}")
+        finals = [self.store.get(it.id) for it in items]
+        for f in finals:
+            self.assertEqual(
+                f.status, ItemStatus.MERGED,
+                f"{f.id[:8]} not MERGED: {f.status} last_error={f.last_error!r}",
+            )
+        # Both returned feature SHAs exist and differ.
+        shas = list(results.values())
+        self.assertEqual(len(set(shas)), 2, f"feature SHAs collided: {shas}")
+        # Main has advanced by two commits (merge commits in "merge" mode),
+        # each pulling in one feature SHA.
+        self.assertNotEqual(_main_sha(self.root), base_before)
+        log = subprocess.run(
+            ["git", "log", "--pretty=%H", f"{base_before}..main"],
+            cwd=self.root, capture_output=True, text=True, check=True,
+        ).stdout.split()
+        for sha in shas:
+            self.assertIn(
+                str(sha), log,
+                "feature commit should be reachable from main",
+            )
+        # Feature branches and worktrees cleaned up for both.
+        for it in items:
+            self.assertFalse(
+                _branch_exists(self.root, it.branch),
+                f"feature branch {it.branch} should be deleted",
+            )
+            self.assertFalse(
+                Path(it.worktree_path).exists(),
+                f"worktree {it.worktree_path} should be removed",
+            )
+
+    def test_integration_lock_serialises_base_branch_updates(self):
+        """Directly verify mutual exclusion: instrument
+        `git_ops.merge_feature_into_base` to track concurrent entries. With
+        the lock in place the counter never exceeds 1."""
+        import threading as _t
+        from agentor import git_ops as _git_ops
+
+        items = self._drive_to_awaiting_review()
+        entry_counter = {"live": 0, "max": 0}
+        entry_lock = _t.Lock()
+        original = _git_ops.merge_feature_into_base
+
+        def instrumented(*a, **kw):
+            with entry_lock:
+                entry_counter["live"] += 1
+                if entry_counter["live"] > entry_counter["max"]:
+                    entry_counter["max"] = entry_counter["live"]
+            try:
+                # Give the other thread a chance to race in if the
+                # integration lock were missing.
+                time.sleep(0.1)
+                return original(*a, **kw)
+            finally:
+                with entry_lock:
+                    entry_counter["live"] -= 1
+
+        # Patch both the module and the local import inside committer.
+        from agentor import committer as _committer
+        _git_ops.merge_feature_into_base = instrumented
+        _committer.git_ops.merge_feature_into_base = instrumented
+        try:
+            barrier = _t.Barrier(len(items))
+
+            def work(it):
+                barrier.wait(timeout=5)
+                approve_and_commit(
+                    self.cfg, self.store, it, f"stub commit {it.id[:6]}",
+                )
+
+            threads = [_t.Thread(target=work, args=(it,)) for it in items]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+        finally:
+            _git_ops.merge_feature_into_base = original
+            _committer.git_ops.merge_feature_into_base = original
+
+        self.assertEqual(
+            entry_counter["max"], 1,
+            "integration lock must serialise merge_feature_into_base; "
+            f"observed {entry_counter['max']} concurrent entries",
+        )
 
 
 if __name__ == "__main__":
