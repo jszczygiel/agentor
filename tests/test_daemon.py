@@ -135,6 +135,93 @@ class TestDispatchPoolCap(unittest.TestCase):
         self.assertIn("max_attempts", (item.last_error or ""))
 
 
+class TestDispatchStagger(unittest.TestCase):
+    """try_fill_pool waits between successive dispatches when
+    dispatch_stagger_seconds > 0 so the first agent populates the shared
+    system-prompt cache before siblings race for the same prefix."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        self.block = threading.Event()
+
+    def tearDown(self):
+        self.block.set()
+        self.store.close()
+        self.td.cleanup()
+
+    def _queue(self, id: str) -> None:
+        self.store.upsert_discovered(_mk_item(id))
+        self.store.transition(id, ItemStatus.QUEUED)
+
+    def _factory(self):
+        block = self.block
+
+        def behavior(runner, item):
+            block.wait(timeout=2)
+            return RunResult(item.id, Path("/x"), "br", "ok", [], "")
+
+        def make(cfg, store):
+            return FakeRunner(cfg, store, behavior)
+
+        return make
+
+    def _mk_daemon(self, pool_size: int, stagger: float) -> Daemon:
+        cfg = _mk_config(self.root, pool_size=pool_size)
+        cfg.agent.dispatch_stagger_seconds = stagger
+        d = Daemon(cfg, self.store, self._factory(),
+                   install_signals=False, log=lambda m: None)
+        d._stagger_waits = []  # type: ignore[attr-defined]
+        d._stagger_wait = d._stagger_waits.append  # type: ignore[method-assign]
+        return d
+
+    def test_stagger_between_sibling_dispatches(self):
+        for i in ("a", "b", "c"):
+            self._queue(i)
+        d = self._mk_daemon(pool_size=3, stagger=2.5)
+        n = d.try_fill_pool()
+        self.assertEqual(n, 3)
+        # Two gaps between three dispatches, each the configured duration.
+        self.assertEqual(d._stagger_waits, [2.5, 2.5])
+        self.block.set()
+        _drain_workers(d)
+
+    def test_no_stagger_when_zero(self):
+        for i in ("a", "b", "c"):
+            self._queue(i)
+        d = self._mk_daemon(pool_size=3, stagger=0.0)
+        n = d.try_fill_pool()
+        self.assertEqual(n, 3)
+        self.assertEqual(d._stagger_waits, [])
+        self.block.set()
+        _drain_workers(d)
+
+    def test_no_stagger_for_solo_dispatch(self):
+        """Single-item burst (pool holds one slot) must not sleep — there
+        are no siblings to share the cache with."""
+        self._queue("a")
+        d = self._mk_daemon(pool_size=1, stagger=3.0)
+        n = d.try_fill_pool()
+        self.assertEqual(n, 1)
+        # pool_has_slot is False after filling the only slot, so no wait.
+        self.assertEqual(d._stagger_waits, [])
+        self.block.set()
+        _drain_workers(d)
+
+    def test_no_stagger_after_final_dispatch_in_burst(self):
+        """Three items, three-slot pool — two staggers total (between 1-2
+        and 2-3), nothing trailing after the last item fills the pool."""
+        for i in ("a", "b", "c"):
+            self._queue(i)
+        d = self._mk_daemon(pool_size=3, stagger=1.0)
+        n = d.try_fill_pool()
+        self.assertEqual(n, 3)
+        self.assertEqual(len(d._stagger_waits), 2)
+        self.block.set()
+        _drain_workers(d)
+
+
 class TestInfraErrorStickyAlert(unittest.TestCase):
     def setUp(self):
         self.td = TemporaryDirectory()

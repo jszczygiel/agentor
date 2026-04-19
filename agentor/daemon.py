@@ -129,9 +129,24 @@ class Daemon:
         right now — bypasses the scan-interval wait. Returns how many were
         dispatched."""
         n = 0
+        stagger = self.config.agent.dispatch_stagger_seconds
         while self._dispatch_one():
             n += 1
+            if stagger <= 0:
+                continue
+            # Give the first agent a head start writing the shared system-
+            # prompt prefix into Anthropic's cache before siblings race for
+            # it. Skip when another dispatch isn't plausibly about to fire
+            # (pool just filled) so a solo dispatch never waits.
+            if not self.store.pool_has_slot(self.config.agent.pool_size):
+                break
+            self._stagger_wait(stagger)
         return n
+
+    def _stagger_wait(self, seconds: float) -> None:
+        """Interruptible sleep between staggered dispatches. Uses stop_event
+        so a shutdown signal unblocks the wait. Overridable for tests."""
+        self.stop_event.wait(seconds)
 
     def _dispatch_one(self) -> bool:
         """Dispatch one QUEUED item if a pool slot is free. New items land
@@ -250,8 +265,7 @@ class Daemon:
             self.stats.scans += 1
             if result.new_items:
                 self.log(f"scan: {result.new_items} new items")
-            while self._dispatch_one():
-                pass
+            self.try_fill_pool()
             self._maybe_log_heartbeat(result.new_items)
             self.stop_event.wait(self.scan_interval)
 

@@ -149,6 +149,11 @@ class AgentConfig:
     # Hard cap on agent turns. 0 disables. Live stream watches num_turns
     # and kills the child when exceeded.
     max_turns: int = 0
+    # Seconds to pause between successive dispatches in a single
+    # try_fill_pool burst, so the first agent can populate the shared
+    # system-prompt cache before siblings race for the same prefix.
+    # 0 disables (back-compat default).
+    dispatch_stagger_seconds: float = 0.0
     build_cmd: str | None = None
     test_cmd: str | None = None
 
