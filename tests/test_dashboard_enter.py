@@ -18,21 +18,21 @@ class TestInspectActionMap(unittest.TestCase):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[
             ItemStatus.AWAITING_PLAN_REVIEW
         ]}
-        self.assertEqual(keys, {"a", "f", "r", "s"})
+        self.assertEqual(keys, {"a", "f", "r", "s", "x"})
 
     def test_awaiting_review_has_approve_reject_defer_diff(self):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[
             ItemStatus.AWAITING_REVIEW
         ]}
-        self.assertEqual(keys, {"a", "r", "s", "v"})
+        self.assertEqual(keys, {"a", "r", "s", "v", "x"})
 
     def test_conflicted_has_retry_merge_resubmit_defer(self):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[ItemStatus.CONFLICTED]}
-        self.assertEqual(keys, {"m", "e", "s"})
+        self.assertEqual(keys, {"m", "e", "s", "x"})
 
     def test_errored_has_retry_and_defer(self):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[ItemStatus.ERRORED]}
-        self.assertEqual(keys, {"a", "s"})
+        self.assertEqual(keys, {"a", "s", "x"})
 
     def test_rejected_has_retry(self):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[ItemStatus.REJECTED]}
@@ -42,16 +42,27 @@ class TestInspectActionMap(unittest.TestCase):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[ItemStatus.DEFERRED]}
         self.assertEqual(keys, {"a", "x"})
 
-    def test_terminal_and_mid_flight_statuses_have_no_actions(self):
+    def test_delete_is_bound_on_every_status(self):
+        """`x` is the unified delete action — every lifecycle state must
+        expose it so operators can remove any item from the inspect view."""
+        for st in ItemStatus:
+            with self.subTest(status=st):
+                keys = {k for k, _ in _ACTION_KEYS_BY_STATUS.get(st, [])}
+                self.assertIn("x", keys)
+
+    def test_view_only_statuses_have_only_delete(self):
+        """QUEUED, WORKING, and the terminal states expose only `x`; other
+        actions (approve/defer/merge/etc.) aren't meaningful there."""
         for st in (
+            ItemStatus.QUEUED,
+            ItemStatus.WORKING,
+            ItemStatus.APPROVED,
             ItemStatus.MERGED,
             ItemStatus.CANCELLED,
-            ItemStatus.APPROVED,
-            ItemStatus.WORKING,
-            ItemStatus.QUEUED,
         ):
             with self.subTest(status=st):
-                self.assertEqual(_ACTION_KEYS_BY_STATUS.get(st, []), [])
+                keys = {k for k, _ in _ACTION_KEYS_BY_STATUS.get(st, [])}
+                self.assertEqual(keys, {"x"})
 
     def test_keys_do_not_collide_with_global_close(self):
         # q closes the inspect view; n advances; enter/esc close. Those
@@ -62,13 +73,16 @@ class TestInspectActionMap(unittest.TestCase):
                 with self.subTest(status=st, key=key):
                     self.assertNotIn(key, reserved)
 
-    def test_approve_key_is_a_everywhere(self):
-        # "a" is the primary forward action in every status that has one.
+    def test_approve_key_is_a_where_an_approve_action_exists(self):
+        # "a" is the primary forward action in every status that has a
+        # non-delete action (approve / retry / restore). Statuses whose
+        # only action is `[x]delete` (QUEUED, WORKING, APPROVED, MERGED,
+        # CANCELLED) and CONFLICTED (uses m/e/s instead) are excluded.
+        delete_only = {"x"}
         for st, pairs in _ACTION_KEYS_BY_STATUS.items():
-            if not pairs:
-                continue
             keys = {k for k, _ in pairs}
-            # CONFLICTED uses m/e/s — no single primary approve key.
+            if not keys or keys == delete_only:
+                continue
             if st == ItemStatus.CONFLICTED:
                 self.assertNotIn("a", keys)
                 continue
@@ -77,9 +91,14 @@ class TestInspectActionMap(unittest.TestCase):
 
 
 class TestInspectActionLabel(unittest.TestCase):
-    def test_empty_for_view_only_status(self):
-        self.assertEqual(_inspect_action_label(ItemStatus.MERGED), "")
-        self.assertEqual(_inspect_action_label(ItemStatus.WORKING), "")
+    def test_delete_only_status_label_contains_delete(self):
+        """Statuses whose only action is `[x]delete` render that label
+        alone in the footer."""
+        for st in (ItemStatus.MERGED, ItemStatus.WORKING):
+            with self.subTest(status=st):
+                self.assertEqual(
+                    _inspect_action_label(st), "[x]delete",
+                )
 
     def test_lists_all_labels_for_awaiting_review(self):
         label = _inspect_action_label(ItemStatus.AWAITING_REVIEW)

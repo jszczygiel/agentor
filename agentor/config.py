@@ -220,15 +220,15 @@ class GitConfig:
     # merge in-place. Off by default: existing workflows keep the manual
     # [m] retry_merge / [e] resubmit dashboard gates.
     auto_resolve_conflicts: bool = False
-    # When true (the default), every clean auto-merge advances the user's
-    # primary checkout at `project_root` to the new base tip — after the
-    # ref has already CAS-advanced — so `git status` in the user's shell
-    # doesn't accumulate phantom "reversions" as more merges land. The
-    # checkout advance is guarded: it is skipped (with a visible reason
-    # on the dashboard) when the checkout is on a different branch, the
-    # worktree is dirty, or HEAD no longer matches the pre-merge base SHA.
-    # Set false to keep the checkout pinned across merges (e.g. operator
-    # deliberately stays on a feature branch).
+    # After a clean auto-merge CAS-advances `refs/heads/<base_branch>`, the
+    # user's primary checkout at `project.root` still reads stale files
+    # until they manually `git pull`. When true, the committer fast-forwards
+    # the checkout to the new tip iff all guards hold: (1) the checkout is
+    # on `base_branch`, (2) working tree is clean, (3) HEAD resolves to the
+    # pre-merge base sha. Any guard failure is silent — we never clobber
+    # uncommitted user work. Opt out by setting false if you deliberately
+    # keep another branch checked out at `project.root`. Triggers
+    # `post-merge` hook at `project.root`, same as a manual `git pull`.
     advance_user_checkout: bool = True
 
 

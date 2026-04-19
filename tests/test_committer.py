@@ -65,27 +65,6 @@ def _head_sha(repo: Path) -> str:
     return cp.stdout.strip()
 
 
-def _current_branch(repo: Path) -> str:
-    cp = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=repo, capture_output=True, text=True, check=True,
-    )
-    return cp.stdout.strip()
-
-
-def _index_matches_head(repo: Path) -> bool:
-    """True when the index has been refreshed to match HEAD. After an
-    `update-ref refs/heads/<base>` that moved the symbolic HEAD forward,
-    the index still reflects the pre-update tree — so a skipped checkout
-    advance leaves this False and `git status` accumulates phantom
-    reversions. A completed advance (via `merge --ff-only`) refreshes the
-    index so this returns True."""
-    cp = subprocess.run(
-        ["git", "diff", "--cached", "--quiet"], cwd=repo,
-    )
-    return cp.returncode == 0
-
-
 class TestAutoMerge(unittest.TestCase):
     def setUp(self):
         self.td = TemporaryDirectory()
@@ -855,8 +834,9 @@ class TestConcurrentIntegration(unittest.TestCase):
 
 class TestDeleteIdea(unittest.TestCase):
     """`delete_idea` is the committer-layer wrapper the dashboard calls
-    when the operator confirms `x` in deferred mode. It must hard-delete
-    (not just CANCELLED-transition) and tombstone the id."""
+    when the operator confirms `x` in the inspect view. It must
+    hard-delete (not just CANCELLED-transition) and tombstone the id,
+    tearing down any live runner state on the way."""
 
     def setUp(self):
         self.td = TemporaryDirectory()
@@ -880,7 +860,10 @@ class TestDeleteIdea(unittest.TestCase):
         item = self.store.get("d1")
         self.assertIsNotNone(item)
 
-        delete_idea(self.store, item)
+        # DEFERRED items have no worktree and no live subprocess, so
+        # config/daemon can be None — the cross-status inspect delete
+        # exercises the other branches.
+        delete_idea(None, self.store, None, item)
 
         self.assertIsNone(self.store.get("d1"))
         self.assertTrue(self.store.is_deleted("d1"))
@@ -893,18 +876,24 @@ class TestDeleteIdea(unittest.TestCase):
 
 
 class TestAdvanceUserCheckout(unittest.TestCase):
-    """The user's primary checkout at `project_root` should fast-forward
-    to the new base tip after every clean auto-merge, unless a guard
-    trips (wrong branch / dirty / diverged) or the config gate is off.
-    Skip reason must show up on the MERGED transition note."""
+    """After a clean auto-merge CAS-advances refs/heads/<base>, the user's
+    primary checkout at `project.root` should fast-forward so its index
+    and working tree match the new tip — unless any of the safety guards
+    trip, in which case it's left untouched silently."""
 
     def setUp(self):
         self.td = TemporaryDirectory()
         self.root = Path(self.td.name)
         _init_project(self.root)
+        # Gitignore + commit backlog so self.root starts truly clean —
+        # the guard rejects any `status --porcelain` output, including
+        # untracked files like the `.agentor/` state dir.
+        (self.root / ".gitignore").write_text(".agentor/\n")
         (self.root / "backlog.md").write_text(
             "- [ ] Touch a file\n  details\n"
         )
+        _git(self.root, "add", ".gitignore", "backlog.md")
+        _git(self.root, "commit", "-q", "-m", "seed backlog")
         self.cfg = _mk_config(self.root)
         self.store = Store(self.root / ".agentor" / "state.db")
         scan_once(self.cfg, self.store)
@@ -913,185 +902,174 @@ class TestAdvanceUserCheckout(unittest.TestCase):
         self.store.close()
         self.td.cleanup()
 
-    def _drive_to_awaiting_review(self):
+    def _claim_and_stub(self):
         item = self.store.list_by_status(ItemStatus.QUEUED)[0]
         wt, br = plan_worktree(self.cfg, item)
         claimed = self.store.claim_next_queued(str(wt), br)
         StubRunner(self.cfg, self.store).run(claimed)
         return self.store.get(claimed.id)
 
-    def _last_note(self, item_id: str) -> str:
-        return self.store.transitions_for(item_id)[-1].note or ""
-
-    def test_clean_merge_advances_user_checkout(self):
-        # Commit the untracked backlog.md + .agentor/ so root is clean;
-        # _init_project leaves them untracked, which would trip the dirty
-        # guard under the new default. Real operators .gitignore these.
-        (self.root / ".gitignore").write_text(
-            ".agentor/\nbacklog.md\n"
-        )
-        _git(self.root, "add", ".gitignore")
-        _git(self.root, "commit", "-q", "-m", "gitignore")
-        item = self._drive_to_awaiting_review()
-        self.assertEqual(_current_branch(self.root), "main")
+    def test_happy_path_advances_checkout_to_new_base_tip(self):
+        """Default config, checkout on main + clean: HEAD, index, and
+        working tree all land at the new merge commit."""
+        item = self._claim_and_stub()
+        base_before = _main_sha(self.root)
+        self.assertEqual(_head_sha(self.root), base_before)
 
         approve_and_commit(self.cfg, self.store, item, "stub note")
 
-        final = self.store.get(item.id)
-        self.assertEqual(final.status, ItemStatus.MERGED)
-        self.assertTrue(
-            _index_matches_head(self.root),
-            "index must track HEAD after a successful checkout advance — "
-            "otherwise `git status` shows phantom reversions",
-        )
-        # The stub committed a `.agentor-note-*.md` that's now on main AND
-        # should be materialised in the user's working tree.
-        notes = list(self.root.glob(".agentor-note-*.md"))
+        new_main = _main_sha(self.root)
+        self.assertNotEqual(new_main, base_before, "ref should advance")
         self.assertEqual(
-            len(notes), 1,
-            "stub commit's note file must be present in the user's "
-            "working tree after the checkout advance",
+            _head_sha(self.root), new_main,
+            "HEAD at user checkout should follow new base tip",
         )
-        self.assertIn("checkout advanced", self._last_note(item.id))
+        # Working tree has the stub's note file — reachable because the
+        # reset pulled in the new tree.
+        ls = subprocess.run(
+            ["git", "ls-files"],
+            cwd=self.root, capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertIn(".agentor-note-", ls,
+                      "stub note should be in the user's working tree")
+        # No spurious staged/unstaged diff vs HEAD.
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=self.root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(status, "",
+                         f"checkout should be clean post-advance: {status!r}")
 
-    def test_dirty_worktree_skips_with_reason(self):
-        item = self._drive_to_awaiting_review()
-        # Uncommitted change in user's checkout → guard must trip.
-        (self.root / "dirty.txt").write_text("work in progress\n")
+    def test_config_off_skipped(self):
+        self.cfg.git.advance_user_checkout = False
+        item = self._claim_and_stub()
+        base_before = _main_sha(self.root)
 
         approve_and_commit(self.cfg, self.store, item, "stub note")
 
-        final = self.store.get(item.id)
-        self.assertEqual(final.status, ItemStatus.MERGED)
-        # Ref moved (CAS advance) but index was NOT refreshed — the exact
-        # phantom-reversion state the ticket is fixing.
-        self.assertFalse(
-            _index_matches_head(self.root),
-            "dirty worktree skip must leave the index pinned at pre-merge "
-            "tree (phantom reversions visible via git status)",
+        self.assertNotEqual(_main_sha(self.root), base_before,
+                            "ref must still advance")
+        # HEAD symbolically follows the ref on the base branch, so
+        # rev-parse HEAD returns the new sha regardless — the real signal
+        # for "skipped" is the stale index: status --porcelain reports
+        # the merge commit's diff as staged changes.
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=self.root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertNotEqual(
+            status, "",
+            "without advance, checkout's index should be stale vs new HEAD",
         )
-        # Dirty file itself survives.
-        self.assertEqual((self.root / "dirty.txt").read_text(),
-                         "work in progress\n")
-        self.assertIn("checkout skipped: dirty worktree",
-                      self._last_note(item.id))
 
-    def test_checkout_on_other_branch_skipped(self):
-        (self.root / ".gitignore").write_text(
-            ".agentor/\nbacklog.md\n"
-        )
-        _git(self.root, "add", ".gitignore")
-        _git(self.root, "commit", "-q", "-m", "gitignore")
-        item = self._drive_to_awaiting_review()
-        # Operator deliberately sits on a side branch — respect the choice.
-        _git(self.root, "checkout", "-b", "side")
-        side_head_before = _head_sha(self.root)
+    def test_dirty_worktree_skipped(self):
+        """Uncommitted user work at `project.root` must survive the merge."""
+        (self.root / "user_scratch.txt").write_text("uncommitted\n")
+        item = self._claim_and_stub()
+        base_before = _main_sha(self.root)
 
         approve_and_commit(self.cfg, self.store, item, "stub note")
 
-        final = self.store.get(item.id)
-        self.assertEqual(final.status, ItemStatus.MERGED)
-        self.assertEqual(_current_branch(self.root), "side")
-        self.assertEqual(_head_sha(self.root), side_head_before,
-                         "side branch HEAD must be untouched — different "
-                         "ref, not moved by update-ref on main")
-        self.assertIn("checkout skipped: checkout on side",
-                      self._last_note(item.id))
+        self.assertNotEqual(_main_sha(self.root), base_before)
+        self.assertTrue(
+            (self.root / "user_scratch.txt").exists(),
+            "uncommitted user file must not be clobbered",
+        )
+        self.assertEqual(
+            (self.root / "user_scratch.txt").read_text(), "uncommitted\n",
+        )
+
+    def test_different_branch_skipped(self):
+        """Operator parked on a different branch → advance must skip so
+        the sidecar branch isn't silently reset."""
+        _git(self.root, "checkout", "-b", "sidecar")
+        item = self._claim_and_stub()
+        sidecar_before = _head_sha(self.root)
+        base_before = _main_sha(self.root)
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        self.assertNotEqual(_main_sha(self.root), base_before,
+                            "main ref must still advance")
+        self.assertEqual(
+            _head_sha(self.root), sidecar_before,
+            "HEAD on sidecar must be untouched",
+        )
+        cp = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            cwd=self.root, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(cp.stdout.strip(), "sidecar")
 
     def test_detached_head_skipped(self):
-        (self.root / ".gitignore").write_text(
-            ".agentor/\nbacklog.md\n"
-        )
-        _git(self.root, "add", ".gitignore")
-        _git(self.root, "commit", "-q", "-m", "gitignore")
-        item = self._drive_to_awaiting_review()
-        # Operator on detached HEAD — respect the choice, don't advance.
-        _git(self.root, "checkout", "--detach")
+        """Detached HEAD at `project.root` must not be touched."""
+        base_before = _main_sha(self.root)
+        _git(self.root, "checkout", "--detach", base_before)
+        item = self._claim_and_stub()
 
         approve_and_commit(self.cfg, self.store, item, "stub note")
 
-        final = self.store.get(item.id)
-        self.assertEqual(final.status, ItemStatus.MERGED)
-        note = self._last_note(item.id)
-        # Detached HEAD resolves to "HEAD" via `rev-parse --abbrev-ref`,
-        # same skip shape as "on a different branch."
-        self.assertIn("checkout skipped: checkout on", note)
+        self.assertNotEqual(_main_sha(self.root), base_before,
+                            "ref must advance")
+        self.assertEqual(
+            _head_sha(self.root), base_before,
+            "detached HEAD must stay pinned",
+        )
+        # Still detached (symbolic-ref fails with non-zero rc).
+        cp = subprocess.run(
+            ["git", "symbolic-ref", "--quiet", "HEAD"],
+            cwd=self.root, capture_output=True, text=True,
+        )
+        self.assertNotEqual(cp.returncode, 0,
+                            "HEAD must remain detached")
 
-    def test_diverged_tree_skipped_unit(self):
-        """Unit-level: when the user has staged or committed work that
-        makes the index/worktree diverge from `expected_sha`, the guard
-        must refuse to advance. The CAS in the caller would have already
-        failed if the ref drifted — so the remaining divergence shape we
-        catch here is a stale index/worktree relative to the expected
-        pre-merge tree."""
+    def test_diverged_head_skipped(self):
+        """Local commit on base above the dispatched base_sha_before →
+        advance must skip (unit-level check on the guard)."""
         from agentor import git_ops
-        _git(self.root, "add", ".")  # stage untracked backlog.md + .agentor/
-        head_before = _head_sha(self.root)
-        # Supply an `expected_sha` that predates the staging (the initial
-        # commit SHA), with a `new_sha` that's merely different so we
-        # don't hit the no-op fast path.
-        stale_expected = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=self.root,
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        reason = git_ops.advance_user_checkout(
-            self.root, "main", stale_expected, "0" * 40,
-        )
-        # Index has extra staged files → diff --cached vs expected is
-        # non-zero → "dirty worktree".
-        self.assertEqual(reason, "dirty worktree")
-        self.assertEqual(_head_sha(self.root), head_before,
-                         "skip must leave HEAD untouched")
 
-    def test_config_gate_off_skips_silently(self):
-        self.cfg.git.advance_user_checkout = False
-        item = self._drive_to_awaiting_review()
+        # Repo starts on main, clean. Capture base_sha_before, then add
+        # a local commit so HEAD diverges from the captured sha.
+        base_sha_before = _main_sha(self.root)
+        (self.root / "local.txt").write_text("local work\n")
+        _git(self.root, "add", "local.txt")
+        _git(self.root, "commit", "-q", "-m", "local commit")
+        self.assertNotEqual(_head_sha(self.root), base_sha_before)
 
-        approve_and_commit(self.cfg, self.store, item, "stub note")
-
-        final = self.store.get(item.id)
-        self.assertEqual(final.status, ItemStatus.MERGED)
-        # Ref moved; index left pinned. No skip/advance phrase either way.
         self.assertFalse(
-            _index_matches_head(self.root),
-            "gate off must leave the checkout pinned at pre-merge tree",
+            git_ops.advance_user_checkout_allowed(
+                self.root, "main", base_sha_before,
+            ),
+            "guard must reject when HEAD diverges from captured base sha",
         )
-        note = self._last_note(item.id)
-        self.assertNotIn("checkout advanced", note,
-                         "gate off must not advertise advance")
-        self.assertNotIn("checkout skipped", note,
-                         "gate off must be silent, not a skip reason")
 
-    def test_retry_merge_advances_user_checkout(self):
-        (self.root / ".gitignore").write_text(
-            ".agentor/\nbacklog.md\n"
-        )
-        _git(self.root, "add", ".gitignore")
-        _git(self.root, "commit", "-q", "-m", "gitignore")
-        # Drive to CONFLICTED — same clash the retry suite uses.
-        item = self._drive_to_awaiting_review()
-        wt = Path(item.worktree_path)
-        (wt / "README.md").write_text("# project\n\nFEAT\n")
-        _git(wt, "add", "README.md")
-        _git(wt, "commit", "-q", "-m", "feat readme")
-        (self.root / "README.md").write_text("# project\n\nMAIN\n")
-        _git(self.root, "add", "README.md")
-        _git(self.root, "commit", "-q", "-m", "main readme")
-        approve_and_commit(self.cfg, self.store, item, "stub commit")
-        conflicted = self.store.get(item.id)
-        self.assertEqual(conflicted.status, ItemStatus.CONFLICTED)
-        # User resolves by taking main's version, then retries.
-        (wt / "README.md").write_text("# project\n\nMAIN\n")
+    def test_guard_allows_only_when_all_checks_pass(self):
+        """Direct unit test of the guard helper — all four code paths."""
+        from agentor import git_ops
 
-        ok, _msg = retry_merge(self.cfg, self.store, conflicted)
-
-        self.assertTrue(ok)
+        base = _main_sha(self.root)
+        # Happy: on main, clean, HEAD == base.
         self.assertTrue(
-            _index_matches_head(self.root),
-            "retry_merge must also advance the user checkout",
+            git_ops.advance_user_checkout_allowed(self.root, "main", base),
         )
-        note = self._last_note(item.id)
-        self.assertIn("checkout advanced", note)
+        # Dirty.
+        (self.root / "dirt.txt").write_text("x")
+        self.assertFalse(
+            git_ops.advance_user_checkout_allowed(self.root, "main", base),
+        )
+        (self.root / "dirt.txt").unlink()
+        # Wrong branch.
+        _git(self.root, "checkout", "-b", "other")
+        self.assertFalse(
+            git_ops.advance_user_checkout_allowed(self.root, "main", base),
+        )
+        _git(self.root, "checkout", "main")
+        # Wrong base_sha_before.
+        self.assertFalse(
+            git_ops.advance_user_checkout_allowed(
+                self.root, "main", "0" * 40,
+            ),
+        )
 
 
 if __name__ == "__main__":
