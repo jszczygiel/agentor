@@ -209,6 +209,40 @@ def _write_fake_codex(bin_dir: Path, script: str) -> Path:
     return _write_fake_cli(bin_dir, "codex", script)
 
 
+def _stream_json_script(
+    *, read_stdin: bool, sleep_on_stdin_after: bool,
+    session_id: str = "sess-fake",
+) -> str:
+    """Build a /bin/sh script that mimics the claude stream-json protocol:
+    optionally consume one initial stdin line (the framed user prompt),
+    emit one `system`/init, one `assistant` block, and one `result` event
+    carrying `terminal_reason:"completed"`, then optionally block reading
+    stdin again (the explicit regression-trigger for the stdin-stays-open
+    hang — without the runner closing stdin on `result`, this `read` would
+    never return)."""
+    parts: list[str] = []
+    if read_stdin:
+        parts.append("read line || true")
+    parts.append(
+        "printf '%s\\n' "
+        f"'{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{session_id}\"}}'"
+    )
+    parts.append(
+        "printf '%s\\n' '{\"type\":\"assistant\",\"message\":"
+        "{\"role\":\"assistant\",\"model\":\"claude-opus-4-7\","
+        "\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,"
+        "\"cache_creation_input_tokens\":0,\"output_tokens\":5}}}'"
+    )
+    parts.append(
+        "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\","
+        "\"result\":\"plan body\",\"num_turns\":1,"
+        "\"stop_reason\":\"end_turn\",\"terminal_reason\":\"completed\"}'"
+    )
+    if sleep_on_stdin_after:
+        parts.append("read injected || true")
+    return "\n".join(parts) + "\n"
+
+
 class TestClaudeRunner(unittest.TestCase):
     def setUp(self):
         self.td = TemporaryDirectory()
@@ -1882,82 +1916,6 @@ sleep 3
         self.assertEqual([e["type"] for e in events], ["first", "second"])
         self.assertEqual(events[1]["line"], "nudge-payload")
 
-    def test_watchdog_closes_stdin_after_result_event(self):
-        import time as _time
-
-        from agentor import runner as runner_mod
-        from agentor.runner import (ChildStdinHolder,
-                                    _run_stream_json_subprocess)
-
-        # Fake CLI: emit a `result` event, then block on stdin read. Once the
-        # watchdog closes stdin, `read` returns non-zero, the fallback branch
-        # emits `late`, and the CLI exits. Proves the helper no longer hangs
-        # even when the caller's `on_event` forgets to close the holder.
-        cli = self._fake_cli(
-            'printf \'{"type":"result"}\\n\'\n'
-            'if read injected; then\n'
-            '  printf \'{"type":"late","line":"%s"}\\n\' "$injected"\n'
-            'else\n'
-            '  printf \'{"type":"late","line":"eof"}\\n\'\n'
-            'fi\n'
-        )
-        holder = ChildStdinHolder()
-        events: list[dict] = []
-
-        def on_event(ev: dict):
-            events.append(ev)
-            return None
-
-        original_grace = runner_mod._STDIN_CLOSE_AFTER_RESULT_SECONDS
-        runner_mod._STDIN_CLOSE_AFTER_RESULT_SECONDS = 1
-        try:
-            started = _time.monotonic()
-            stdout, stderr, rc, timed_out, cap = _run_stream_json_subprocess(
-                args=[str(cli)],
-                cwd=self.root,
-                timeout_seconds=15,
-                transcript_path=self.transcript,
-                proc_registry=None,
-                item_key="k",
-                fnfe_hint="missing",
-                on_event=on_event,
-                stdin_holder=holder,
-            )
-            elapsed = _time.monotonic() - started
-        finally:
-            runner_mod._STDIN_CLOSE_AFTER_RESULT_SECONDS = original_grace
-
-        self.assertFalse(timed_out,
-                         "watchdog must close stdin before outer timeout fires")
-        self.assertLess(elapsed, 5,
-                        f"helper should return within grace+slop, took {elapsed:.2f}s")
-        self.assertEqual([e["type"] for e in events], ["result", "late"])
-        self.assertIn(
-            "closed stdin after result — protocol drift",
-            self.transcript.read_text(),
-        )
-
-    def test_watchdog_not_armed_without_result_event(self):
-        from agentor.runner import _run_stream_json_subprocess
-
-        cli = self._fake_cli(r"""printf '%s\n' '{"type":"hello"}'
-""")
-
-        _run_stream_json_subprocess(
-            args=[str(cli)],
-            cwd=self.root,
-            timeout_seconds=5,
-            transcript_path=self.transcript,
-            proc_registry=None,
-            item_key="k",
-            fnfe_hint="missing",
-            on_event=lambda ev: None,
-        )
-        self.assertNotIn(
-            "closed stdin after result",
-            self.transcript.read_text(),
-        )
-
 
 class TestClaudeRunnerCheckpointInjection(unittest.TestCase):
     """Drive `_invoke_claude_streaming` with a stubbed stream-json helper
@@ -2351,6 +2309,162 @@ class TestStreamStateRateLimitHarvester(unittest.TestCase):
                       "stop_reason": "end_turn",
                       "rate_limit": "not-a-dict"})
         self.assertNotIn("rate_limits", state.envelope())
+
+
+class TestClaudeRunnerStreamJsonIntegration(unittest.TestCase):
+    """End-to-end smoke for `ClaudeRunner.run` against a real fake-CLI
+    subprocess speaking stream-json. Covers the new stdin path (default
+    `_default_claude_command`), the legacy `{prompt}` template path, the
+    `single_phase=True` shortcut to AWAITING_REVIEW, and the explicit
+    regression guard against the 2026-04-19 stdin-stays-open hang
+    (`result` event emitted but stdin never closed → readline deadlock)."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name) / "proj"
+        self.root.mkdir()
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text(
+            "- [ ] Wire fake CLI smoke\n  body\n"
+        )
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _mk_streaming_cfg(
+        self, *, command: list[str], single_phase: bool = False,
+    ) -> Config:
+        return Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                runner="claude", pool_size=1, max_attempts=1,
+                command=command,
+                plan_prompt_template="PLAN: {title}",
+                execute_prompt_template="EXEC: {title}\nplan={plan}",
+                timeout_seconds=10,
+                single_phase=single_phase,
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+
+    def _stdin_path_command(self, fake: Path) -> list[str]:
+        return [
+            str(fake),
+            "--input-format", "stream-json",
+            "--output-format", "stream-json", "--verbose",
+            "--settings", "{settings_path}",
+        ]
+
+    def _legacy_command(self, fake: Path) -> list[str]:
+        return [
+            str(fake), "-p", "{prompt}",
+            "--output-format", "stream-json", "--verbose",
+        ]
+
+    def _write_fake(self, script: str) -> Path:
+        return _write_fake_claude(Path(self.td.name) / "bin", script)
+
+    def _claim_first(self, cfg: Config):
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        return self.store.claim_next_queued(str(wt), br)
+
+    def test_stream_json_stdin_path_lands_in_plan_review(self):
+        fake = self._write_fake(_stream_json_script(
+            read_stdin=True, sleep_on_stdin_after=False,
+            session_id="sess-stdin",
+        ))
+        cfg = self._mk_streaming_cfg(command=self._stdin_path_command(fake))
+        claimed = self._claim_first(cfg)
+        result = make_runner(cfg, self.store).run(claimed)
+        self.assertIsNone(result.error, msg=result.error)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_PLAN_REVIEW)
+        data = json.loads(refreshed.result_json)
+        self.assertEqual(data["phase"], "plan")
+        self.assertEqual(data["plan"], "plan body")
+        self.assertIsNotNone(refreshed.session_id)
+        transcript = (
+            self.root / ".agentor" / "transcripts" / f"{claimed.id}.plan.log"
+        ).read_text()
+        self.assertIn('"terminal_reason":"completed"', transcript)
+        self.assertIn("exit: 0", transcript)
+
+    def test_legacy_prompt_template_path_lands_in_plan_review(self):
+        fake = self._write_fake(_stream_json_script(
+            read_stdin=False, sleep_on_stdin_after=False,
+            session_id="sess-legacy",
+        ))
+        cfg = self._mk_streaming_cfg(command=self._legacy_command(fake))
+        claimed = self._claim_first(cfg)
+        result = make_runner(cfg, self.store).run(claimed)
+        self.assertIsNone(result.error, msg=result.error)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_PLAN_REVIEW)
+        data = json.loads(refreshed.result_json)
+        self.assertEqual(data["phase"], "plan")
+        self.assertEqual(data["plan"], "plan body")
+        self.assertIsNotNone(refreshed.session_id)
+        transcript = (
+            self.root / ".agentor" / "transcripts" / f"{claimed.id}.plan.log"
+        ).read_text()
+        self.assertIn("exit: 0", transcript)
+
+    def test_single_phase_lands_in_awaiting_review(self):
+        fake = self._write_fake(_stream_json_script(
+            read_stdin=True, sleep_on_stdin_after=False,
+            session_id="sess-single",
+        ))
+        cfg = self._mk_streaming_cfg(
+            command=self._stdin_path_command(fake), single_phase=True,
+        )
+        claimed = self._claim_first(cfg)
+        result = make_runner(cfg, self.store).run(claimed)
+        self.assertIsNone(result.error, msg=result.error)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_REVIEW)
+        data = json.loads(refreshed.result_json)
+        self.assertEqual(data["phase"], "execute")
+        # single_phase still routes through the no-prior-session branch in
+        # `_invoke_claude`, so the transcript filename uses the `.plan.log`
+        # tag (driven by session presence, not the plan/execute split).
+        transcript = (
+            self.root / ".agentor" / "transcripts" / f"{claimed.id}.plan.log"
+        ).read_text()
+        self.assertIn("exit: 0", transcript)
+
+    def test_stdin_close_after_result_avoids_hang_regression(self):
+        """Without the runner's stdin-close on `result` (runner.py:~1020),
+        the fake CLI's trailing `read injected` would block forever and the
+        runner would only return on `agent.timeout_seconds` elapsed. With
+        the fix the CLI sees EOF immediately after `result` and exits well
+        under timeout * 0.5."""
+        import time
+        fake = self._write_fake(_stream_json_script(
+            read_stdin=True, sleep_on_stdin_after=True,
+            session_id="sess-regression",
+        ))
+        cfg = self._mk_streaming_cfg(command=self._stdin_path_command(fake))
+        claimed = self._claim_first(cfg)
+        runner = make_runner(cfg, self.store)
+        start = time.monotonic()
+        result = runner.run(claimed)
+        elapsed = time.monotonic() - start
+        self.assertIsNone(result.error, msg=result.error)
+        budget = cfg.agent.timeout_seconds * 0.5
+        self.assertLess(
+            elapsed, budget,
+            msg=(f"runner took {elapsed:.2f}s (budget {budget:.2f}s) — "
+                 "stdin-close on result regressed?"),
+        )
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_PLAN_REVIEW)
 
 
 if __name__ == "__main__":
