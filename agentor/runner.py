@@ -620,8 +620,13 @@ class ClaudeRunner(Runner):
 
         Legacy non-streaming commands (no stream-json) still work — we detect
         the output format and fall back to blocking subprocess.run."""
+        settings_path = write_claude_settings(self.config, item.id)
         args = [
-            a.format(prompt=prompt, model=self.config.agent.model)
+            a.format(
+                prompt=prompt,
+                model=self.config.agent.model,
+                settings_path=str(settings_path),
+            )
             for a in (self.config.agent.command or _default_claude_command())
         ]
 
@@ -1238,10 +1243,51 @@ def _default_codex_command() -> list[str]:
 
 
 def _default_claude_command() -> list[str]:
+    # `--settings {settings_path}` points Claude at a per-run JSON that
+    # registers a PreToolUse hook blocking whole-file `Read` calls on
+    # files above `agent.large_file_line_threshold`. Custom overrides that
+    # drop this placeholder silently disable enforcement.
     return [
         "claude", "-p", "{prompt}", "--dangerously-skip-permissions",
+        "--settings", "{settings_path}",
         "--output-format", "stream-json", "--verbose",
     ]
+
+
+def _read_hook_path() -> Path:
+    """Absolute path to the shipped PreToolUse hook script."""
+    return (Path(__file__).resolve().parent / "read_hook.py")
+
+
+def write_claude_settings(
+    config: Config, item_id: str,
+) -> Path:
+    """Write a Claude settings JSON registering the large-file Read hook
+    into `<project>/.agentor/claude-settings/<item_id>.json`. When the
+    threshold is <= 0 the file still exists (claude needs a readable
+    --settings path) but its hooks list is empty."""
+    threshold = int(config.agent.large_file_line_threshold or 0)
+    settings_dir = (
+        config.project_root / ".agentor" / "claude-settings"
+    )
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    settings_path = settings_dir / f"{item_id}.json"
+    settings: dict = {"hooks": {}}
+    if threshold > 0:
+        hook_cmd = (
+            f"AGENTOR_READ_THRESHOLD={threshold} "
+            f"python3 {_read_hook_path()}"
+        )
+        settings["hooks"] = {
+            "PreToolUse": [
+                {
+                    "matcher": "Read",
+                    "hooks": [{"type": "command", "command": hook_cmd}],
+                }
+            ]
+        }
+    settings_path.write_text(json.dumps(settings, indent=2))
+    return settings_path
 
 
 def _default_codex_resume_command() -> list[str]:

@@ -13,7 +13,9 @@ from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
 from agentor.models import ItemStatus
 from agentor.recovery import recover_on_startup
 from agentor.runner import (CodexRunner, StubRunner,
-                            _mark_done_instruction, make_runner, plan_worktree)
+                            _default_claude_command,
+                            _mark_done_instruction, make_runner, plan_worktree,
+                            write_claude_settings)
 from agentor.store import Store
 from agentor.watcher import scan_once
 
@@ -1408,6 +1410,68 @@ sleep 3
         # After the helper returns, the process must be unregistered —
         # nothing to kill on a subsequent shutdown sweep.
         self.assertEqual(reg.kill_all(log=lambda m: None), 0)
+
+
+class TestClaudeSettingsHookWiring(unittest.TestCase):
+    """The Claude runner must write a per-run settings JSON that registers
+    a PreToolUse hook pointing at the shipped read_hook.py, so whole-file
+    Read calls on large files are blocked before the tool runs."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _cfg(self, threshold: int) -> Config:
+        return Config(
+            project_name="proj", project_root=self.root,
+            sources=SourcesConfig(watch=[], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(large_file_line_threshold=threshold),
+            git=GitConfig(), review=ReviewConfig(),
+        )
+
+    def test_settings_written_with_threshold(self):
+        cfg = self._cfg(threshold=400)
+        path = write_claude_settings(cfg, "abcdef1234")
+        self.assertTrue(path.exists())
+        data = json.loads(path.read_text())
+        pre = data["hooks"]["PreToolUse"]
+        self.assertEqual(len(pre), 1)
+        self.assertEqual(pre[0]["matcher"], "Read")
+        cmd = pre[0]["hooks"][0]["command"]
+        self.assertIn("AGENTOR_READ_THRESHOLD=400", cmd)
+        self.assertIn("read_hook.py", cmd)
+        # The command must reference an absolute hook path so claude can
+        # invoke it regardless of cwd.
+        hook_path_token = [t for t in cmd.split() if t.endswith("read_hook.py")][0]
+        self.assertTrue(Path(hook_path_token).is_absolute())
+        self.assertTrue(Path(hook_path_token).exists())
+
+    def test_settings_disabled_when_threshold_zero(self):
+        cfg = self._cfg(threshold=0)
+        path = write_claude_settings(cfg, "abcdef1234")
+        self.assertTrue(path.exists())
+        data = json.loads(path.read_text())
+        # Hooks object present but empty — claude still accepts --settings
+        # without choking, but no PreToolUse gate is registered.
+        self.assertEqual(data.get("hooks"), {})
+
+    def test_default_claude_command_contains_settings_placeholder(self):
+        cmd = _default_claude_command()
+        self.assertIn("--settings", cmd)
+        self.assertIn("{settings_path}", cmd)
+
+    def test_default_command_formats_with_settings_path(self):
+        cfg = self._cfg(threshold=400)
+        settings = write_claude_settings(cfg, "item-xyz")
+        args = [
+            a.format(prompt="hi", model="claude", settings_path=str(settings))
+            for a in _default_claude_command()
+        ]
+        self.assertIn(str(settings), args)
 
 
 if __name__ == "__main__":
