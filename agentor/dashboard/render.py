@@ -702,15 +702,25 @@ def _prompt_text(stdscr, message: str) -> str:
         return ""
 
 
-def _prompt_multiline(stdscr, label: str, *, rows: int = 8) -> str:
+def _prompt_multiline(stdscr, label: str, *, rows: int | None = None) -> str:
     """Multi-line text entry in a centered overlay. Enter inserts a newline;
     Ctrl-G submits; Ctrl-C or Esc cancels (empty string). Empty submit also
-    returns empty. Falls back to `_prompt_text` on very small terminals."""
+    returns empty. Falls back to `_prompt_text` on very small terminals.
+
+    `rows` is the visible edit area height. When None, it adapts to the
+    terminal — larger terminals get more room for longer feedback, capped
+    so the overlay never eats the whole screen."""
     import curses.textpad
 
     h, w = stdscr.getmaxyx()
     if h < 10 or w < 40:
         return _prompt_text(stdscr, label + " (empty=cancel): ")
+
+    if rows is None:
+        # Adaptive: fill most of the terminal, floor=8 (matches old default
+        # so sub-14-row terminals keep the prior behavior), cap=30 so very
+        # tall terminals don't render a single gigantic box.
+        rows = max(8, min(30, h - 6))
 
     box_h = min(rows + 4, h - 2)
     box_w = min(80, w - 4)
