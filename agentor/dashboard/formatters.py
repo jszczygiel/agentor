@@ -1,3 +1,4 @@
+import datetime
 import json
 import time
 
@@ -228,6 +229,95 @@ def _token_breakdown(item: StoredItem) -> list[dict]:
     rows.sort(key=lambda r: -(r["input"] + r["output"] +
                               r["cache_read"] + r["cache_create"]))
     return rows
+
+
+def _midnight_local_epoch(now: float | None = None) -> float:
+    """Epoch seconds of the most recent local-midnight boundary. Uses the
+    system tz (`astimezone()`), matching the backlog's "today (midnight-
+    local)" framing. Separate helper so tests can freeze the clock."""
+    ref = datetime.datetime.fromtimestamp(now if now is not None else time.time())
+    midnight = ref.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.timestamp()
+
+
+# `aggregate_token_usage` does a full-table scan over `items.result_json` and
+# Python-side JSON-decodes every blob, so calling it three times per 500ms
+# render tick was O(completed_items) per tick — the exact pattern flagged by
+# the dashboard-hang gotcha in CLAUDE.md. A 2s TTL keeps cumulative totals
+# imperceptibly stale while dropping repeat ticks to O(1).
+_TOKEN_CACHE_TTL_S = 2.0
+_token_cache: dict = {"key": None, "computed_at": 0.0, "value": None}
+
+
+def _token_windows_invalidate() -> None:
+    """Clear the token-windows cache so the next call recomputes. Exposed for
+    tests; also safe to call from callers that know totals just changed."""
+    _token_cache["key"] = None
+    _token_cache["computed_at"] = 0.0
+    _token_cache["value"] = None
+
+
+def _token_windows(store: Store, daemon_started_at: float) -> dict[str, dict]:
+    """Compute session / today / 7d token totals in one pass.
+
+    `daemon_started_at == 0` means the daemon has not entered its main loop
+    yet (e.g. tests); the "session" view then mirrors the "today" view so the
+    panel stays populated instead of showing a confusing 0.
+
+    Result is cached for `_TOKEN_CACHE_TTL_S` seconds keyed on
+    `daemon_started_at` so the 500ms render loop doesn't re-aggregate the
+    whole items table every tick.
+    """
+    now = time.time()
+    # Key includes id(store) so swapping the backing Store (notably between
+    # tests with fresh TemporaryDirectory-backed DBs) correctly bypasses a
+    # cached aggregate that belonged to a prior store.
+    key = (id(store), daemon_started_at)
+    cached = _token_cache["value"]
+    if (cached is not None
+            and _token_cache["key"] == key
+            and now - _token_cache["computed_at"] < _TOKEN_CACHE_TTL_S):
+        return cached  # type: ignore[return-value]
+    session_since: float | None = daemon_started_at or None
+    today_since = _midnight_local_epoch(now)
+    week_since = now - 7 * 24 * 3600
+    result = {
+        "session": store.aggregate_token_usage(since=session_since),
+        "today": store.aggregate_token_usage(since=today_since),
+        "7d": store.aggregate_token_usage(since=week_since),
+    }
+    _token_cache["key"] = key
+    _token_cache["computed_at"] = now
+    _token_cache["value"] = result
+    return result
+
+
+def _fmt_token_line(label: str, totals: dict) -> str:
+    """One compact row for the token-usage panel. Kept narrow so it fits in
+    80-column terminals: `session  in 1.5M  out 120k  cache_r 8.0M  cache_c 350k  Σ 10.0M`."""
+    return (f"{label:<8}"
+            f"in {_fmt_tokens(int(totals.get('input', 0))):>6}  "
+            f"out {_fmt_tokens(int(totals.get('output', 0))):>6}  "
+            f"cache_r {_fmt_tokens(int(totals.get('cache_read', 0))):>6}  "
+            f"cache_c {_fmt_tokens(int(totals.get('cache_create', 0))):>6}  "
+            f"Σ {_fmt_tokens(int(totals.get('total', 0))):>6}")
+
+
+def _fmt_token_line_mid(label: str, totals: dict) -> str:
+    """Mid-tier (60–79 col) compact form. Drops the cache columns and
+    leads with Σ so the most operator-relevant number isn't clipped."""
+    return (f"{label:<8}"
+            f"Σ {_fmt_tokens(int(totals.get('total', 0))):>6}  "
+            f"in {_fmt_tokens(int(totals.get('input', 0))):>6}  "
+            f"out {_fmt_tokens(int(totals.get('output', 0))):>6}")
+
+
+def _fmt_token_line_narrow(label: str, totals: dict) -> str:
+    """Narrow-tier (<60 col) form. Label is truncated to 4 chars and
+    only Σ survives — the other fields live in the inspect view."""
+    short = label[:4]
+    return (f"{short:<5}"
+            f"Σ {_fmt_tokens(int(totals.get('total', 0))):>6}")
 
 
 def _build_commit_message(item: StoredItem) -> str:

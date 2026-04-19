@@ -17,7 +17,11 @@ from .formatters import (
     _ctx_fill_pct,
     _elapsed_for,
     _fmt_elapsed,
+    _fmt_token_line,
+    _fmt_token_line_mid,
+    _fmt_token_line_narrow,
     _phase_for,
+    _token_windows,
 )
 
 
@@ -168,6 +172,7 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     status_line = _build_status_line(tier, cfg, s, counts, len(daemon.workers))
     _safe_addstr(stdscr, row, 0, status_line, w)
     row += 1
+    row = _render_token_panel(stdscr, row, w, store, daemon, tier)
     _safe_addstr(stdscr, row, 0, "─" * w, w, curses.A_DIM)
     row += 1
 
@@ -217,16 +222,22 @@ def _table_header(tier: str) -> str:
 
 def _table_row(tier: str, item, st, elapsed_s: str, ctx_s: str,
                has_err: bool, w: int) -> str:
-    """Compose one main-table row respecting the active width tier."""
+    """Compose one main-table row respecting the active width tier.
+    The priority glyph (`*` for priority>0, space otherwise) is always
+    reserved before the TITLE so pinned rows stay column-aligned with
+    ordinary ones."""
     marker = "!" if has_err else " "
+    pri_glyph = "*" if item.priority > 0 else " "
+    pri_cell = f"{pri_glyph} "  # glyph + separator
+
     if tier == "narrow":
         glyph = _state_glyph(st)
         state_cell = f"{marker}{glyph} "  # 3 chars total — matches header
-        cols_used = 1 + (_COL_ID - 1) + 3 + _COL_ELAPSED
+        cols_used = 1 + (_COL_ID - 1) + 3 + _COL_ELAPSED + len(pri_cell)
         title_max = max(0, w - cols_used)
         title = item.title[:title_max]
         return (f" {item.id[:8]:<{_COL_ID-1}}{state_cell}"
-                f"{elapsed_s:<{_COL_ELAPSED}}{title}")
+                f"{elapsed_s:<{_COL_ELAPSED}}{pri_cell}{title}")
 
     state_label = st.value
     if st == ItemStatus.WORKING:
@@ -238,23 +249,24 @@ def _table_row(tier: str, item, st, elapsed_s: str, ctx_s: str,
 
     if tier == "mid":
         cols_used = (1 + (_COL_ID - 1) + _COL_STATE
-                     + _COL_ELAPSED + _COL_CTX)
+                     + _COL_ELAPSED + _COL_CTX + len(pri_cell))
         title_max = max(0, w - cols_used)
         title = item.title[:title_max]
         return (f" {item.id[:8]:<{_COL_ID-1}}{state_cell:<{_COL_STATE}}"
-                f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}{title}")
+                f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
+                f"{pri_cell}{title}")
 
     # wide
     src = item.source_file
     if len(src) > _COL_SOURCE - 1:
         src = "…" + src[-(_COL_SOURCE - 2):]
     cols_used = (1 + (_COL_ID - 1) + _COL_STATE + _COL_ELAPSED
-                 + _COL_CTX + _COL_SOURCE)
+                 + _COL_CTX + _COL_SOURCE + len(pri_cell))
     title_max = max(0, w - cols_used)
     title = item.title[:title_max]
     return (f" {item.id[:8]:<{_COL_ID-1}}{state_cell:<{_COL_STATE}}"
             f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
-            f"{src:<{_COL_SOURCE}}{title}")
+            f"{src:<{_COL_SOURCE}}{pri_cell}{title}")
 
 
 def _build_alert_banner(alert: str, w: int) -> str:
@@ -314,6 +326,29 @@ def _build_status_line(tier: str, cfg, stats, counts: dict,
         f" p={cfg.agent.pool_size} w={worker_count} "
         f"R={review} e={counts[ItemStatus.ERRORED]}"
     )
+
+
+def _render_token_panel(stdscr, row: int, w: int, store, daemon,
+                        tier: str = "wide") -> int:
+    """Draw the cumulative token-usage panel: one line per time window
+    (session / today / 7d). Tier-aware so the 71-char wide format
+    doesn't silently clip on phone-width terminals. Returns the next
+    free row."""
+    windows = _token_windows(store, daemon.started_at)
+    if tier != "narrow":
+        _safe_addstr(stdscr, row, 0, " tokens".ljust(w), w,
+                     curses.A_DIM | curses.A_BOLD)
+        row += 1
+    for label, totals in windows.items():
+        if tier == "wide":
+            line = " " + _fmt_token_line(label, totals)
+        elif tier == "mid":
+            line = " " + _fmt_token_line_mid(label, totals)
+        else:
+            line = " " + _fmt_token_line_narrow(label, totals)
+        _safe_addstr(stdscr, row, 0, line.ljust(w), w, curses.A_DIM)
+        row += 1
+    return row
 
 
 def _safe_addstr(stdscr, y, x, s, w, attr=0):

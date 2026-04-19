@@ -448,6 +448,53 @@ class TestAutoResolveConflicts(unittest.TestCase):
         self.assertIn("main", fb)
         self.assertIn("README.md", fb)
 
+    def test_auto_resolve_on_marks_transition_note(self):
+        """Chained resubmit tags the CONFLICTED → QUEUED transition so the
+        dashboard can distinguish an auto-chain from a manual resubmit."""
+        from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
+        cfg = _mk_config(self.root)
+        cfg.git.auto_resolve_conflicts = True
+        final = self._drive_to_conflict(cfg)
+
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        history = self.store.transitions_for(final.id)
+        chain = [
+            t for t in history
+            if t.from_status == ItemStatus.CONFLICTED
+            and t.to_status == ItemStatus.QUEUED
+        ]
+        self.assertEqual(len(chain), 1)
+        self.assertTrue(
+            (chain[0].note or "").startswith(AUTO_RESOLVE_NOTE_PREFIX),
+            f"expected auto-resolve marker, got note={chain[0].note!r}",
+        )
+
+    def test_manual_resubmit_has_no_auto_marker(self):
+        """Manual `[e]` resubmit (auto off) must not carry the marker —
+        the dashboard uses its absence to keep the indicator silent."""
+        from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
+        cfg = _mk_config(self.root)
+        # auto_resolve_conflicts stays False — drive reaches CONFLICTED only.
+        conflicted = self._drive_to_conflict(cfg)
+        self.assertEqual(conflicted.status, ItemStatus.CONFLICTED)
+
+        resubmit_conflicted(cfg, self.store, conflicted)
+
+        final = self.store.get(conflicted.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        history = self.store.transitions_for(final.id)
+        chain = [
+            t for t in history
+            if t.from_status == ItemStatus.CONFLICTED
+            and t.to_status == ItemStatus.QUEUED
+        ]
+        self.assertEqual(len(chain), 1)
+        self.assertFalse(
+            (chain[0].note or "").startswith(AUTO_RESOLVE_NOTE_PREFIX),
+            f"manual resubmit should not carry the auto marker: "
+            f"note={chain[0].note!r}",
+        )
+
 
 class TestRetryErrored(unittest.TestCase):
     def setUp(self):

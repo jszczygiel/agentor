@@ -357,6 +357,63 @@ class Store:
             )
         return new_val
 
+    def aggregate_token_usage(self, since: float | None = None) -> dict:
+        """Sum token usage across all items whose `result_json` carries one.
+
+        Returns a dict with `input`, `output`, `cache_read`, `cache_create`,
+        and `total` keys. When an item's result_json has a `modelUsage` block
+        (claude's authoritative per-model breakdown) we sum across models;
+        otherwise fall back to the flat `usage` dict.
+
+        `since` is an epoch threshold against `items.updated_at`: rows whose
+        updated_at is strictly less than `since` are skipped. `None` keeps
+        every row. Time bucketing (session/today/7d) is the caller's job.
+
+        Multi-attempt items only contribute their latest result_json — the
+        column is overwritten per run — so this is a "current state" total,
+        not a full historical sum across retries.
+        """
+        buckets = {
+            "input": 0, "output": 0,
+            "cache_read": 0, "cache_create": 0,
+        }
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT updated_at, result_json FROM items "
+                "WHERE result_json IS NOT NULL",
+            ).fetchall()
+        for row in rows:
+            if since is not None and row["updated_at"] < since:
+                continue
+            try:
+                data = json.loads(row["result_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            mu = data.get("modelUsage")
+            if isinstance(mu, dict) and mu:
+                for v in mu.values():
+                    if not isinstance(v, dict):
+                        continue
+                    buckets["input"] += int(v.get("inputTokens", 0) or 0)
+                    buckets["output"] += int(v.get("outputTokens", 0) or 0)
+                    buckets["cache_read"] += int(
+                        v.get("cacheReadInputTokens", 0) or 0)
+                    buckets["cache_create"] += int(
+                        v.get("cacheCreationInputTokens", 0) or 0)
+                continue
+            usage = data.get("usage")
+            if isinstance(usage, dict):
+                buckets["input"] += int(usage.get("input_tokens", 0) or 0)
+                buckets["output"] += int(usage.get("output_tokens", 0) or 0)
+                buckets["cache_read"] += int(
+                    usage.get("cache_read_input_tokens", 0) or 0)
+                buckets["cache_create"] += int(
+                    usage.get("cache_creation_input_tokens", 0) or 0)
+        buckets["total"] = sum(buckets.values())
+        return buckets
+
     def update_result_json(self, item_id: str, blob: str) -> None:
         """Write a fresh result_json for an item WITHOUT recording a status
         transition. Used by the streaming claude runner to publish live

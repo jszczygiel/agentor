@@ -58,7 +58,7 @@ Design invariants to preserve:
 
 ## Gotchas from prior runs
 
-Hard-won traps future agents keep rediscovering. Promote additional durable lessons from `docs/agent-logs/` here when they recur.
+Hard-won traps future agents keep rediscovering. Durable lessons get folded here from `docs/agent-logs/` via an auto-queued backlog item: the daemon notices when `docs/agent-logs/` crosses `agent.fold_threshold` files (default 10) and drops `docs/backlog/fold-agent-lessons-YYYY-MM-DD.md` so a future agent clusters recurring Surprises / Gotchas into this file and deletes the consumed logs in the same commit. The CLAUDE.md diff still goes through the normal review gate — no auto-merge.
 
 - **Stale `file:line` refs in backlog items** — the codebase moves; `agentor/dashboard.py` is now the `agentor/dashboard/` package. Grep stable symbols, not filenames, before trusting any path cited in a ticket.
 - **`last_error` is capped at 4000 chars** — `Store.transition` stores whatever you hand it, but the inspect view and downstream consumers truncate at 4000. When composing structured summaries (see `committer._build_conflict_summary`), pre-cap each section independently (`_BODY_CAP=2000`, `_RAW_CAP=1500`) so the trailing mechanics block survives; a single outer `[:4000]` silently amputates whatever came last.

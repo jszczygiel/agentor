@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -9,13 +10,58 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, TypeVar
 
 from . import git_ops
+from .checkpoint import CheckpointConfig, CheckpointEmitter
 from .config import Config
 from .models import ItemStatus
 from .resume_primer import build_primer
 from .slug import slugify
 from .store import Store, StoredItem
+
+T = TypeVar("T")
+
+
+class ChildStdinHolder:
+    """Thread-safe line writer bound to a child process's stdin pipe.
+
+    `_run_stream_json_subprocess` populates the internal handle after spawn;
+    the stream-reader thread calls `write_line(payload)` to inject additional
+    JSONL messages (e.g. mid-run checkpoint nudges) without racing with
+    process teardown. A lock guards every write/close so `p.kill()` on the
+    timeout path can't corrupt a partial write."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._fh = None
+        self._closed = False
+
+    def attach(self, fh) -> None:
+        with self._lock:
+            self._fh = fh
+
+    def write_line(self, text: str) -> bool:
+        line = text if text.endswith("\n") else text + "\n"
+        with self._lock:
+            if self._closed or self._fh is None:
+                return False
+            try:
+                self._fh.write(line)
+                self._fh.flush()
+                return True
+            except Exception:
+                return False
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
 
 
 class ProcRegistry:
@@ -141,6 +187,121 @@ def _error_signature(msg: str) -> str:
     'claude killed: max_turns=30 hit (30 turns)' →
     'claude killed: max_turns= hit'."""
     return _ERR_NOISE.sub("", (msg or "").lower())[:80]
+
+
+# Exponential-backoff cadence for transient CLI failures. Module-level so
+# tests can monkey-patch. `_sleep` is looked up at call time so patching
+# `runner._sleep` works end-to-end.
+_RETRY_DELAYS: tuple[float, ...] = (2.0, 8.0, 30.0)
+_RETRY_JITTER: float = 0.25
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+_TRANSIENT_NEEDLES = (
+    "429", "rate limit", "rate_limit",
+    "500 ", "502 ", "503 ", "504 ",
+    "bad gateway", "gateway timeout",
+    "service unavailable", "internal server error",
+    "overloaded",
+    "connection reset", "connection refused", "connection aborted",
+    "temporary failure in name resolution",
+    "name or service not known", "nodename nor servname",
+    "network is unreachable",
+    "eof occurred in violation",
+    "read timed out",
+)
+
+
+# Strings that look transient at a glance but are actually fatal and should
+# fail fast so the operator sees them. Auth/quota/credit won't recover on
+# retry; max_turns / max_cost_usd are deliberate runaway-guard kills;
+# syntax errors in the prompt/template won't self-heal.
+_FATAL_NEEDLES = (
+    "invalid api key", "unauthorized", "forbidden",
+    "quota", "credit",
+    "syntaxerror", "syntax error",
+    "max_turns=", "max_cost_usd=",
+)
+
+
+def _is_transient_error(
+    msg: str, elapsed: float, timeout_seconds: float,
+) -> bool:
+    """True if `msg` looks like a momentary hiccup worth retrying in-dispatch
+    (HTTP 429/5xx, TCP/DNS blips, or a `timed out` when elapsed was well
+    under the configured budget — i.e. a subprocess.TimeoutExpired-style
+    stall, not a genuine hang). Returns False for shutdown / dead-session /
+    infrastructure (dedicated paths), auth/quota/syntax/runaway-cap fatals,
+    and real hangs (timeout with elapsed ≥ 90% of the budget)."""
+    low = (msg or "").lower()
+    if not low:
+        return False
+    if (_is_shutdown_error(low) or _is_dead_session_error(low)
+            or _is_infrastructure_error(low)):
+        return False
+    if any(n in low for n in _FATAL_NEEDLES):
+        return False
+    if "timed out" in low or "timeout" in low:
+        if timeout_seconds > 0 and elapsed >= 0.9 * timeout_seconds:
+            return False
+        return True
+    return any(n in low for n in _TRANSIENT_NEEDLES)
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Return the sleep duration before retry number `attempt` (0-indexed).
+    Indexes past the table clamp to the last value."""
+    idx = min(attempt, len(_RETRY_DELAYS) - 1)
+    base = _RETRY_DELAYS[idx]
+    return base + random.uniform(0.0, base * _RETRY_JITTER)
+
+
+def _log_retry(
+    transcript_path: Path, attempt: int, budget: int, delay: float,
+    error: str,
+) -> None:
+    """Append a RETRY marker to the per-item transcript so operators can see
+    why a run took longer than expected. Best-effort — a write failure must
+    not derail the retry."""
+    try:
+        with transcript_path.open("a") as fh:
+            fh.write(
+                f"\nRETRY {attempt}/{budget} in {delay:.1f}s: "
+                f"{error.strip()[-500:]}\n"
+            )
+    except Exception:
+        pass
+
+
+def _retry_transient(
+    invoke: Callable[[], T], *,
+    transcript_path: Path, retries: int, timeout_seconds: int,
+) -> T:
+    """Call `invoke()`, retrying up to `retries` times on transient errors
+    with exponential backoff. Non-transient errors and budget-exhausted
+    retries propagate unchanged. Each backoff is written to `transcript_path`
+    so operators can see why a run took longer than expected."""
+    if retries <= 0:
+        return invoke()
+    for attempt in range(retries + 1):
+        t0 = time.monotonic()
+        try:
+            return invoke()
+        except RuntimeError as e:
+            elapsed = time.monotonic() - t0
+            if attempt >= retries:
+                raise
+            if not _is_transient_error(str(e), elapsed, timeout_seconds):
+                raise
+            delay = _backoff_delay(attempt)
+            _log_retry(
+                transcript_path, attempt + 1, retries, delay, str(e),
+            )
+            _sleep(delay)
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 @dataclass
@@ -425,6 +586,8 @@ def _run_stream_json_subprocess(
     item_key: str,
     fnfe_hint: str,
     on_event,
+    stdin_payload: str | None = None,
+    stdin_holder: ChildStdinHolder | None = None,
 ) -> tuple[str, str, int | None, bool, str | None]:
     """Spawn a subprocess that emits line-delimited JSON on stdout, stream
     each event through `on_event`, and return once the child exits (or a
@@ -434,15 +597,24 @@ def _run_stream_json_subprocess(
     a truthy string, the child is killed and that string is surfaced as
     `cap_reason` so callers can raise a descriptive error.
 
+    `stdin_payload` is written (and flushed) before the read loop begins.
+    When `stdin_holder` is passed, stdin stays open and `on_event` can
+    inject further lines via `stdin_holder.write_line(...)`; if no holder
+    is passed stdin is closed immediately after the initial payload.
+
     Returns (stdout_text, stderr_text, returncode, timed_out, cap_reason).
     Caller is responsible for the final shutdown-event / returncode checks —
     this helper just owns the subprocess lifecycle and byte plumbing."""
+    stdin_spec = subprocess.PIPE if (
+        stdin_payload is not None or stdin_holder is not None
+    ) else None
     try:
         # start_new_session=True puts the child (and anything it spawns)
         # in its own process group so the daemon can SIGTERM the whole
         # tree on shutdown via os.killpg.
         p = subprocess.Popen(
             args, cwd=cwd,
+            stdin=stdin_spec,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1, start_new_session=True,
         )
@@ -451,6 +623,19 @@ def _run_stream_json_subprocess(
     assert p.stdout is not None and p.stderr is not None
     if proc_registry is not None:
         proc_registry.register(item_key, p)
+    if stdin_holder is not None and p.stdin is not None:
+        stdin_holder.attach(p.stdin)
+    if stdin_payload is not None and p.stdin is not None:
+        try:
+            p.stdin.write(stdin_payload)
+            p.stdin.flush()
+        except Exception:
+            pass
+        if stdin_holder is None:
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
 
     timed_out = threading.Event()
 
@@ -481,7 +666,11 @@ def _run_stream_json_subprocess(
 
     stdout_buf: list[str] = []
     cap_reason: str | None = None
-    transcript_path.write_text(f"args: {args}\n\nstdout:\n")
+    # Append mode so RETRY markers written by the surrounding retry loop
+    # are preserved across attempts; _invoke_claude/_invoke_codex truncate
+    # the file once before the first attempt.
+    with transcript_path.open("a") as fh:
+        fh.write(f"args: {args}\n\nstdout:\n")
     try:
         for line in iter(p.stdout.readline, ""):
             stdout_buf.append(line)
@@ -508,6 +697,8 @@ def _run_stream_json_subprocess(
         timer.cancel()
         if proc_registry is not None:
             proc_registry.unregister(item_key)
+        if stdin_holder is not None:
+            stdin_holder.close()
         try:
             p.stdout.close()
         except Exception:
@@ -641,6 +832,8 @@ class ClaudeRunner(Runner):
 
         Legacy non-streaming commands (no stream-json) still work — we detect
         the output format and fall back to blocking subprocess.run."""
+        template = self.config.agent.command or _default_claude_command()
+        legacy_prompt_arg = _command_has_prompt_placeholder(template)
         settings_path = write_claude_settings(self.config, item.id)
         args = [
             a.format(
@@ -648,7 +841,7 @@ class ClaudeRunner(Runner):
                 model=self.config.agent.model,
                 settings_path=str(settings_path),
             )
-            for a in (self.config.agent.command or _default_claude_command())
+            for a in template
         ]
 
         # Session id: pre-generated + persisted before the child starts so a
@@ -669,14 +862,28 @@ class ClaudeRunner(Runner):
         phase_tag = "execute" if had_session else "plan"
         transcript_path = self._transcript_path(item, phase_tag)
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        # Clear once before the retry loop so the first attempt's log isn't
+        # contaminated by a prior run; retry attempts append so RETRY markers
+        # survive.
+        transcript_path.write_text("")
 
         streaming = "stream-json" in args
-        if streaming:
-            return self._invoke_claude_streaming(
-                item, args, worktree, transcript_path, phase_tag,
+
+        def invoke() -> tuple[str, str]:
+            if streaming:
+                stdin_prompt = None if legacy_prompt_arg else prompt
+                return self._invoke_claude_streaming(
+                    item, args, worktree, transcript_path, phase_tag,
+                    stdin_prompt=stdin_prompt,
+                )
+            return self._invoke_claude_blocking(
+                item, args, worktree, transcript_path,
             )
-        return self._invoke_claude_blocking(
-            item, args, worktree, transcript_path,
+
+        return _retry_transient(
+            invoke, transcript_path=transcript_path,
+            retries=self.config.agent.transient_retries,
+            timeout_seconds=self.config.agent.timeout_seconds,
         )
 
     def _invoke_claude_blocking(
@@ -710,11 +917,12 @@ class ClaudeRunner(Runner):
                 stdout, stderr = p.communicate()
                 e_stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
                 e_stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
-                transcript_path.write_text(
-                    f"TIMEOUT after {self.config.agent.timeout_seconds}s\n\n"
-                    f"stdout:\n{stdout or e_stdout}\n\n"
-                    f"stderr:\n{stderr or e_stderr}\n"
-                )
+                with transcript_path.open("a") as fh:
+                    fh.write(
+                        f"TIMEOUT after {self.config.agent.timeout_seconds}s\n\n"
+                        f"stdout:\n{stdout or e_stdout}\n\n"
+                        f"stderr:\n{stderr or e_stderr}\n"
+                    )
                 raise RuntimeError(
                     f"claude timed out after {self.config.agent.timeout_seconds}s"
                 )
@@ -722,11 +930,12 @@ class ClaudeRunner(Runner):
             if self.proc_registry is not None:
                 self.proc_registry.unregister(item.id)
 
-        transcript_path.write_text(
-            f"exit: {p.returncode}\n"
-            f"args: {args}\n\n"
-            f"stdout:\n{stdout}\n\nstderr:\n{stderr}\n"
-        )
+        with transcript_path.open("a") as fh:
+            fh.write(
+                f"exit: {p.returncode}\n"
+                f"args: {args}\n\n"
+                f"stdout:\n{stdout}\n\nstderr:\n{stderr}\n"
+            )
         if self.stop_event is not None and self.stop_event.is_set():
             raise RuntimeError("claude killed: agentor shutdown")
         if p.returncode != 0:
@@ -739,18 +948,50 @@ class ClaudeRunner(Runner):
     def _invoke_claude_streaming(
         self, item: StoredItem, args: list[str], worktree: Path,
         transcript_path: Path, phase_tag: str,
+        stdin_prompt: str | None = None,
     ) -> tuple[str, str]:
         """Launch claude with Popen, read stdout line-by-line, parse each
-        stream-json event, and publish live usage/iterations to the store."""
+        stream-json event, and publish live usage/iterations to the store.
+
+        When `stdin_prompt` is set, claude is invoked with stream-json input
+        mode — the prompt is framed as an initial `user` JSONL and written to
+        stdin, and stdin is held open so the checkpoint emitter can inject
+        additional user-role nudges mid-session."""
         state = _StreamState(item_id=item.id, phase=phase_tag)
         max_turns = int(self.config.agent.max_turns or 0)
+        ckpt_cfg = CheckpointConfig(
+            soft_turns=int(self.config.agent.turn_checkpoint_soft or 0),
+            hard_turns=int(self.config.agent.turn_checkpoint_hard or 0),
+            output_tokens=int(self.config.agent.output_token_checkpoint or 0),
+            soft_template=self.config.agent.checkpoint_soft_template,
+            hard_template=self.config.agent.checkpoint_hard_template,
+            tokens_template=self.config.agent.checkpoint_tokens_template,
+        )
+        emitter = None if ckpt_cfg.all_disabled() else CheckpointEmitter(ckpt_cfg)
+
+        stdin_holder: ChildStdinHolder | None = None
+        stdin_payload: str | None = None
+        if stdin_prompt is not None:
+            stdin_holder = ChildStdinHolder()
+            stdin_payload = _claude_initial_stdin_payload(stdin_prompt)
 
         def on_event(ev: dict) -> str | None:
             state.ingest(ev)
-            # Publish on every assistant turn and the final result event —
-            # cheaper than per-line, enough for live dashboard UX.
             if ev.get("type") in ("assistant", "result"):
                 self._publish_live(item.id, state)
+            if emitter is not None and ev.get("type") == "assistant":
+                nudges = emitter.observe(
+                    state.num_turns, state.total_output_tokens,
+                )
+                for nudge in nudges:
+                    self._note_checkpoint(transcript_path, state, nudge,
+                                          injected=stdin_holder is not None)
+                    if stdin_holder is not None:
+                        line = json.dumps({
+                            "type": "user",
+                            "message": {"role": "user", "content": nudge},
+                        })
+                        stdin_holder.write_line(line)
             # Runaway guard. No cost cap — subscription-billed plans make
             # mid-stream dollar accounting misleading; max_turns is enough.
             if max_turns and state.num_turns >= max_turns:
@@ -769,6 +1010,8 @@ class ClaudeRunner(Runner):
                     f"Install claude or set agent.command in agentor.toml."
                 ),
                 on_event=on_event,
+                stdin_payload=stdin_payload,
+                stdin_holder=stdin_holder,
             )
         )
         if timed_out:
@@ -799,6 +1042,25 @@ class ClaudeRunner(Runner):
         except Exception:
             # A publish failure shouldn't crash the run. Dashboard just
             # stays on the previous snapshot.
+            pass
+
+    def _note_checkpoint(
+        self, transcript_path: Path, state: "_StreamState", nudge: str,
+        injected: bool,
+    ) -> None:
+        """Append a human-readable marker to the transcript so post-hoc
+        analysis can see where a checkpoint nudge landed. The marker sits
+        outside the JSONL event stream (line doesn't start with `{`) so the
+        stream walker skips it."""
+        tag = "injected" if injected else "observed-dry-run"
+        marker = (
+            f"\n[checkpoint-{tag} @ turn {state.num_turns} "
+            f"output_tokens={state.total_output_tokens}]\n{nudge}\n"
+        )
+        try:
+            with transcript_path.open("a") as fh:
+                fh.write(marker)
+        except Exception:
             pass
 
 
@@ -891,9 +1153,24 @@ class CodexRunner(Runner):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists():
             output_path.unlink()
-        args = self._codex_args(item, prompt, output_path)
-        return self._invoke_codex_jsonl(
-            item, args, worktree, transcript_path, output_path, phase_tag,
+        # Clear transcript once before the retry loop; RETRY markers and
+        # per-attempt logs are appended so the full history survives.
+        transcript_path.write_text("")
+
+        def invoke() -> tuple[str, str]:
+            # Re-fetch the item each attempt so a thread_id persisted by a
+            # prior failed attempt flips us onto the resume template (and we
+            # don't orphan the codex thread created mid-stream).
+            fresh = self.store.get(item.id) or item
+            args = self._codex_args(fresh, prompt, output_path)
+            return self._invoke_codex_jsonl(
+                fresh, args, worktree, transcript_path, output_path, phase_tag,
+            )
+
+        return _retry_transient(
+            invoke, transcript_path=transcript_path,
+            retries=self.config.agent.transient_retries,
+            timeout_seconds=self.config.agent.timeout_seconds,
         )
 
     def _codex_args(
@@ -1000,6 +1277,10 @@ class _StreamState:
         self.model_usage: dict[str, dict] = {}
         # Last seen result text (set by the terminal 'result' event).
         self.result_text: str | None = None
+        # Cumulative output tokens across all assistant turns. Published
+        # so the checkpoint emitter can gate on "doing too much in-context"
+        # without recomputing from `iterations` on every event.
+        self.total_output_tokens: int = 0
 
     def ingest(self, ev: dict) -> None:
         etype = ev.get("type")
@@ -1040,6 +1321,7 @@ class _StreamState:
                 usage.get("cache_read_input_tokens", 0) or 0)
             mu["cacheCreationInputTokens"] += int(
                 usage.get("cache_creation_input_tokens", 0) or 0)
+            self.total_output_tokens += int(usage.get("output_tokens", 0) or 0)
             return
         if etype == "result":
             if ev.get("num_turns") is not None:
@@ -1261,15 +1543,41 @@ def _default_codex_command() -> list[str]:
 
 
 def _default_claude_command() -> list[str]:
+    # The `-p` without a prompt argument + `--input-format stream-json` puts
+    # claude into a session where user messages are fed via stdin as JSONL
+    # lines. The runner streams the initial prompt in on start, then can
+    # inject mid-run checkpoint nudges on the same channel. Legacy configs
+    # that still set `agent.command = [..., "-p", "{prompt}", ...]` keep
+    # working — the runner detects the placeholder and falls back to the
+    # single-shot invocation (no mid-run injection).
+    #
     # `--settings {settings_path}` points Claude at a per-run JSON that
     # registers a PreToolUse hook blocking whole-file `Read` calls on
     # files above `agent.large_file_line_threshold`. Custom overrides that
     # drop this placeholder silently disable enforcement.
     return [
-        "claude", "-p", "{prompt}", "--dangerously-skip-permissions",
+        "claude", "-p", "--dangerously-skip-permissions",
         "--settings", "{settings_path}",
+        "--input-format", "stream-json",
         "--output-format", "stream-json", "--verbose",
     ]
+
+
+def _claude_initial_stdin_payload(prompt: str) -> str:
+    """Frame the initial prompt as a single `user` stream-json line.
+    Trailing newline included — the runner writes this verbatim to claude's
+    stdin before the read loop starts."""
+    return json.dumps({
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+    }) + "\n"
+
+
+def _command_has_prompt_placeholder(args: list[str]) -> bool:
+    """Legacy command templates carry `{prompt}` as an arg; the new
+    stream-json stdin path does not. Used to pick single-shot vs
+    injection-capable invocation."""
+    return any("{prompt}" in a for a in args)
 
 
 def _read_hook_path() -> Path:

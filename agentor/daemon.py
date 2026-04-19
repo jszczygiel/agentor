@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .config import Config
+from .fold import maybe_enqueue_fold_item
 from .models import ItemStatus
 from .recovery import recover_on_startup
 from .runner import InfrastructureError, ProcRegistry, Runner, plan_worktree
@@ -55,6 +56,10 @@ class Daemon:
         self.paused: bool = False
         self._heartbeat_last: float = 0.0
         self._heartbeat_dispatched: int = 0
+        # Epoch set when run() starts; used as the "since-daemon-start" cutoff
+        # for the dashboard token-usage panel. Zero means the loop has not
+        # been entered yet (tests constructing a bare Daemon).
+        self.started_at: float = 0.0
 
     #: Wall-clock seconds of idle before a heartbeat log line fires. Class-
     #: level so tests can shrink it without patching time.
@@ -234,6 +239,7 @@ class Daemon:
         signal.signal(signal.SIGTERM, handler)
 
     def run(self) -> DaemonStats:
+        self.started_at = time.time()
         if self.install_signals:
             self._install_signal_handlers()
         rec = recover_on_startup(self.config, self.store)
@@ -243,6 +249,9 @@ class Daemon:
         if rec.auto_recovered:
             self.log(f"auto-recovered {len(rec.auto_recovered)} items "
                      f"with benign last_error (shutdown/cap/stale session)")
+        if rec.stale_sessions:
+            self.log(f"auto-recovered {len(rec.stale_sessions)} items "
+                     f"with stale claude session")
         if rec.resumable:
             # Resumable items are now demoted to QUEUED by recovery; the
             # normal dispatch loop claims them when a pool slot opens, and
@@ -266,6 +275,13 @@ class Daemon:
             if result.new_items:
                 self.log(f"scan: {result.new_items} new items")
             self.try_fill_pool()
+            try:
+                created = maybe_enqueue_fold_item(self.config, self.store)
+            except Exception as e:
+                self.log(f"fold-queue error: {e}")
+            else:
+                if created is not None:
+                    self.log(f"queued agent-log fold item: {created}")
             self._maybe_log_heartbeat(result.new_items)
             self.stop_event.wait(self.scan_interval)
 

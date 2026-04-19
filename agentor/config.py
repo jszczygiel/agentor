@@ -3,6 +3,9 @@ import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+from .checkpoint import (DEFAULT_HARD_TEMPLATE, DEFAULT_SOFT_TEMPLATE,
+                         DEFAULT_TOKENS_TEMPLATE)
+
 
 @dataclass
 class SourcesConfig:
@@ -135,9 +138,11 @@ class AgentConfig:
         "    ## Stop if\n"
         "    - symptoms that should halt a future similar attempt\n\n"
         "   Skip sections with nothing to say — an empty run produces no "
-        "file. Include this file in your commit. A human will periodically "
-        "grep `docs/agent-logs/` and fold durable lessons into CLAUDE.md "
-        "/ skills.\n\n"
+        "file. Include this file in your commit. When `docs/agent-logs/` "
+        "accumulates ≥ `agent.fold_threshold` files (default 10), the "
+        "daemon auto-queues a fold item whose agent clusters durable "
+        "lessons into CLAUDE.md / skills and deletes the consumed logs "
+        "in the same commit.\n\n"
         "9. Commit on this branch. Do NOT push, do NOT merge — a human "
         "reviewer and agentor's committer handle integration. Use a "
         "concise conventional-commit-style message summarizing the "
@@ -149,11 +154,29 @@ class AgentConfig:
     # Hard cap on agent turns. 0 disables. Live stream watches num_turns
     # and kills the child when exceeded.
     max_turns: int = 0
+    # In-dispatch retry budget for transient CLI failures (HTTP 429/5xx,
+    # network resets, DNS blips, sub-budget timeouts). Each retry uses
+    # exponential backoff; a success refunds the attempt because the
+    # retries happen inside a single claim. 0 disables the loop.
+    transient_retries: int = 3
     # Seconds to pause between successive dispatches in a single
     # try_fill_pool burst, so the first agent can populate the shared
     # system-prompt cache before siblings race for the same prefix.
     # 0 disables (back-compat default).
     dispatch_stagger_seconds: float = 0.0
+    # Mid-run advisory checkpoints. When the live turn count or cumulative
+    # output-token total crosses a threshold, the runner injects a user-role
+    # nudge suggesting the agent delegate discovery to a subagent. Each
+    # threshold fires at most once per run. Set any to 0 to disable that
+    # gate; setting all three to 0 disables checkpoints entirely. Only the
+    # Claude stream-json-stdin path acts on the emissions; legacy `-p
+    # {prompt}` command shapes still observe but do not inject.
+    turn_checkpoint_soft: int = 60
+    turn_checkpoint_hard: int = 100
+    output_token_checkpoint: int = 50_000
+    checkpoint_soft_template: str = DEFAULT_SOFT_TEMPLATE
+    checkpoint_hard_template: str = DEFAULT_HARD_TEMPLATE
+    checkpoint_tokens_template: str = DEFAULT_TOKENS_TEMPLATE
     build_cmd: str | None = None
     test_cmd: str | None = None
     # Threshold (in lines) above which a `Read` tool call MUST pass
@@ -167,6 +190,18 @@ class AgentConfig:
     # agent can't dump hundreds of match lines into context. Content-mode
     # is the only gated mode — `count` and `files_with_matches` stay free.
     enforce_grep_head_limit: bool = True
+    # Max age (hours) for a persisted Claude session_id to still be
+    # considered resumable on the recovery sweep. Claude CLI sessions
+    # expire after ~5h; default 4h leaves a safety cushion. Items past
+    # the threshold (or carrying a prior dead-session failure row) are
+    # demoted to a fresh plan run instead of paying for a doomed
+    # `claude --resume` round-trip.
+    session_max_age_hours: float = 4.0
+    # When `docs/agent-logs/` has accumulated at least this many files,
+    # the daemon auto-queues a "Fold agent log lessons" backlog item so
+    # a future agent clusters the Surprises/Gotchas into CLAUDE.md and
+    # deletes the consumed logs in a single commit. 0 disables.
+    fold_threshold: int = 10
 
 
 @dataclass

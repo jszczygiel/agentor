@@ -1,14 +1,24 @@
 import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from unittest import mock
+
+from agentor.dashboard import formatters
 from agentor.dashboard.formatters import (
     _ctx_fill_pct,
     _fmt_elapsed,
+    _fmt_token_line,
+    _fmt_token_line_mid,
+    _fmt_token_line_narrow,
     _fmt_tokens,
     _token_breakdown,
+    _token_windows,
+    _token_windows_invalidate,
 )
-from agentor.models import ItemStatus
-from agentor.store import StoredItem
+from agentor.models import Item, ItemStatus
+from agentor.store import Store, StoredItem
 
 
 def _item(result_json: str | None) -> StoredItem:
@@ -168,6 +178,178 @@ class TestTokenBreakdown(unittest.TestCase):
         rows = _token_breakdown(_item(json.dumps(payload)))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["model"], "claude-opus-4-6")
+
+
+class TestFmtTokenLine(unittest.TestCase):
+    def test_contains_all_buckets(self):
+        totals = {
+            "input": 100, "output": 50,
+            "cache_read": 2000, "cache_create": 300,
+            "total": 2450,
+        }
+        line = _fmt_token_line("session", totals)
+        self.assertIn("session", line)
+        self.assertIn("in ", line)
+        self.assertIn("out ", line)
+        self.assertIn("cache_r ", line)
+        self.assertIn("cache_c ", line)
+        # Values rendered via _fmt_tokens — 2000 stays as "2.0k".
+        self.assertIn("2.0k", line)
+
+    def test_zero_totals_render_zeros(self):
+        totals = {"input": 0, "output": 0,
+                  "cache_read": 0, "cache_create": 0, "total": 0}
+        line = _fmt_token_line("today", totals)
+        # All buckets should read 0, not "—".
+        self.assertEqual(line.count("     0"), 5)
+
+
+class TestTokenWindows(unittest.TestCase):
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.store = Store(Path(self.td.name) / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _seed_item(self, item_id: str, input_tokens: int,
+                   updated_at: float) -> None:
+        item = Item(
+            id=item_id, title="t", body="",
+            source_file="s.md", source_line=1, tags={},
+        )
+        self.store.upsert_discovered(item)
+        self.store.update_result_json(
+            item_id,
+            json.dumps({"usage": {"input_tokens": input_tokens}}),
+        )
+        self.store.conn.execute(
+            "UPDATE items SET updated_at = ? WHERE id = ?",
+            (updated_at, item_id),
+        )
+
+    def test_three_keys_present(self):
+        windows = _token_windows(self.store, daemon_started_at=0.0)
+        self.assertEqual(set(windows.keys()), {"session", "today", "7d"})
+
+    def test_session_since_daemon_start(self):
+        import time as _time
+        now = _time.time()
+        self._seed_item("before", 99, updated_at=now - 60)
+        self._seed_item("after", 7, updated_at=now + 1)
+        windows = _token_windows(self.store, daemon_started_at=now)
+        # session starts now → only "after" row counts.
+        self.assertEqual(windows["session"]["input"], 7)
+        # 7d spans both.
+        self.assertEqual(windows["7d"]["input"], 106)
+
+    def test_session_falls_back_to_today_when_not_started(self):
+        # daemon_started_at == 0 → session mirrors today so the panel is
+        # populated even when the Daemon.run() loop hasn't fired yet.
+        import time as _time
+        now = _time.time()
+        self._seed_item("a", 11, updated_at=now)
+        windows = _token_windows(self.store, daemon_started_at=0.0)
+        self.assertEqual(windows["session"], windows["today"])
+
+
+class _FakeStore:
+    """Minimal stand-in for Store that counts aggregate_token_usage calls.
+    `_token_windows` only needs that one method on its collaborator."""
+
+    def __init__(self) -> None:
+        self.calls: list[float | None] = []
+
+    def aggregate_token_usage(self, since: float | None = None) -> dict:
+        self.calls.append(since)
+        return {"input": 1, "output": 0, "cache_read": 0,
+                "cache_create": 0, "total": 1}
+
+
+class TestTokenWindowsCache(unittest.TestCase):
+    def setUp(self):
+        _token_windows_invalidate()
+
+    def tearDown(self):
+        _token_windows_invalidate()
+
+    def test_first_call_delegates_three_times(self):
+        store = _FakeStore()
+        _token_windows(store, daemon_started_at=0.0)
+        # One aggregate per window (session, today, 7d).
+        self.assertEqual(len(store.calls), 3)
+
+    def test_second_call_within_ttl_is_cached(self):
+        store = _FakeStore()
+        first = _token_windows(store, daemon_started_at=0.0)
+        second = _token_windows(store, daemon_started_at=0.0)
+        self.assertEqual(len(store.calls), 3)  # still 3, not 6
+        # Same dict object returned — confirms the cache hit path.
+        self.assertIs(first, second)
+
+    def test_invalidate_forces_recompute(self):
+        store = _FakeStore()
+        _token_windows(store, daemon_started_at=0.0)
+        _token_windows_invalidate()
+        _token_windows(store, daemon_started_at=0.0)
+        self.assertEqual(len(store.calls), 6)
+
+    def test_ttl_expiry_forces_recompute(self):
+        store = _FakeStore()
+        base = 1_000_000.0
+        with mock.patch.object(formatters.time, "time", return_value=base):
+            _token_windows(store, daemon_started_at=0.0)
+            self.assertEqual(len(store.calls), 3)
+        # Jump past the TTL window (2.0s).
+        with mock.patch.object(formatters.time, "time", return_value=base + 5.0):
+            _token_windows(store, daemon_started_at=0.0)
+        self.assertEqual(len(store.calls), 6)
+
+    def test_different_store_identity_busts_cache(self):
+        store_a = _FakeStore()
+        store_b = _FakeStore()
+        _token_windows(store_a, daemon_started_at=0.0)
+        _token_windows(store_b, daemon_started_at=0.0)
+        # Each store computed its own three aggregates.
+        self.assertEqual(len(store_a.calls), 3)
+        self.assertEqual(len(store_b.calls), 3)
+
+    def test_different_daemon_start_busts_cache(self):
+        store = _FakeStore()
+        _token_windows(store, daemon_started_at=0.0)
+        _token_windows(store, daemon_started_at=123.0)
+        self.assertEqual(len(store.calls), 6)
+
+
+class TestFmtTokenLineTiers(unittest.TestCase):
+    """Tier-specific token-panel line formatters must fit their own
+    minimum width so the dashboard doesn't silently clip the totals."""
+
+    totals = {"input": 1_500_000, "output": 120_000,
+              "cache_read": 8_000_000, "cache_create": 350_000,
+              "total": 10_000_000}
+
+    def test_wide_line_fits_80(self):
+        line = _fmt_token_line("session", self.totals)
+        self.assertLessEqual(len(line) + 1, 80)  # leading space
+
+    def test_mid_line_fits_60(self):
+        line = _fmt_token_line_mid("session", self.totals)
+        self.assertLessEqual(len(line) + 1, 60)
+        # Σ survives in mid tier — most operator-relevant datum.
+        self.assertIn("Σ", line)
+
+    def test_narrow_line_fits_40(self):
+        line = _fmt_token_line_narrow("session", self.totals)
+        self.assertLessEqual(len(line) + 1, 40)
+        self.assertIn("Σ", line)
+
+    def test_narrow_truncates_long_label(self):
+        line = _fmt_token_line_narrow("session", self.totals)
+        # Narrow truncates `session` to 4 chars so Σ never clips.
+        self.assertIn("sess", line)
+        self.assertNotIn("session", line)
 
 
 if __name__ == "__main__":

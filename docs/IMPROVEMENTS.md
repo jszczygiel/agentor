@@ -5,6 +5,18 @@ the current task's scope.
 
 ## Open
 
+- Stale-session demotion in `recovery.py` clears `worktree_path` on the item
+  but leaves the actual worktree directory on disk. `claim_next_queued` will
+  overwrite the path with a fresh slug on re-dispatch, so the old worktree
+  lingers until external cleanup (or the next conflicting `git worktree add`).
+  Consider calling `git_ops.worktree_remove` from the stale-session branch the
+  same way the dead-session-revert path does, gated on the worktree dir
+  existing. Scope kept narrow for the original task.
+- `CodexRunner` does not yet wire `CheckpointEmitter`. Codex uses its own
+  JSONL event shape and `thread_id` resume semantics — the emitter module
+  is runner-agnostic so a follow-up PR can gate on `_CodexStreamState`
+  (no per-turn `output_tokens`, so a turn-count-only gate is the
+  minimum-viable wiring). Scope kept to Claude for this task.
 - `tests/test_config.py` has three unused-import F401 ruff errors (`ReviewConfig`,
   `ParsingConfig`, `SourcesConfig` on lines 9-10). CI runs `ruff check` so these
   should already be failing the workflow — check whether the CI config ignores
@@ -14,7 +26,3 @@ the current task's scope.
   automatic. Consider tagging the transition note (or surfacing an auto-resolve
   badge in the main table) so operators can distinguish a human `[e]` resubmit
   from a committer-driven one.
-- mypy reports `func-returns-value` in `agentor/dashboard/modes.py` around the
-  `_capture_note_for_expansion` callsite — a `(p("…"), call())[-1]` tuple trick
-  trips the checker because `p` returns None. Pre-existing; switch to an inner
-  helper that calls `p(...)` then returns the real value to clear the warning.
