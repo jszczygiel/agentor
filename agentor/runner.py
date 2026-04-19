@@ -1012,6 +1012,13 @@ class ClaudeRunner(Runner):
                             "message": {"role": "user", "content": nudge},
                         })
                         stdin_holder.write_line(line)
+            # Claude with `--input-format stream-json` keeps stdin open and
+            # waits for the next user message after emitting `result`. Close
+            # stdin so the CLI sees EOF and exits; otherwise the outer
+            # `p.stdout.readline()` loop blocks forever and the item stays
+            # WORKING until timeout.
+            if ev.get("type") == "result" and stdin_holder is not None:
+                stdin_holder.close()
             # Runaway guard. No cost cap — subscription-billed plans make
             # mid-stream dollar accounting misleading; max_turns is enough.
             if max_turns and state.num_turns >= max_turns:

@@ -2008,6 +2008,62 @@ class TestClaudeRunnerCheckpointInjection(unittest.TestCase):
         self.assertEqual(user_lines[0]["type"], "user")
         self.assertIn("turn", user_lines[0]["message"]["content"].lower())
 
+    def test_result_event_closes_stdin_holder(self):
+        """Regression: claude with stream-json input keeps stdin open and
+        waits for the next user message after `terminal_reason:completed`.
+        The runner must close stdin on the `result` event so the CLI sees
+        EOF and exits; otherwise the outer readline blocks forever and the
+        item stays WORKING until timeout."""
+        from agentor import runner as runner_mod
+        from agentor.runner import ClaudeRunner
+
+        cfg = self._mk_claude_cfg()
+        runner = ClaudeRunner(cfg, self.store)
+
+        scan_once(cfg, self.store)
+        item_id = self.store.list_by_status(ItemStatus.QUEUED)[0].id
+        wt = self.root / "wt"
+        wt.mkdir()
+        claimed = self.store.claim_next_queued(str(wt), "agent/big-refactor")
+
+        holder_closed_mid_flow: list[bool] = []
+
+        def helper(*, args, cwd, timeout_seconds, transcript_path,
+                   proc_registry, item_key, fnfe_hint, on_event,
+                   stdin_payload=None, stdin_holder=None):
+            class _Sink:
+                def write(self, text): pass
+                def flush(self): pass
+            stdin_holder.attach(_Sink())
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text("")
+            on_event(self._assistant_event())
+            on_event({"type": "result", "stop_reason": "end_turn",
+                      "num_turns": 1})
+            # Snapshot holder state *after* result event, before the helper
+            # itself tears down. If the runner didn't close on result the
+            # real CLI would hang here waiting for stdin.
+            holder_closed_mid_flow.append(stdin_holder._closed)
+            stdin_holder.close()
+            return "", "", 0, False, None
+
+        original = runner_mod._run_stream_json_subprocess
+        runner_mod._run_stream_json_subprocess = helper
+        try:
+            runner._invoke_claude_streaming(
+                claimed,
+                ["claude", "-p", "--input-format", "stream-json",
+                 "--output-format", "stream-json", "--verbose"],
+                wt,
+                self.root / ".agentor" / "transcripts" / f"{item_id}.plan.log",
+                "plan",
+                stdin_prompt="THE-PROMPT",
+            )
+        finally:
+            runner_mod._run_stream_json_subprocess = original
+
+        self.assertEqual(holder_closed_mid_flow, [True])
+
     def test_legacy_prompt_template_skips_injection(self):
         from agentor import runner as runner_mod
         from agentor.runner import ClaudeRunner
