@@ -58,8 +58,7 @@ _ACTION_KEYS_BY_STATUS: dict[ItemStatus, list[tuple[str, str]]] = {
     ],
     ItemStatus.AWAITING_PLAN_REVIEW: [
         ("a", "[a]approve→execute"),
-        ("f", "[f]approve+feedback"),
-        ("r", "[r]eject+feedback"),
+        ("r", "[r]feedback"),
         ("s", "[s]defer"),
         ("x", "[x]delete"),
     ],
@@ -328,16 +327,6 @@ def _inspect_dispatch(
             if daemon is not None:
                 daemon.try_fill_pool()
             return True, "plan approved → execute queued"
-        if key == "f":
-            feedback = _prompt_multiline(
-                stdscr, "feedback for execute phase"
-            )
-            if not feedback:
-                return False, ""
-            approve_plan(store, item, feedback=feedback)
-            if daemon is not None:
-                daemon.try_fill_pool()
-            return True, "plan approved with feedback"
         if key == "r":
             feedback = _prompt_multiline(
                 stdscr, "feedback (plan retry)"
@@ -345,7 +334,7 @@ def _inspect_dispatch(
             if not feedback:
                 return False, ""
             reject_and_retry(store, item, feedback)
-            return True, "plan rejected — agent will re-plan"
+            return True, "plan requeued with feedback"
         if key == "s":
             defer(store, item)
             return True, "deferred"

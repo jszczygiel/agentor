@@ -104,6 +104,72 @@ class TestInspectDispatch(unittest.TestCase):
         self.assertEqual(self.store.get("plan1").status, ItemStatus.QUEUED)
         self.assertEqual(self.daemon.filled, 1)
 
+    def test_plan_review_feedback_key_requeues_with_note(self):
+        """`r` in plan review calls `reject_and_retry`: item goes back to
+        QUEUED with feedback set, result_json cleared, attempts reset.
+        Runner's `_prepend_feedback` consumes it on the next plan pass."""
+        self._seed("plan1", ItemStatus.QUEUED)
+        self.store.transition("plan1", ItemStatus.WORKING, note="t")
+        self.store.transition(
+            "plan1", ItemStatus.AWAITING_PLAN_REVIEW,
+            result_json='{"phase": "plan", "plan": "old"}', note="t",
+        )
+        with patch(
+            "agentor.dashboard.modes._prompt_multiline",
+            return_value="avoid rewriting store.py",
+        ):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("plan1"), "r",
+            )
+        self.assertTrue(acted)
+        self.assertEqual(msg, "plan requeued with feedback")
+        got = self.store.get("plan1")
+        self.assertEqual(got.status, ItemStatus.QUEUED)
+        self.assertEqual(got.feedback, "avoid rewriting store.py")
+        self.assertIsNone(got.result_json)
+        self.assertEqual(got.attempts, 0)
+
+    def test_plan_review_feedback_cancelled_is_noop(self):
+        """Empty feedback from the prompt (user aborted) leaves the item in
+        AWAITING_PLAN_REVIEW — no state change, no flash."""
+        self._seed("plan1", ItemStatus.QUEUED)
+        self.store.transition("plan1", ItemStatus.WORKING, note="t")
+        self.store.transition(
+            "plan1", ItemStatus.AWAITING_PLAN_REVIEW, note="t",
+        )
+        with patch(
+            "agentor.dashboard.modes._prompt_multiline", return_value="",
+        ):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("plan1"), "r",
+            )
+        self.assertFalse(acted)
+        self.assertEqual(msg, "")
+        self.assertEqual(
+            self.store.get("plan1").status, ItemStatus.AWAITING_PLAN_REVIEW,
+        )
+
+    def test_plan_review_f_key_is_unbound(self):
+        """The former `[f]approve+feedback` action was removed — plan
+        review now mirrors the execute-review split (approve / feedback /
+        defer / delete). Pressing `f` must be a no-op."""
+        self._seed("plan1", ItemStatus.QUEUED)
+        self.store.transition("plan1", ItemStatus.WORKING, note="t")
+        self.store.transition(
+            "plan1", ItemStatus.AWAITING_PLAN_REVIEW, note="t",
+        )
+        acted, msg = _inspect_dispatch(
+            None, None, self.store, self.daemon,
+            self._fresh("plan1"), "f",
+        )
+        self.assertFalse(acted)
+        self.assertEqual(msg, "")
+        self.assertEqual(
+            self.store.get("plan1").status, ItemStatus.AWAITING_PLAN_REVIEW,
+        )
+
     def test_plan_review_defer_transitions_to_deferred(self):
         self._seed("plan1", ItemStatus.QUEUED)
         self.store.transition("plan1", ItemStatus.WORKING, note="t")
