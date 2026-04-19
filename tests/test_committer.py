@@ -29,6 +29,11 @@ def _init_project(root: Path) -> None:
 
 
 def _mk_config(root: Path, *, merge_mode: str = "merge") -> Config:
+    # Test fixture pins `auto_resolve_conflicts=False` so committer tests can
+    # assert on the CONFLICTED state without the default-on auto-chain
+    # immediately moving the item to QUEUED. TestAutoResolveConflicts
+    # explicitly re-enables it to exercise the on-path; the production
+    # GitConfig() default is True and is pinned in tests/test_config.py.
     return Config(
         project_name=root.name,
         project_root=root,
@@ -36,7 +41,8 @@ def _mk_config(root: Path, *, merge_mode: str = "merge") -> Config:
         parsing=ParsingConfig(mode="checkbox"),
         agent=AgentConfig(pool_size=1),
         git=GitConfig(base_branch="main", branch_prefix="agent/",
-                      merge_mode=merge_mode),
+                      merge_mode=merge_mode,
+                      auto_resolve_conflicts=False),
         review=ReviewConfig(),
     )
 
@@ -508,7 +514,7 @@ class TestAutoResolveConflicts(unittest.TestCase):
 
     def test_auto_resolve_off_leaves_conflicted(self):
         cfg = _mk_config(self.root)
-        self.assertFalse(cfg.git.auto_resolve_conflicts)
+        cfg.git.auto_resolve_conflicts = False
         final = self._drive_to_conflict(cfg)
         self.assertEqual(final.status, ItemStatus.CONFLICTED)
         self.assertIsNone(final.feedback)
@@ -516,7 +522,7 @@ class TestAutoResolveConflicts(unittest.TestCase):
 
     def test_auto_resolve_on_requeues_with_feedback(self):
         cfg = _mk_config(self.root)
-        cfg.git.auto_resolve_conflicts = True
+        cfg.git.auto_resolve_conflicts = True  # re-enable (fixture forces off)
         final = self._drive_to_conflict(cfg)
 
         self.assertEqual(final.status, ItemStatus.QUEUED)
@@ -539,7 +545,7 @@ class TestAutoResolveConflicts(unittest.TestCase):
         dispatch (conflict resolution is pure execute work)."""
         from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
         cfg = _mk_config(self.root)
-        cfg.git.auto_resolve_conflicts = True
+        cfg.git.auto_resolve_conflicts = True  # re-enable (fixture forces off)
         final = self._drive_to_conflict(cfg)
 
         self.assertEqual(final.status, ItemStatus.QUEUED)
@@ -571,7 +577,9 @@ class TestAutoResolveConflicts(unittest.TestCase):
         the dashboard uses its absence to keep the indicator silent."""
         from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
         cfg = _mk_config(self.root)
-        # auto_resolve_conflicts stays False — drive reaches CONFLICTED only.
+        # Force off so drive reaches CONFLICTED without chaining; then call
+        # resubmit_conflicted manually to simulate the operator's [e] press.
+        cfg.git.auto_resolve_conflicts = False
         conflicted = self._drive_to_conflict(cfg)
         self.assertEqual(conflicted.status, ItemStatus.CONFLICTED)
 
