@@ -402,21 +402,29 @@ def reject_and_retry(store: Store, item: StoredItem, feedback: str) -> None:
 
 def approve_plan(
     store: Store, item: StoredItem, feedback: str | None = None,
+    note: str | None = None,
 ) -> None:
     """User approved the agent's development plan. Push the item back to QUEUED
     so the daemon re-claims it; the runner sees the persisted plan in
     result_json and runs the execute phase (resumes the same claude session).
 
     Optional `feedback` is persisted and consumed once by the runner's
-    `_prepend_feedback` on the execute phase — same path as reject_and_retry."""
+    `_prepend_feedback` on the execute phase — same path as reject_and_retry.
+
+    `note` overrides the default transition note. The daemon's auto-accept
+    path (see `agentor.auto_accept`) passes `auto-accepted: <reason>` so
+    the inspect view shows the auto-approve provenance."""
     assert item.status == ItemStatus.AWAITING_PLAN_REVIEW
     fields: dict[str, object] = {}
     if feedback:
         fields["feedback"] = feedback
+    final_note = note or (
+        "plan approved — execute phase queued"
+        + (" with feedback" if feedback else "")
+    )
     store.transition(
         item.id, ItemStatus.QUEUED,
-        note="plan approved — execute phase queued"
-        + (" with feedback" if feedback else ""),
+        note=final_note,
         **fields,
     )
 

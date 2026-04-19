@@ -681,6 +681,18 @@ class TestApproveFeedbackSplit(unittest.TestCase):
         self.assertEqual(final.status, ItemStatus.QUEUED)
         self.assertIsNone(final.feedback)
 
+    def test_approve_plan_note_override(self):
+        """Callers (daemon auto-accept path, recovery sweep) pass a custom
+        `note` so the inspect view records the auto-approve provenance
+        instead of the default 'plan approved — execute phase queued'."""
+        item = self._plan_review_item()
+        approve_plan(self.store, item, note="auto-accepted: always")
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        last = self.store.transitions_for(item.id)[-1]
+        self.assertEqual(last.note, "auto-accepted: always")
+
 
 class TestConcurrentIntegration(unittest.TestCase):
     """Two AWAITING_REVIEW items approved simultaneously must both reach

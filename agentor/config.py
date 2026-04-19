@@ -45,6 +45,14 @@ class AgentConfig:
     # no value. The execute prompt is rendered with plan="(no plan; spec is
     # in the task body)" so existing template stays valid.
     single_phase: bool = False
+    # Controls whether the plan-review gate auto-approves without operator
+    # keypress. Allowed values:
+    #   "off"    — default; every plan stops at AWAITING_PLAN_REVIEW.
+    #   "always" — auto-approve every plan; operator owns the risk globally.
+    # Future values ("small" with per-item gating, plus an auto_accept_verifier
+    # knob) are reserved; unknown values fall back to "off" with a stderr
+    # warning so a stale config doesn't silently break the review gate.
+    auto_accept_plan: str = "off"
     # Two-phase flow: agent first produces a plan (no code changes), human
     # reviews, then agent resumes in the same session to execute + commit.
     # Placeholders for both: {title}, {body}, {source_file}. The execute
