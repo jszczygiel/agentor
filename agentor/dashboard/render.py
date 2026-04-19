@@ -375,6 +375,21 @@ def _safe_addstr(stdscr, y, x, s, w, attr=0):
         pass
 
 
+def _handle_resize(stdscr, ch: int) -> bool:
+    """Return True when `ch` is `KEY_RESIZE` and the screen was refreshed.
+    After a terminal shrink the internal curses buffer still holds the
+    wider layout; without an explicit `clear()` + `update_lines_cols()`
+    the stale cells wrap in the narrower terminal and push row 0 off
+    screen. Callers typically `continue` their loop so the next tick
+    repaints at the new size."""
+    if ch != curses.KEY_RESIZE:
+        return False
+    if hasattr(curses, "update_lines_cols"):
+        curses.update_lines_cols()
+    stdscr.clear()
+    return True
+
+
 def _render_table(
     stdscr, store, top, height, w, statuses, context_window,
     selected_id: str | None = None,
@@ -545,6 +560,8 @@ def _show_help(stdscr) -> None:
             content_scroll=scroll,
         )
         ch = stdscr.getch()
+        if _handle_resize(stdscr, ch):
+            continue
         new_scroll = _scroll_key(ch, scroll, len(lines), max(1, h - 4))
         if new_scroll >= 0:
             scroll = new_scroll
@@ -567,6 +584,8 @@ def _view_text_in_curses(stdscr, text: str) -> None:
             content_scroll=scroll,
         )
         ch = stdscr.getch()
+        if _handle_resize(stdscr, ch):
+            continue
         new_scroll = _scroll_key(ch, scroll, len(lines), max(1, h - 4))
         if new_scroll >= 0:
             scroll = new_scroll
@@ -649,7 +668,8 @@ def _run_with_progress(
                          " working… keystrokes ignored ".ljust(w), w,
                          curses.A_DIM | curses.A_REVERSE)
             stdscr.refresh()
-            stdscr.getch()  # drain; timeout returns -1
+            ch = stdscr.getch()  # drain; timeout returns -1
+            _handle_resize(stdscr, ch)
             tick += 1
             if not t.is_alive():
                 break
@@ -666,14 +686,18 @@ def _prompt_yn(stdscr, message: str) -> bool:
     Leaves the window in blocking mode (nodelay=False) — callers run a
     follow-up getch loop that must block. Top-level modes reset nodelay
     themselves on exit."""
-    h, w = stdscr.getmaxyx()
-    _safe_addstr(stdscr, h - 1, 0, (" " + message + " [y/N] ").ljust(w), w,
-                 curses.A_BOLD | curses.A_REVERSE)
-    stdscr.refresh()
     stdscr.nodelay(False)
-    ch = stdscr.getch()
-    k = chr(ch).lower() if 0 < ch < 256 else ""
-    return k == "y"
+    while True:
+        h, w = stdscr.getmaxyx()
+        _safe_addstr(stdscr, h - 1, 0,
+                     (" " + message + " [y/N] ").ljust(w), w,
+                     curses.A_BOLD | curses.A_REVERSE)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if _handle_resize(stdscr, ch):
+            continue
+        k = chr(ch).lower() if 0 < ch < 256 else ""
+        return k == "y"
 
 
 def _prompt_text(stdscr, message: str) -> str:

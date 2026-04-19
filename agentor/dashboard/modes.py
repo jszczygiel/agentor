@@ -25,6 +25,7 @@ from .formatters import (
 from .render import (
     REFRESH_MS,
     _flash,
+    _handle_resize,
     _prompt_multiline,
     _prompt_text,
     _prompt_yn,
@@ -197,6 +198,8 @@ def _inspect_render(
             )
             ch = stdscr.getch()
             if ch == -1:
+                continue
+            if _handle_resize(stdscr, ch):
                 continue
             new_scroll = _scroll_key(ch, scroll, len(lines), max(1, h - 4))
             if new_scroll >= 0:

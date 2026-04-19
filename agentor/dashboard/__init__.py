@@ -8,6 +8,7 @@ from ..store import Store, StoredItem
 from .render import (
     FILTERS,
     REFRESH_MS,
+    _handle_resize,
     _init_colors,
     _render,
     _set_terminal_title,
@@ -91,6 +92,8 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
                 # terminal and the process exits.
                 return
             if ch == -1:
+                continue
+            if _handle_resize(stdscr, ch):
                 continue
             k = chr(ch).lower() if 0 < ch < 256 else ""
 

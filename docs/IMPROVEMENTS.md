@@ -39,3 +39,10 @@ the current task's scope.
   that moved to `_prompt_multiline` — operators would benefit from newlines
   and wrapping. Deferred to keep the multi-line-feedback task on its stated
   scope ("at least the feedback-reject paths").
+- `_prompt_multiline` (`dashboard/render.py`) does not reflow on terminal
+  resize: `curses.textpad.Textbox.edit` blocks inside a validator loop, and
+  KEY_RESIZE (410) is treated as a literal input char. Minimum-viable fix
+  is returning 0 from the validator when `ch == curses.KEY_RESIZE`; a proper
+  fix tears down and recreates `edit_win` / `frame` at the new dims so the
+  overlay re-centres. Scope kept to getch-based mode loops for the
+  top-line-hidden task.
