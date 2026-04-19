@@ -26,3 +26,8 @@ the current task's scope.
   automatic. Consider tagging the transition note (or surfacing an auto-resolve
   badge in the main table) so operators can distinguish a human `[e]` resubmit
   from a committer-driven one.
+- The new-issue bug/idea note prompt at `dashboard/modes.py:784` is still
+  single-line (`_prompt_text`). Same long-form argument as the feedback paths
+  that moved to `_prompt_multiline` — operators would benefit from newlines
+  and wrapping. Deferred to keep the multi-line-feedback task on its stated
+  scope ("at least the feedback-reject paths").
