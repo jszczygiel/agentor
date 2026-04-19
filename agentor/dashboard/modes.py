@@ -51,6 +51,9 @@ from .transcript import (
 # `delete_idea` → `Store.delete_item` (see `_inspect_dispatch`).
 _ACTION_KEYS_BY_STATUS: dict[ItemStatus, list[tuple[str, str]]] = {
     ItemStatus.QUEUED: [
+        ("f", "[f]eedback"),
+        ("r", "[r]eject+feedback"),
+        ("s", "[s]defer"),
         ("x", "[x]delete"),
     ],
     ItemStatus.WORKING: [
@@ -300,11 +303,13 @@ def _inspect_dispatch(
         approve_plan,
         defer,
         delete_idea,
+        reject,
         reject_and_retry,
         restore_deferred,
         resubmit_conflicted,
         retry,
         retry_merge,
+        set_feedback,
     )
 
     status = item.status
@@ -321,6 +326,27 @@ def _inspect_dispatch(
         if not deleted:
             return True, "already deleted"
         return True, "deleted"
+
+    if status == ItemStatus.QUEUED:
+        if key == "f":
+            feedback = _prompt_multiline(
+                stdscr, "feedback for next run"
+            )
+            if not feedback:
+                return False, ""
+            set_feedback(store, item, feedback)
+            return True, "feedback seeded"
+        if key == "r":
+            feedback = _prompt_multiline(
+                stdscr, "feedback (reject reason)"
+            )
+            if not feedback:
+                return False, ""
+            reject(store, item, feedback)
+            return True, "rejected"
+        if key == "s":
+            defer(store, item)
+            return True, "deferred"
 
     if status == ItemStatus.AWAITING_PLAN_REVIEW:
         if key == "a":
