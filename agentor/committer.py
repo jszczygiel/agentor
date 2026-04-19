@@ -1,13 +1,17 @@
 import json
 import subprocess
 import threading
+import time
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from . import git_ops
 from .config import Config
 from .models import ItemStatus
 from .store import Store, StoredItem
+
+if TYPE_CHECKING:  # pragma: no cover — import cycle guard only
+    from .daemon import Daemon
 
 ProgressCb = Callable[[str], None]
 
@@ -380,14 +384,69 @@ def retry(store: Store, item: StoredItem) -> None:
     )
 
 
-def delete_idea(store: Store, item: StoredItem) -> None:
-    """User rejected an idea at pickup — park it in CANCELLED so scan_once
-    doesn't re-enqueue it from the source markdown on the next pass. Source
-    file is left intact; user can remove the markdown entry whenever."""
+_DELETE_WAIT_SECONDS = 5.0
+_DELETE_POLL_INTERVAL = 0.1
+
+
+def delete_idea(
+    config: Config | None, store: Store, daemon: "Daemon | None",
+    item: StoredItem,
+) -> bool:
+    """Unified delete for the inspect view. Parks `item` in CANCELLED from
+    any status, tearing down live runner state on the way. Returns True when
+    a transition happened, False when the item was already CANCELLED.
+
+    Teardown order matters:
+      1. If WORKING, signal the registered subprocess via
+         `daemon.proc_registry.kill_one(item.id)` and poll the store until
+         the runner's own error path writes a terminal-ish status (ERRORED /
+         QUEUED / AWAITING_*). Bounded at ~5s so a wedged runner can't hang
+         the dashboard.
+      2. If a worktree_path is recorded (live, resumable, or forensic),
+         force-remove the git worktree, prune stale registrations, and
+         force-delete the feature branch. Best-effort — git errors don't
+         block the CANCELLED transition.
+      3. Write the final transition LAST. Any error-path row the runner
+         dropped in step 1 is shadowed by this write, so CANCELLED wins.
+
+    `config` is only required for worktree/branch cleanup; callers that
+    know the item has no worktree (e.g. legacy DEFERRED-only pickups) may
+    pass None. `daemon` is only needed to kill a live subprocess; None is
+    safe for non-WORKING items."""
+    prev_status = item.status
+    if prev_status == ItemStatus.CANCELLED:
+        return False
+
+    if prev_status == ItemStatus.WORKING and daemon is not None:
+        daemon.proc_registry.kill_one(item.id)
+        deadline = time.monotonic() + _DELETE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            refreshed = store.get(item.id)
+            if refreshed is None or refreshed.status != ItemStatus.WORKING:
+                break
+            time.sleep(_DELETE_POLL_INTERVAL)
+
+    if config is not None and item.worktree_path:
+        wt = Path(item.worktree_path)
+        try:
+            git_ops.worktree_remove(config.project_root, wt, force=True)
+            git_ops.worktree_prune(config.project_root)
+        except git_ops.GitError:
+            pass
+        if item.branch:
+            try:
+                git_ops.branch_delete(
+                    config.project_root, item.branch, force=True,
+                )
+            except git_ops.GitError:
+                pass
+
     store.transition(
         item.id, ItemStatus.CANCELLED,
-        note=f"deleted from pickup (was {item.status.value})",
+        worktree_path=None, branch=None, session_id=None, last_error=None,
+        note=f"deleted from {prev_status.value}",
     )
+    return True
 
 
 def defer(store: Store, item: StoredItem) -> None:

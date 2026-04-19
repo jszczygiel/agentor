@@ -44,35 +44,57 @@ from .transcript import (
 # Unified action keymap per item status. Each entry is (key, label).
 # The inspect view renders these as footer hints and gates keystrokes
 # against the set so a key only fires when the status allows it.
-# Terminal states (MERGED, CANCELLED, APPROVED) and mid-flight states
-# (WORKING, QUEUED) intentionally have no entries — view-only.
+# `[x]delete` is bound on every status — operators want one consistent
+# way to remove the current row regardless of lifecycle position. The
+# dispatcher tears down live runner state (subprocess, worktree, branch)
+# before transitioning to CANCELLED (see `_inspect_dispatch`).
 _ACTION_KEYS_BY_STATUS: dict[ItemStatus, list[tuple[str, str]]] = {
+    ItemStatus.QUEUED: [
+        ("x", "[x]delete"),
+    ],
+    ItemStatus.WORKING: [
+        ("x", "[x]delete"),
+    ],
     ItemStatus.AWAITING_PLAN_REVIEW: [
         ("a", "[a]approve→execute"),
         ("f", "[f]approve+feedback"),
         ("r", "[r]eject+feedback"),
         ("s", "[s]defer"),
+        ("x", "[x]delete"),
     ],
     ItemStatus.AWAITING_REVIEW: [
         ("a", "[a]approve+merge"),
         ("r", "[r]eject+feedback"),
         ("s", "[s]defer"),
         ("v", "[v]diff"),
+        ("x", "[x]delete"),
     ],
     ItemStatus.CONFLICTED: [
         ("m", "[m]retry merge"),
         ("e", "[e]resubmit to agent"),
         ("s", "[s]defer"),
+        ("x", "[x]delete"),
     ],
     ItemStatus.ERRORED: [
         ("a", "[a]retry"),
         ("s", "[s]defer"),
+        ("x", "[x]delete"),
     ],
     ItemStatus.REJECTED: [
         ("a", "[a]retry"),
+        ("x", "[x]delete"),
     ],
     ItemStatus.DEFERRED: [
         ("a", "[a]restore"),
+        ("x", "[x]delete"),
+    ],
+    ItemStatus.APPROVED: [
+        ("x", "[x]delete"),
+    ],
+    ItemStatus.MERGED: [
+        ("x", "[x]delete"),
+    ],
+    ItemStatus.CANCELLED: [
         ("x", "[x]delete"),
     ],
 }
@@ -286,6 +308,18 @@ def _inspect_dispatch(
 
     status = item.status
 
+    # Delete is wired on every status — handle it once here so every
+    # per-status branch doesn't need to duplicate the confirm + teardown
+    # dance. `delete_idea` kills any live runner subprocess, removes the
+    # worktree + branch, and transitions to CANCELLED.
+    if key == "x":
+        if not _prompt_yn(stdscr, "delete this item?"):
+            return False, ""
+        changed = delete_idea(cfg, store, daemon, item)
+        if not changed:
+            return True, "already cancelled"
+        return True, "deleted"
+
     if status == ItemStatus.AWAITING_PLAN_REVIEW:
         if key == "a":
             approve_plan(store, item)
@@ -398,11 +432,6 @@ def _inspect_dispatch(
             if daemon is not None:
                 daemon.try_fill_pool()
             return True, "restored"
-        if key == "x":
-            if not _prompt_yn(stdscr, "delete this idea?"):
-                return False, ""
-            delete_idea(store, item)
-            return True, "deleted"
 
     return False, ""
 

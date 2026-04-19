@@ -107,6 +107,26 @@ class ProcRegistry:
                     pass
         return len(live)
 
+    def kill_one(self, key: str) -> bool:
+        """Signal a single registered subprocess — operator-initiated delete
+        of a WORKING item. Same SIGTERM→wait→SIGKILL pattern as `kill_all`
+        but scoped to one key. Returns True when a live process was
+        signalled, False when no entry exists or it had already exited."""
+        with self._lock:
+            p = self._procs.pop(key, None)
+        if p is None or p.poll() is not None:
+            return False
+        _signal_group(p, signal.SIGTERM)
+        try:
+            p.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            _signal_group(p, signal.SIGKILL)
+            try:
+                p.wait(timeout=2.0)
+            except Exception:
+                pass
+        return True
+
 
 def _signal_group(p: subprocess.Popen, sig: int) -> None:
     try:
