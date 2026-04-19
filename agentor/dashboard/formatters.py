@@ -302,13 +302,36 @@ def _fmt_token_line(label: str, totals: dict) -> str:
             f"Σ {_fmt_tokens(int(totals.get('total', 0))):>6}")
 
 
-def _fmt_token_compact(windows: dict) -> str:
+def _fmt_pct_of_budget(total: int, budget: int) -> str:
+    """Render `(NN%)` suffix for the status-line rate-limit readout.
+    Empty when budget is 0 (operator hasn't configured one). Clamps at
+    `>99%` so a busted budget doesn't spam 4-digit percentages into the
+    status line."""
+    if budget <= 0:
+        return ""
+    pct = int(total * 100 / budget)
+    if pct > 99:
+        return " (>99%)"
+    return f" ({pct}%)"
+
+
+def _fmt_token_compact(windows: dict, agent_cfg=None) -> str:
     """One-glance session + weekly totals for the status line. Full breakdown
     stays in the token panel; this is the at-a-glance "am I burning tokens
-    faster than last week?" readout."""
+    faster than last week?" readout. When `agent_cfg` supplies non-zero
+    `session_token_budget` / `weekly_token_budget`, append a `(NN%)` suffix
+    so operators can eyeball their proximity to throttling. Claude's stream-
+    json feed strips the `anthropic-ratelimit-*` response headers today, so
+    the % is budget-derived; if the CLI later surfaces live quotas, the
+    harvester in `_StreamState` already captures them for a future upgrade."""
     sess = int(windows.get("session", {}).get("total", 0))
     wk = int(windows.get("7d", {}).get("total", 0))
-    return f"tok sess={_fmt_tokens(sess)}  wk={_fmt_tokens(wk)}"
+    sess_pct = _fmt_pct_of_budget(
+        sess, getattr(agent_cfg, "session_token_budget", 0) or 0)
+    wk_pct = _fmt_pct_of_budget(
+        wk, getattr(agent_cfg, "weekly_token_budget", 0) or 0)
+    return (f"tok sess={_fmt_tokens(sess)}{sess_pct}  "
+            f"wk={_fmt_tokens(wk)}{wk_pct}")
 
 
 def _fmt_token_line_mid(label: str, totals: dict) -> str:

@@ -193,7 +193,7 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     # Compute once and reuse — the token-windows cache makes the second
     # call free but explicit sharing keeps the data-flow obvious.
     token_windows = _token_windows(store, daemon.started_at)
-    token_compact = _fmt_token_compact(token_windows)
+    token_compact = _fmt_token_compact(token_windows, cfg.agent)
     status_line = _build_status_line(
         tier, cfg, s, counts, len(daemon.workers),
         token_compact=token_compact,

@@ -1327,11 +1327,35 @@ class _StreamState:
         # so the checkpoint emitter can gate on "doing too much in-context"
         # without recomputing from `iterations` on every event.
         self.total_output_tokens: int = 0
+        # Latest-wins capture of any `rate_limit`/`ratelimits`/`anthropic-
+        # ratelimit-*` field the claude CLI might surface in future versions.
+        # The current CLI strips the response headers, so this stays None in
+        # practice and the dashboard falls back to budget-derived %. Kept as
+        # a passive harvester so that if Anthropic later exposes quota hints
+        # in stream-json, we start recording them without further work.
+        self.rate_limits: dict | None = None
+
+    def _harvest_rate_limits(self, ev: dict) -> None:
+        """Look for rate-limit hints on the event and nested message/usage
+        dicts. Latest-wins — each call overwrites any prior sample. Flat
+        dict lookup only (no recursive walk) to keep per-event cost O(1)."""
+        msg = ev.get("message") if isinstance(ev.get("message"), dict) else None
+        msg_usage = msg.get("usage") if isinstance(msg, dict) else None
+        for scope in (ev, msg, ev.get("usage"), msg_usage):
+            if not isinstance(scope, dict):
+                continue
+            for key in ("rate_limit", "rate_limits", "ratelimits",
+                        "anthropic-ratelimit", "anthropic_ratelimit"):
+                val = scope.get(key)
+                if isinstance(val, dict) and val:
+                    self.rate_limits = val
+                    return
 
     def ingest(self, ev: dict) -> None:
         etype = ev.get("type")
         self.last_event_at = time.time()
         self.last_event_type = str(etype or "unknown")
+        self._harvest_rate_limits(ev)
         if etype == "system" and ev.get("subtype") == "init":
             if ev.get("session_id"):
                 self.session_id = ev["session_id"]
@@ -1414,6 +1438,8 @@ class _StreamState:
             out["session_id"] = self.session_id
         if self.result_text:
             out["result"] = self.result_text
+        if self.rate_limits:
+            out["rate_limits"] = self.rate_limits
         progress: dict[str, object] = {}
         if self.last_event_at is not None:
             progress["last_event_at"] = self.last_event_at

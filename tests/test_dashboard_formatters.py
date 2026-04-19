@@ -232,6 +232,78 @@ class TestFmtTokenCompact(unittest.TestCase):
         )
 
 
+class _FakeAgentCfg:
+    def __init__(self, session_token_budget=0, weekly_token_budget=0):
+        self.session_token_budget = session_token_budget
+        self.weekly_token_budget = weekly_token_budget
+
+
+class TestFmtTokenCompactPct(unittest.TestCase):
+    def test_no_suffix_when_budgets_zero(self):
+        windows = {"session": {"total": 1500}, "7d": {"total": 2_300_000}}
+        cfg = _FakeAgentCfg()
+        self.assertEqual(
+            _fmt_token_compact(windows, cfg),
+            "tok sess=1.5k  wk=2.3M",
+        )
+
+    def test_pct_suffix_when_budgets_set(self):
+        windows = {
+            "session": {"total": 500_000},
+            "7d": {"total": 5_000_000},
+        }
+        cfg = _FakeAgentCfg(
+            session_token_budget=1_000_000,
+            weekly_token_budget=10_000_000,
+        )
+        self.assertEqual(
+            _fmt_token_compact(windows, cfg),
+            "tok sess=500.0k (50%)  wk=5.0M (50%)",
+        )
+
+    def test_zero_totals_render_zero_pct(self):
+        windows = {"session": {"total": 0}, "7d": {"total": 0}}
+        cfg = _FakeAgentCfg(
+            session_token_budget=1_000_000,
+            weekly_token_budget=10_000_000,
+        )
+        self.assertEqual(
+            _fmt_token_compact(windows, cfg),
+            "tok sess=0 (0%)  wk=0 (0%)",
+        )
+
+    def test_overbudget_clamps_to_gt99(self):
+        windows = {
+            "session": {"total": 2_000_000},
+            "7d": {"total": 20_000_000},
+        }
+        cfg = _FakeAgentCfg(
+            session_token_budget=1_000_000,
+            weekly_token_budget=10_000_000,
+        )
+        self.assertEqual(
+            _fmt_token_compact(windows, cfg),
+            "tok sess=2.0M (>99%)  wk=20.0M (>99%)",
+        )
+
+    def test_only_session_budget_set(self):
+        # Partial config: only one budget is honored, the other stays
+        # suffix-less so operators aren't forced to set both.
+        windows = {"session": {"total": 500_000}, "7d": {"total": 5_000_000}}
+        cfg = _FakeAgentCfg(session_token_budget=1_000_000)
+        self.assertEqual(
+            _fmt_token_compact(windows, cfg),
+            "tok sess=500.0k (50%)  wk=5.0M",
+        )
+
+    def test_agent_cfg_none_behaves_like_unconfigured(self):
+        windows = {"session": {"total": 1500}, "7d": {"total": 2_300_000}}
+        self.assertEqual(
+            _fmt_token_compact(windows, None),
+            "tok sess=1.5k  wk=2.3M",
+        )
+
+
 class TestTokenWindows(unittest.TestCase):
     def setUp(self):
         self.td = TemporaryDirectory()
