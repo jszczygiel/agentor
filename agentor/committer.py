@@ -1,4 +1,5 @@
 import subprocess
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -8,6 +9,16 @@ from .models import ItemStatus
 from .store import Store, StoredItem
 
 ProgressCb = Callable[[str], None]
+
+# Process-wide serialisation of base-branch updates. `approve_and_commit`
+# and `retry_merge` both spawn a detached ephemeral worktree off the
+# current tip of `git.base_branch` and CAS-advance the ref. Two integrations
+# running concurrently would race: the second one's `update-ref OLD NEW`
+# trips on a stale OLD and transitions CONFLICTED with a spurious
+# "ref changed under us" error for work that wasn't actually conflicting.
+# Holding this lock over only the integration block (not the per-feature
+# commit / rebase-in-place) keeps the serialisation window tight.
+_INTEGRATION_LOCK = threading.Lock()
 
 
 def _noop(_msg: str) -> None:
@@ -93,43 +104,44 @@ def approve_and_commit(
     tmp_root = repo / ".agentor" / "merge-tmp"
     mode = config.git.merge_mode
     verb = "rebasing onto" if mode == "rebase" else "merging into"
-    p(f"{verb} {config.git.base_branch}")
-    merge_sha, conflict = git_ops.merge_feature_into_base(
-        repo, item.branch, config.git.base_branch,
-        message=f"Merge branch '{item.branch}' into {config.git.base_branch}"
-                f"\n\n{message}",
-        tmp_root=tmp_root, mode=mode,
-    )
-    if conflict is not None:
-        # Keep the worktree and branch — user resolves by hand, then calls
-        # retry_merge (inspect [m]) once the conflict is fixed.
-        summary = _build_conflict_summary(
-            item, mode, config.git.base_branch, conflict,
+    with _INTEGRATION_LOCK:
+        p(f"{verb} {config.git.base_branch}")
+        merge_sha, conflict = git_ops.merge_feature_into_base(
+            repo, item.branch, config.git.base_branch,
+            message=f"Merge branch '{item.branch}' into {config.git.base_branch}"
+                    f"\n\n{message}",
+            tmp_root=tmp_root, mode=mode,
         )
-        store.transition(
-            item.id, ItemStatus.CONFLICTED,
-            last_error=summary[:4000],
-            note=f"{mode} into {config.git.base_branch} conflicted; "
-                 f"feature branch {item.branch} kept",
-        )
-        if config.git.auto_resolve_conflicts:
-            p("auto-resubmitting for agent conflict resolution")
-            refreshed = store.get(item.id)
-            if refreshed is not None and \
-                    refreshed.status == ItemStatus.CONFLICTED:
-                resubmit_conflicted(config, store, refreshed)
-        return sha
+        if conflict is not None:
+            # Keep the worktree and branch — user resolves by hand, then calls
+            # retry_merge (inspect [m]) once the conflict is fixed.
+            summary = _build_conflict_summary(
+                item, mode, config.git.base_branch, conflict,
+            )
+            store.transition(
+                item.id, ItemStatus.CONFLICTED,
+                last_error=summary[:4000],
+                note=f"{mode} into {config.git.base_branch} conflicted; "
+                     f"feature branch {item.branch} kept",
+            )
+            if config.git.auto_resolve_conflicts:
+                p("auto-resubmitting for agent conflict resolution")
+                refreshed = store.get(item.id)
+                if refreshed is not None and \
+                        refreshed.status == ItemStatus.CONFLICTED:
+                    resubmit_conflicted(config, store, refreshed)
+            return sha
 
-    assert merge_sha is not None
-    p("cleaning up worktree and branch")
-    git_ops.worktree_remove(repo, wt, force=False)
-    git_ops.branch_delete(repo, item.branch, force=True)
-    store.transition(
-        item.id, ItemStatus.MERGED,
-        note=f"{note_prefix} {sha[:8]}, {mode}d {merge_sha[:8]} into "
-             f"{config.git.base_branch}",
-    )
-    return sha
+        assert merge_sha is not None
+        p("cleaning up worktree and branch")
+        git_ops.worktree_remove(repo, wt, force=False)
+        git_ops.branch_delete(repo, item.branch, force=True)
+        store.transition(
+            item.id, ItemStatus.MERGED,
+            note=f"{note_prefix} {sha[:8]}, {mode}d {merge_sha[:8]} into "
+                 f"{config.git.base_branch}",
+        )
+        return sha
 
 
 def retry_merge(
@@ -163,34 +175,35 @@ def retry_merge(
     tmp_root = repo / ".agentor" / "merge-tmp"
     mode = config.git.merge_mode
     verb = "rebasing onto" if mode == "rebase" else "merging into"
-    p(f"{verb} {config.git.base_branch} (retry)")
-    merge_sha, conflict = git_ops.merge_feature_into_base(
-        repo, item.branch, config.git.base_branch,
-        message=f"Merge branch '{item.branch}' into {config.git.base_branch}"
-                f" (retry)",
-        tmp_root=tmp_root, mode=mode,
-    )
-    if conflict is not None:
-        summary = _build_conflict_summary(
-            item, mode, config.git.base_branch, conflict, retry=True,
+    with _INTEGRATION_LOCK:
+        p(f"{verb} {config.git.base_branch} (retry)")
+        merge_sha, conflict = git_ops.merge_feature_into_base(
+            repo, item.branch, config.git.base_branch,
+            message=f"Merge branch '{item.branch}' into {config.git.base_branch}"
+                    f" (retry)",
+            tmp_root=tmp_root, mode=mode,
         )
-        store.transition(
-            item.id, ItemStatus.CONFLICTED,
-            last_error=summary[:4000],
-            note=f"retry {mode} still conflicts on {config.git.base_branch}",
-        )
-        return False, f"still conflicted: {conflict.splitlines()[0] if conflict else '?'}"
+        if conflict is not None:
+            summary = _build_conflict_summary(
+                item, mode, config.git.base_branch, conflict, retry=True,
+            )
+            store.transition(
+                item.id, ItemStatus.CONFLICTED,
+                last_error=summary[:4000],
+                note=f"retry {mode} still conflicts on {config.git.base_branch}",
+            )
+            return False, f"still conflicted: {conflict.splitlines()[0] if conflict else '?'}"
 
-    assert merge_sha is not None
-    p("cleaning up worktree and branch")
-    git_ops.worktree_remove(repo, wt, force=False)
-    git_ops.branch_delete(repo, item.branch, force=True)
-    store.transition(
-        item.id, ItemStatus.MERGED,
-        last_error=None,
-        note=f"resolved — {mode}d {merge_sha[:8]} into {config.git.base_branch}",
-    )
-    return True, f"{mode}d {merge_sha[:8]} into {config.git.base_branch}"
+        assert merge_sha is not None
+        p("cleaning up worktree and branch")
+        git_ops.worktree_remove(repo, wt, force=False)
+        git_ops.branch_delete(repo, item.branch, force=True)
+        store.transition(
+            item.id, ItemStatus.MERGED,
+            last_error=None,
+            note=f"resolved — {mode}d {merge_sha[:8]} into {config.git.base_branch}",
+        )
+        return True, f"{mode}d {merge_sha[:8]} into {config.git.base_branch}"
 
 
 def resubmit_conflicted(
