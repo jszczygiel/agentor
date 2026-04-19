@@ -172,6 +172,12 @@ class AgentConfig:
     checkpoint_tokens_template: str = DEFAULT_TOKENS_TEMPLATE
     build_cmd: str | None = None
     test_cmd: str | None = None
+    # Threshold (in lines) above which a `Read` tool call MUST pass
+    # `offset` or `limit`; enforced by a PreToolUse hook wired into the
+    # Claude runner via a generated settings JSON. 0 disables the hook.
+    # Custom `agent.command` overrides that drop the `{settings_path}`
+    # placeholder silently skip enforcement.
+    large_file_line_threshold: int = 400
 
 
 @dataclass

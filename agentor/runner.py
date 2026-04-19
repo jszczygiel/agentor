@@ -14,6 +14,7 @@ from . import git_ops
 from .checkpoint import CheckpointConfig, CheckpointEmitter
 from .config import Config
 from .models import ItemStatus
+from .resume_primer import build_primer
 from .slug import slugify
 from .store import Store, StoredItem
 
@@ -640,6 +641,17 @@ class ClaudeRunner(Runner):
             plan=plan,
         )
         prompt += _mark_done_instruction(self.config, item.source_file)
+        # Kill-resume primer. An existing `.execute.log` means a prior
+        # attempt was interrupted (e.g. `agentor shutdown` mid-run). The
+        # resumed claude session keeps its prompt cache but has no
+        # structured record of which files it already Read/Grep'd, so it
+        # cold-starts discovery and re-Reads — ~18k tokens wasted in the
+        # worst observed case. Summarise the prior tool activity and
+        # prepend it so the agent knows what not to re-fetch. The subprocess
+        # will overwrite this log on start, so we read it before launching.
+        primer = build_primer(self._execute_transcript_path(item))
+        if primer:
+            prompt = f"{primer}\n{prompt}"
         prompt = self._prepend_feedback(item, prompt, phase="execute")
         summary, stdout = self._invoke_claude(item, worktree, prompt)
         files = _list_changes(worktree, self.config.git.base_branch)
@@ -678,6 +690,15 @@ class ClaudeRunner(Runner):
         )
         return block + prompt
 
+    def _transcript_path(self, item: StoredItem, phase_tag: str) -> Path:
+        return (
+            self.config.project_root / ".agentor" / "transcripts"
+            / f"{item.id}.{phase_tag}.log"
+        )
+
+    def _execute_transcript_path(self, item: StoredItem) -> Path:
+        return self._transcript_path(item, "execute")
+
     def _invoke_claude(
         self, item: StoredItem, worktree: Path, prompt: str,
     ) -> tuple[str, str]:
@@ -690,8 +711,13 @@ class ClaudeRunner(Runner):
         the output format and fall back to blocking subprocess.run."""
         template = self.config.agent.command or _default_claude_command()
         legacy_prompt_arg = _command_has_prompt_placeholder(template)
+        settings_path = write_claude_settings(self.config, item.id)
         args = [
-            a.format(prompt=prompt, model=self.config.agent.model)
+            a.format(
+                prompt=prompt,
+                model=self.config.agent.model,
+                settings_path=str(settings_path),
+            )
             for a in template
         ]
 
@@ -711,10 +737,7 @@ class ClaudeRunner(Runner):
             args += ["--session-id", session_id]
 
         phase_tag = "execute" if had_session else "plan"
-        transcript_path = (
-            self.config.project_root / ".agentor" / "transcripts"
-            / f"{item.id}.{phase_tag}.log"
-        )
+        transcript_path = self._transcript_path(item, phase_tag)
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
 
         streaming = "stream-json" in args
@@ -1375,8 +1398,14 @@ def _default_claude_command() -> list[str]:
     # that still set `agent.command = [..., "-p", "{prompt}", ...]` keep
     # working — the runner detects the placeholder and falls back to the
     # single-shot invocation (no mid-run injection).
+    #
+    # `--settings {settings_path}` points Claude at a per-run JSON that
+    # registers a PreToolUse hook blocking whole-file `Read` calls on
+    # files above `agent.large_file_line_threshold`. Custom overrides that
+    # drop this placeholder silently disable enforcement.
     return [
         "claude", "-p", "--dangerously-skip-permissions",
+        "--settings", "{settings_path}",
         "--input-format", "stream-json",
         "--output-format", "stream-json", "--verbose",
     ]
@@ -1397,6 +1426,42 @@ def _command_has_prompt_placeholder(args: list[str]) -> bool:
     stream-json stdin path does not. Used to pick single-shot vs
     injection-capable invocation."""
     return any("{prompt}" in a for a in args)
+
+
+def _read_hook_path() -> Path:
+    """Absolute path to the shipped PreToolUse hook script."""
+    return (Path(__file__).resolve().parent / "read_hook.py")
+
+
+def write_claude_settings(
+    config: Config, item_id: str,
+) -> Path:
+    """Write a Claude settings JSON registering the large-file Read hook
+    into `<project>/.agentor/claude-settings/<item_id>.json`. When the
+    threshold is <= 0 the file still exists (claude needs a readable
+    --settings path) but its hooks list is empty."""
+    threshold = int(config.agent.large_file_line_threshold or 0)
+    settings_dir = (
+        config.project_root / ".agentor" / "claude-settings"
+    )
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    settings_path = settings_dir / f"{item_id}.json"
+    settings: dict = {"hooks": {}}
+    if threshold > 0:
+        hook_cmd = (
+            f"AGENTOR_READ_THRESHOLD={threshold} "
+            f"python3 {_read_hook_path()}"
+        )
+        settings["hooks"] = {
+            "PreToolUse": [
+                {
+                    "matcher": "Read",
+                    "hooks": [{"type": "command", "command": hook_cmd}],
+                }
+            ]
+        }
+    settings_path.write_text(json.dumps(settings, indent=2))
+    return settings_path
 
 
 def _default_codex_resume_command() -> list[str]:

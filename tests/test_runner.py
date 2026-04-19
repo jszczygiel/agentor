@@ -13,7 +13,9 @@ from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
 from agentor.models import ItemStatus
 from agentor.recovery import recover_on_startup
 from agentor.runner import (CodexRunner, StubRunner,
-                            _mark_done_instruction, make_runner, plan_worktree)
+                            _default_claude_command,
+                            _mark_done_instruction, make_runner, plan_worktree,
+                            write_claude_settings)
 from agentor.store import Store
 from agentor.watcher import scan_once
 
@@ -431,6 +433,137 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"here is the plan",
                          "plan phase is read-only; no deletion instruction")
         self.assertIn("Source-file removal", exec_block)
         self.assertIn("docs/ideas/bug-a.md", exec_block)
+
+    def test_do_execute_injects_primer_when_prior_execute_log_exists(self):
+        """Kill-resume primer. When a `.execute.log` already exists at the
+        start of the execute phase (prior attempt was killed mid-run), its
+        tool-use history must be summarised into the next execute prompt so
+        the resumed agent doesn't cold-start discovery."""
+        bin_dir = Path(self.td.name) / "bin"
+        prompt_log = Path(self.td.name) / "prompts.log"
+        _write_fake_claude(
+            bin_dir, f'printf "%s\\n---\\n" "$2" >> "{prompt_log}"\n',
+        )
+        cfg = Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                runner="claude", pool_size=1, max_attempts=1,
+                command=[str(bin_dir / "claude"), "-p", "{prompt}"],
+                plan_prompt_template="PLAN: {title}",
+                execute_prompt_template="EXEC: {title}\nplan={plan}",
+                timeout_seconds=10,
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        runner = make_runner(cfg, self.store)
+        runner.run(claimed)  # plan phase
+        fresh = self.store.get(claimed.id)
+        self.assertEqual(fresh.status, ItemStatus.AWAITING_PLAN_REVIEW)
+
+        # Seed a synthetic killed-execute-run transcript before the approve →
+        # execute handoff. Three assistant turns, three tool calls.
+        transcript_path = (
+            self.root / ".agentor" / "transcripts"
+            / f"{fresh.id}.execute.log"
+        )
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _ev_tool_call(name, inp, tid):
+            return json.dumps({
+                "type": "assistant",
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "usage": {"input_tokens": 5, "output_tokens": 5},
+                    "content": [{
+                        "type": "tool_use", "id": tid,
+                        "name": name, "input": inp,
+                    }],
+                },
+            })
+
+        def _ev_tool_result(tid, text):
+            return json.dumps({
+                "type": "user",
+                "message": {
+                    "content": [{
+                        "type": "tool_result", "tool_use_id": tid,
+                        "content": text, "is_error": False,
+                    }],
+                },
+            })
+
+        transcript_path.write_text(
+            "stdout:\n"
+            + _ev_tool_call(
+                "Read", {"file_path": "scripts/main/game_world.gd"}, "r1",
+            ) + "\n"
+            + _ev_tool_result("r1", "file contents") + "\n"
+            + _ev_tool_call(
+                "Grep", {"pattern": "zoom_level"}, "g1",
+            ) + "\n"
+            + _ev_tool_result("g1", "scripts/ui/hud.gd\nscripts/camera.gd\n")
+            + "\n"
+            + _ev_tool_call("Bash", {"command": "ls"}, "b1") + "\n"
+            + _ev_tool_result("b1", "total 0") + "\n"
+        )
+
+        approve_plan(self.store, fresh)
+        wt2, br2 = plan_worktree(cfg, fresh)
+        claimed2 = self.store.claim_next_queued(str(wt2), br2)
+        runner.run(claimed2)
+
+        prompts = prompt_log.read_text()
+        _, _, exec_block = prompts.partition("\n---\n")
+        self.assertIn("## Prior run", exec_block)
+        self.assertIn("scripts/main/game_world.gd", exec_block)
+        self.assertIn('"zoom_level"', exec_block)
+        self.assertIn("scripts/ui/hud.gd", exec_block)
+        self.assertNotIn("ls", exec_block.split("plan=")[-1])
+
+    def test_do_execute_omits_primer_when_no_prior_execute_log(self):
+        """Plan→execute handoff (no kill) must not inject a primer — there's
+        no prior execute transcript on disk because plan wrote `.plan.log`."""
+        bin_dir = Path(self.td.name) / "bin"
+        prompt_log = Path(self.td.name) / "prompts.log"
+        _write_fake_claude(
+            bin_dir, f'printf "%s\\n---\\n" "$2" >> "{prompt_log}"\n',
+        )
+        cfg = Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                runner="claude", pool_size=1, max_attempts=1,
+                command=[str(bin_dir / "claude"), "-p", "{prompt}"],
+                plan_prompt_template="PLAN: {title}",
+                execute_prompt_template="EXEC: {title}\nplan={plan}",
+                timeout_seconds=10,
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        runner = make_runner(cfg, self.store)
+        runner.run(claimed)
+        fresh = self.store.get(claimed.id)
+        approve_plan(self.store, fresh)
+        wt2, br2 = plan_worktree(cfg, fresh)
+        claimed2 = self.store.claim_next_queued(str(wt2), br2)
+        runner.run(claimed2)
+
+        prompts = prompt_log.read_text()
+        _, _, exec_block = prompts.partition("\n---\n")
+        self.assertNotIn("## Prior run", exec_block)
 
     def test_claude_runner_timeout(self):
         # sleep > timeout
@@ -1640,6 +1773,68 @@ class TestClaudeRunnerCheckpointInjection(unittest.TestCase):
             self.root / ".agentor" / "transcripts" / f"{item_id}.plan.log"
         ).read_text()
         self.assertIn("checkpoint-observed-dry-run", transcript)
+
+
+class TestClaudeSettingsHookWiring(unittest.TestCase):
+    """The Claude runner must write a per-run settings JSON that registers
+    a PreToolUse hook pointing at the shipped read_hook.py, so whole-file
+    Read calls on large files are blocked before the tool runs."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _cfg(self, threshold: int) -> Config:
+        return Config(
+            project_name="proj", project_root=self.root,
+            sources=SourcesConfig(watch=[], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(large_file_line_threshold=threshold),
+            git=GitConfig(), review=ReviewConfig(),
+        )
+
+    def test_settings_written_with_threshold(self):
+        cfg = self._cfg(threshold=400)
+        path = write_claude_settings(cfg, "abcdef1234")
+        self.assertTrue(path.exists())
+        data = json.loads(path.read_text())
+        pre = data["hooks"]["PreToolUse"]
+        self.assertEqual(len(pre), 1)
+        self.assertEqual(pre[0]["matcher"], "Read")
+        cmd = pre[0]["hooks"][0]["command"]
+        self.assertIn("AGENTOR_READ_THRESHOLD=400", cmd)
+        self.assertIn("read_hook.py", cmd)
+        # The command must reference an absolute hook path so claude can
+        # invoke it regardless of cwd.
+        hook_path_token = [t for t in cmd.split() if t.endswith("read_hook.py")][0]
+        self.assertTrue(Path(hook_path_token).is_absolute())
+        self.assertTrue(Path(hook_path_token).exists())
+
+    def test_settings_disabled_when_threshold_zero(self):
+        cfg = self._cfg(threshold=0)
+        path = write_claude_settings(cfg, "abcdef1234")
+        self.assertTrue(path.exists())
+        data = json.loads(path.read_text())
+        # Hooks object present but empty — claude still accepts --settings
+        # without choking, but no PreToolUse gate is registered.
+        self.assertEqual(data.get("hooks"), {})
+
+    def test_default_claude_command_contains_settings_placeholder(self):
+        cmd = _default_claude_command()
+        self.assertIn("--settings", cmd)
+        self.assertIn("{settings_path}", cmd)
+
+    def test_default_command_formats_with_settings_path(self):
+        cfg = self._cfg(threshold=400)
+        settings = write_claude_settings(cfg, "item-xyz")
+        args = [
+            a.format(prompt="hi", model="claude", settings_path=str(settings))
+            for a in _default_claude_command()
+        ]
+        self.assertIn(str(settings), args)
 
 
 if __name__ == "__main__":
