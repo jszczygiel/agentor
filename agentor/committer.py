@@ -1,8 +1,11 @@
+import fcntl
 import json
+import os
 import subprocess
 import threading
 import time
 from pathlib import Path
+from types import TracebackType
 from typing import TYPE_CHECKING, Callable
 
 from . import git_ops
@@ -15,15 +18,63 @@ if TYPE_CHECKING:  # pragma: no cover — import cycle guard only
 
 ProgressCb = Callable[[str], None]
 
-# Process-wide serialisation of base-branch updates. `approve_and_commit`
+# Intra-process serialisation of base-branch updates. `approve_and_commit`
 # and `retry_merge` both spawn a detached ephemeral worktree off the
 # current tip of `git.base_branch` and CAS-advance the ref. Two integrations
 # running concurrently would race: the second one's `update-ref OLD NEW`
 # trips on a stale OLD and transitions CONFLICTED with a spurious
 # "ref changed under us" error for work that wasn't actually conflicting.
-# Holding this lock over only the integration block (not the per-feature
-# commit / rebase-in-place) keeps the serialisation window tight.
+# Use `_integration_lock(repo)` (not this lock directly) — that wraps the
+# in-process lock with an `fcntl.flock` on `<repo>/.agentor/merge.lock`
+# so two daemon processes on the same repo also serialise.
 _INTEGRATION_LOCK = threading.Lock()
+
+
+_INTEGRATION_LOCK_FILENAME = "merge.lock"
+
+
+class _IntegrationLock:
+    """Hold both `_INTEGRATION_LOCK` (intra-process) and an `fcntl.flock`
+    on `<repo>/.agentor/merge.lock` (cross-process) for the duration of
+    the with-block. Threading lock acquired first so a single process
+    never has two threads in `flock` contention against itself."""
+
+    def __init__(self, repo: Path) -> None:
+        self._repo = repo
+        self._fd: int | None = None
+
+    def __enter__(self) -> None:
+        _INTEGRATION_LOCK.acquire()
+        try:
+            lock_dir = self._repo / ".agentor"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = lock_dir / _INTEGRATION_LOCK_FILENAME
+            self._fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        except BaseException:
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
+            _INTEGRATION_LOCK.release()
+            raise
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        try:
+            if self._fd is not None:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+                os.close(self._fd)
+                self._fd = None
+        finally:
+            _INTEGRATION_LOCK.release()
+
+
+def _integration_lock(repo: Path) -> _IntegrationLock:
+    return _IntegrationLock(repo)
 
 
 def _noop(_msg: str) -> None:
@@ -167,7 +218,7 @@ def approve_and_commit(
     tmp_root = repo / ".agentor" / "merge-tmp"
     mode = config.git.merge_mode
     verb = "rebasing onto" if mode == "rebase" else "merging into"
-    with _INTEGRATION_LOCK:
+    with _integration_lock(repo):
         # Capture pre-CAS state under the lock: the base sha the CAS will
         # use as OLD, plus whether the user's checkout is safely advanceable.
         # Once merge_feature_into_base runs, refs/heads/<base> has moved and
@@ -253,7 +304,7 @@ def retry_merge(
     tmp_root = repo / ".agentor" / "merge-tmp"
     mode = config.git.merge_mode
     verb = "rebasing onto" if mode == "rebase" else "merging into"
-    with _INTEGRATION_LOCK:
+    with _integration_lock(repo):
         base_sha_before = git_ops.run(
             repo, "rev-parse", f"refs/heads/{config.git.base_branch}",
         ).stdout.strip()
