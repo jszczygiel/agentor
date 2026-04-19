@@ -330,9 +330,9 @@ class TestRetryMerge(unittest.TestCase):
         self.assertIn("main", final.feedback or "")
 
     def test_manual_resubmit_preserves_result_json(self):
-        """Default (force_execute=False) path — e.g. dashboard `[e]resubmit`
-        — must leave result_json byte-identical so the next dispatch re-runs
-        the plan phase as before."""
+        """Default (force_execute=False) path — direct `resubmit_conflicted`
+        call — must leave result_json byte-identical so the next dispatch
+        re-runs the plan phase as before."""
         item = self._to_conflicted()
         original_json = '{"phase":"execute","summary":"done","plan":"p"}'
         self.store.transition(
@@ -573,12 +573,13 @@ class TestAutoResolveConflicts(unittest.TestCase):
         self.assertIn("force_execute", chain[0].note or "")
 
     def test_manual_resubmit_has_no_auto_marker(self):
-        """Manual `[e]` resubmit (auto off) must not carry the marker —
-        the dashboard uses its absence to keep the indicator silent."""
+        """Manual `resubmit_conflicted` call (auto off) must not carry the
+        marker — the dashboard uses its absence to keep the indicator
+        silent."""
         from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
         cfg = _mk_config(self.root)
         # Force off so drive reaches CONFLICTED without chaining; then call
-        # resubmit_conflicted manually to simulate the operator's [e] press.
+        # resubmit_conflicted manually to simulate a non-auto-chain path.
         cfg.git.auto_resolve_conflicts = False
         conflicted = self._drive_to_conflict(cfg)
         self.assertEqual(conflicted.status, ItemStatus.CONFLICTED)

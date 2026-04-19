@@ -254,8 +254,9 @@ class GitConfig:
     # mode that `git_ops.merge_feature_into_base` funnels into the
     # CONFLICTED path — true merge/rebase conflicts, rebase aborts, and
     # CAS races where base advanced under the integration. Opt out by
-    # setting `auto_resolve_conflicts = false` to keep the manual [m]
-    # retry_merge / [e] resubmit dashboard gates.
+    # setting `auto_resolve_conflicts = false` so conflicts park at
+    # CONFLICTED for the operator to resolve by hand in the feature
+    # worktree and press `[m]` retry merge in the dashboard.
     auto_resolve_conflicts: bool = True
     # After a clean auto-merge CAS-advances `refs/heads/<base_branch>`, the
     # user's primary checkout at `project.root` still reads stale files
