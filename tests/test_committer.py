@@ -29,6 +29,11 @@ def _init_project(root: Path) -> None:
 
 
 def _mk_config(root: Path, *, merge_mode: str = "merge") -> Config:
+    # Test fixture pins `auto_resolve_conflicts=False` so committer tests can
+    # assert on the CONFLICTED state without the default-on auto-chain
+    # immediately moving the item to QUEUED. TestAutoResolveConflicts
+    # explicitly re-enables it to exercise the on-path; the production
+    # GitConfig() default is True and is pinned in tests/test_config.py.
     return Config(
         project_name=root.name,
         project_root=root,
@@ -36,7 +41,8 @@ def _mk_config(root: Path, *, merge_mode: str = "merge") -> Config:
         parsing=ParsingConfig(mode="checkbox"),
         agent=AgentConfig(pool_size=1),
         git=GitConfig(base_branch="main", branch_prefix="agent/",
-                      merge_mode=merge_mode),
+                      merge_mode=merge_mode,
+                      auto_resolve_conflicts=False),
         review=ReviewConfig(),
     )
 
@@ -508,7 +514,7 @@ class TestAutoResolveConflicts(unittest.TestCase):
 
     def test_auto_resolve_off_leaves_conflicted(self):
         cfg = _mk_config(self.root)
-        self.assertFalse(cfg.git.auto_resolve_conflicts)
+        cfg.git.auto_resolve_conflicts = False
         final = self._drive_to_conflict(cfg)
         self.assertEqual(final.status, ItemStatus.CONFLICTED)
         self.assertIsNone(final.feedback)
@@ -516,7 +522,7 @@ class TestAutoResolveConflicts(unittest.TestCase):
 
     def test_auto_resolve_on_requeues_with_feedback(self):
         cfg = _mk_config(self.root)
-        cfg.git.auto_resolve_conflicts = True
+        cfg.git.auto_resolve_conflicts = True  # re-enable (fixture forces off)
         final = self._drive_to_conflict(cfg)
 
         self.assertEqual(final.status, ItemStatus.QUEUED)
@@ -539,7 +545,7 @@ class TestAutoResolveConflicts(unittest.TestCase):
         dispatch (conflict resolution is pure execute work)."""
         from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
         cfg = _mk_config(self.root)
-        cfg.git.auto_resolve_conflicts = True
+        cfg.git.auto_resolve_conflicts = True  # re-enable (fixture forces off)
         final = self._drive_to_conflict(cfg)
 
         self.assertEqual(final.status, ItemStatus.QUEUED)
@@ -571,7 +577,9 @@ class TestAutoResolveConflicts(unittest.TestCase):
         the dashboard uses its absence to keep the indicator silent."""
         from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
         cfg = _mk_config(self.root)
-        # auto_resolve_conflicts stays False — drive reaches CONFLICTED only.
+        # Force off so drive reaches CONFLICTED without chaining; then call
+        # resubmit_conflicted manually to simulate the operator's [e] press.
+        cfg.git.auto_resolve_conflicts = False
         conflicted = self._drive_to_conflict(cfg)
         self.assertEqual(conflicted.status, ItemStatus.CONFLICTED)
 
@@ -1215,6 +1223,105 @@ class TestAdvanceUserCheckoutNoteSurfacing(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertIn(", checkout advanced", self._last_note(item.id))
+
+
+class _NoLogStubRunner(StubRunner):
+    """StubRunner variant that does NOT add a file under
+    `docs/agent-logs/` — exercises the committer's compliance gate
+    miss path."""
+
+    def do_work(self, item, worktree):
+        note_path = worktree / f".agentor-note-{item.id[:8]}.md"
+        note_path.write_text("stub, no log\n")
+        return "stub: no log", [str(note_path.relative_to(worktree))]
+
+
+class TestAgentLogCompliance(unittest.TestCase):
+    """Verifies `approve_and_commit`'s per-run findings log gate:
+    a feature branch must add at least one `docs/agent-logs/*.md`
+    file. Default path appends `, no agent-log written` to the
+    MERGED note; `agent.require_agent_log=True` blocks by
+    transitioning CONFLICTED with `last_error="agent-log missing"`."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text(
+            "- [ ] Touch a file\n  details\n"
+        )
+        self.cfg = _mk_config(self.root)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        scan_once(self.cfg, self.store)
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _claim(self, runner_cls=StubRunner):
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(self.cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        runner_cls(self.cfg, self.store).run(claimed)
+        return self.store.get(claimed.id)
+
+    def _last_note(self, item_id):
+        return self.store.transitions_for(item_id)[-1].note or ""
+
+    def test_missing_log_appends_suffix(self):
+        """Default knob, feature branch adds no agent-log → MERGED
+        with `, no agent-log written` on the transition note."""
+        item = self._claim(_NoLogStubRunner)
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.MERGED)
+        note = self._last_note(item.id)
+        self.assertIn(", no agent-log written", note)
+
+    def test_present_log_no_suffix(self):
+        """Default StubRunner writes a log → MERGED note has no
+        `no agent-log written` marker."""
+        item = self._claim()
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.MERGED)
+        self.assertNotIn("no agent-log written", self._last_note(item.id))
+
+    def test_require_agent_log_blocks_when_missing(self):
+        """`require_agent_log=True` + no log → CONFLICTED,
+        `last_error="agent-log missing"`, feature branch + worktree
+        preserved, base branch untouched."""
+        self.cfg.agent.require_agent_log = True
+        item = self._claim(_NoLogStubRunner)
+        branch = item.branch
+        wt = Path(item.worktree_path)
+        base_before = _main_sha(self.root)
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.CONFLICTED)
+        self.assertEqual(final.last_error, "agent-log missing")
+        self.assertTrue(wt.exists(),
+                        "worktree must be kept for the agent to add the log")
+        self.assertTrue(_branch_exists(self.root, branch),
+                        "feature branch must be preserved when the gate blocks")
+        self.assertEqual(_main_sha(self.root), base_before,
+                         "base must not advance when the gate blocks")
+        self.assertIn("agent-log missing", self._last_note(item.id))
+
+    def test_require_agent_log_allows_when_present(self):
+        """`require_agent_log=True` with a log in the feature branch →
+        MERGED as usual."""
+        self.cfg.agent.require_agent_log = True
+        item = self._claim()
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.MERGED)
+        self.assertNotIn("no agent-log written", self._last_note(item.id))
 
 
 if __name__ == "__main__":
