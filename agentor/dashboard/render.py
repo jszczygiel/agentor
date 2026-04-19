@@ -17,7 +17,9 @@ from .formatters import (
     _ctx_fill_pct,
     _elapsed_for,
     _fmt_elapsed,
+    _fmt_token_line,
     _phase_for,
+    _token_windows,
 )
 
 
@@ -143,6 +145,7 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     )
     _safe_addstr(stdscr, row, 0, status_line, w)
     row += 1
+    row = _render_token_panel(stdscr, row, w, store, daemon)
     _safe_addstr(stdscr, row, 0, "─" * w, w, curses.A_DIM)
     row += 1
 
@@ -173,6 +176,21 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
         f"R{reviews}"
     )
     return rendered
+
+
+def _render_token_panel(stdscr, row: int, w: int, store, daemon) -> int:
+    """Draw the cumulative token-usage panel: one line per time window
+    (session / today / 7d), each showing input / output / cache_read /
+    cache_create totals. Returns the next free row."""
+    windows = _token_windows(store, daemon.started_at)
+    _safe_addstr(stdscr, row, 0, " tokens".ljust(w), w,
+                 curses.A_DIM | curses.A_BOLD)
+    row += 1
+    for label, totals in windows.items():
+        line = " " + _fmt_token_line(label, totals)
+        _safe_addstr(stdscr, row, 0, line.ljust(w), w, curses.A_DIM)
+        row += 1
+    return row
 
 
 def _safe_addstr(stdscr, y, x, s, w, attr=0):

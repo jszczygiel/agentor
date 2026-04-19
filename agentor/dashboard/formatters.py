@@ -1,3 +1,4 @@
+import datetime
 import json
 import time
 
@@ -228,6 +229,44 @@ def _token_breakdown(item: StoredItem) -> list[dict]:
     rows.sort(key=lambda r: -(r["input"] + r["output"] +
                               r["cache_read"] + r["cache_create"]))
     return rows
+
+
+def _midnight_local_epoch(now: float | None = None) -> float:
+    """Epoch seconds of the most recent local-midnight boundary. Uses the
+    system tz (`astimezone()`), matching the backlog's "today (midnight-
+    local)" framing. Separate helper so tests can freeze the clock."""
+    ref = datetime.datetime.fromtimestamp(now if now is not None else time.time())
+    midnight = ref.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.timestamp()
+
+
+def _token_windows(store: Store, daemon_started_at: float) -> dict[str, dict]:
+    """Compute session / today / 7d token totals in one pass.
+
+    `daemon_started_at == 0` means the daemon has not entered its main loop
+    yet (e.g. tests); the "session" view then mirrors the "today" view so the
+    panel stays populated instead of showing a confusing 0.
+    """
+    now = time.time()
+    session_since: float | None = daemon_started_at or None
+    today_since = _midnight_local_epoch(now)
+    week_since = now - 7 * 24 * 3600
+    return {
+        "session": store.aggregate_token_usage(since=session_since),
+        "today": store.aggregate_token_usage(since=today_since),
+        "7d": store.aggregate_token_usage(since=week_since),
+    }
+
+
+def _fmt_token_line(label: str, totals: dict) -> str:
+    """One compact row for the token-usage panel. Kept narrow so it fits in
+    80-column terminals: `session  in 1.5M  out 120k  cache_r 8.0M  cache_c 350k  Σ 10.0M`."""
+    return (f"{label:<8}"
+            f"in {_fmt_tokens(int(totals.get('input', 0))):>6}  "
+            f"out {_fmt_tokens(int(totals.get('output', 0))):>6}  "
+            f"cache_r {_fmt_tokens(int(totals.get('cache_read', 0))):>6}  "
+            f"cache_c {_fmt_tokens(int(totals.get('cache_create', 0))):>6}  "
+            f"Σ {_fmt_tokens(int(totals.get('total', 0))):>6}")
 
 
 def _build_commit_message(item: StoredItem) -> str:

@@ -1,14 +1,18 @@
 import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from agentor.dashboard.formatters import (
     _ctx_fill_pct,
     _fmt_elapsed,
+    _fmt_token_line,
     _fmt_tokens,
     _token_breakdown,
+    _token_windows,
 )
-from agentor.models import ItemStatus
-from agentor.store import StoredItem
+from agentor.models import Item, ItemStatus
+from agentor.store import Store, StoredItem
 
 
 def _item(result_json: str | None) -> StoredItem:
@@ -168,6 +172,80 @@ class TestTokenBreakdown(unittest.TestCase):
         rows = _token_breakdown(_item(json.dumps(payload)))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["model"], "claude-opus-4-6")
+
+
+class TestFmtTokenLine(unittest.TestCase):
+    def test_contains_all_buckets(self):
+        totals = {
+            "input": 100, "output": 50,
+            "cache_read": 2000, "cache_create": 300,
+            "total": 2450,
+        }
+        line = _fmt_token_line("session", totals)
+        self.assertIn("session", line)
+        self.assertIn("in ", line)
+        self.assertIn("out ", line)
+        self.assertIn("cache_r ", line)
+        self.assertIn("cache_c ", line)
+        # Values rendered via _fmt_tokens — 2000 stays as "2.0k".
+        self.assertIn("2.0k", line)
+
+    def test_zero_totals_render_zeros(self):
+        totals = {"input": 0, "output": 0,
+                  "cache_read": 0, "cache_create": 0, "total": 0}
+        line = _fmt_token_line("today", totals)
+        # All buckets should read 0, not "—".
+        self.assertEqual(line.count("     0"), 5)
+
+
+class TestTokenWindows(unittest.TestCase):
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.store = Store(Path(self.td.name) / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _seed_item(self, item_id: str, input_tokens: int,
+                   updated_at: float) -> None:
+        item = Item(
+            id=item_id, title="t", body="",
+            source_file="s.md", source_line=1, tags={},
+        )
+        self.store.upsert_discovered(item)
+        self.store.update_result_json(
+            item_id,
+            json.dumps({"usage": {"input_tokens": input_tokens}}),
+        )
+        self.store.conn.execute(
+            "UPDATE items SET updated_at = ? WHERE id = ?",
+            (updated_at, item_id),
+        )
+
+    def test_three_keys_present(self):
+        windows = _token_windows(self.store, daemon_started_at=0.0)
+        self.assertEqual(set(windows.keys()), {"session", "today", "7d"})
+
+    def test_session_since_daemon_start(self):
+        import time as _time
+        now = _time.time()
+        self._seed_item("before", 99, updated_at=now - 60)
+        self._seed_item("after", 7, updated_at=now + 1)
+        windows = _token_windows(self.store, daemon_started_at=now)
+        # session starts now → only "after" row counts.
+        self.assertEqual(windows["session"]["input"], 7)
+        # 7d spans both.
+        self.assertEqual(windows["7d"]["input"], 106)
+
+    def test_session_falls_back_to_today_when_not_started(self):
+        # daemon_started_at == 0 → session mirrors today so the panel is
+        # populated even when the Daemon.run() loop hasn't fired yet.
+        import time as _time
+        now = _time.time()
+        self._seed_item("a", 11, updated_at=now)
+        windows = _token_windows(self.store, daemon_started_at=0.0)
+        self.assertEqual(windows["session"], windows["today"])
 
 
 if __name__ == "__main__":
