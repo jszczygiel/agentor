@@ -52,10 +52,10 @@ def _one_line(text: str, width: int) -> str:
 
 def _elapsed_for(store: Store, item_id: str) -> float | None:
     """Seconds since the most recent transition INTO `working` for this item."""
-    for t in reversed(store.transitions_for(item_id)):
-        if t.to_status == ItemStatus.WORKING:
-            return max(0.0, time.time() - float(t.at))
-    return None
+    at = store.latest_transition_at(item_id, ItemStatus.WORKING)
+    if at is None:
+        return None
+    return max(0.0, time.time() - at)
 
 
 def _result_data(item: StoredItem) -> dict | None:

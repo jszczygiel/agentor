@@ -388,6 +388,24 @@ class Store:
             for r in rows
         ]
 
+    def latest_transition_at(
+        self, item_id: str, to_status: ItemStatus,
+    ) -> float | None:
+        """Return `transitions.at` of the most recent row where the item
+        entered `to_status`, or None if it never did.
+
+        Cheap single-row read — used by the dashboard's elapsed column to
+        avoid pulling the full history (which on a heavily-recycled item
+        can be hundreds of rows, loaded per WORKING row per 500ms tick)."""
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT at FROM transitions
+                   WHERE item_id = ? AND to_status = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (item_id, _encode_status(to_status)),
+            ).fetchone()
+        return float(row["at"]) if row else None
+
     def recent_failure_notes(self, item_id: str, n: int = 3) -> list[str]:
         """Return the most recent N transition notes whose from_status was
         WORKING and to_status was QUEUED — i.e. the "bounce back after a

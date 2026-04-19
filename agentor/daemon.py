@@ -1,5 +1,6 @@
 import signal
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -52,6 +53,30 @@ class Daemon:
         # clear_alert) once the user has fixed the underlying problem.
         self.system_alert: str | None = None
         self.paused: bool = False
+        self._heartbeat_last: float = 0.0
+        self._heartbeat_dispatched: int = 0
+
+    #: Wall-clock seconds of idle before a heartbeat log line fires. Class-
+    #: level so tests can shrink it without patching time.
+    heartbeat_interval: float = 30.0
+
+    def _maybe_log_heartbeat(self, new_items: int) -> None:
+        """If the daemon is idle (no new items, no new dispatches, no live
+        workers) and the last heartbeat is older than `heartbeat_interval`,
+        emit one log line. Called once per main-loop iteration."""
+        idle = (
+            new_items == 0
+            and self.stats.dispatched == self._heartbeat_dispatched
+            and not self.workers
+        )
+        now = time.monotonic()
+        if idle:
+            if now - self._heartbeat_last >= self.heartbeat_interval:
+                self.log(f"heartbeat: idle ({self.stats.scans} scans)")
+                self._heartbeat_last = now
+        else:
+            self._heartbeat_last = now
+            self._heartbeat_dispatched = self.stats.dispatched
 
     def clear_alert(self) -> None:
         """Acknowledge the alert and resume dispatching. Called from the
@@ -210,6 +235,14 @@ class Daemon:
             self.log(f"queued {len(rec.resumable)} resumable item(s) "
                      f"for dispatch")
 
+        # Heartbeat bookkeeping: log a one-liner once the daemon has been
+        # idle (no new items, no dispatches, no workers) for ~30s of wall
+        # time, so operator reports of "the app seems hung" can be
+        # confirmed against a log that demonstrates the main loop is
+        # alive. Not a progress signal — only fires when nothing else is.
+        self._heartbeat_last = 0.0
+        self._heartbeat_dispatched = self.stats.dispatched
+
         while not self.stop_event.is_set():
             # scan_once lands new items directly at QUEUED; dispatch claims
             # them as pool slots free up.
@@ -219,6 +252,7 @@ class Daemon:
                 self.log(f"scan: {result.new_items} new items")
             while self._dispatch_one():
                 pass
+            self._maybe_log_heartbeat(result.new_items)
             self.stop_event.wait(self.scan_interval)
 
         # Kill in-flight agent subprocesses before draining worker threads.
