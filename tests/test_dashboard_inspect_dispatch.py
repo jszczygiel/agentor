@@ -163,18 +163,6 @@ class TestInspectDispatch(unittest.TestCase):
         )
         self.assertEqual(self.daemon.filled, 1)
 
-    def test_backlog_approve_moves_to_queued(self):
-        # Legacy BACKLOG row — the unified view must still accept approval.
-        self.store.upsert_discovered(_mk("bl1"))
-        # Force DB status to legacy BACKLOG via a raw transition.
-        self.store.transition("bl1", ItemStatus.BACKLOG, note="legacy seed")
-        acted, _ = _inspect_dispatch(
-            None, None, self.store, self.daemon,
-            self._fresh("bl1"), "a",
-        )
-        self.assertTrue(acted)
-        self.assertEqual(self.store.get("bl1").status, ItemStatus.QUEUED)
-
     def test_terminal_status_ignores_all_keys(self):
         self._seed("done1", ItemStatus.QUEUED)
         self.store.transition("done1", ItemStatus.WORKING, note="t")

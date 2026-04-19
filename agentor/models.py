@@ -3,8 +3,7 @@ from enum import Enum
 
 
 class ItemStatus(str, Enum):
-    BACKLOG = "backlog"              # newly discovered, awaiting user approval
-    QUEUED = "queued"                # user-approved, waiting for a worker slot
+    QUEUED = "queued"                # newly discovered; the daemon dispatches automatically
     WORKING = "working"
     AWAITING_PLAN_REVIEW = "awaiting_plan_review"
     AWAITING_REVIEW = "awaiting_review"

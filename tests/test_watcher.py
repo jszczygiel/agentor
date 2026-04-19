@@ -59,12 +59,11 @@ class TestWatcher(unittest.TestCase):
 
     def test_scan_lands_at_queued_not_backlog(self):
         """Regression guard: the pickup-mode gate is gone. New items must
-        land at QUEUED in a single write with no BACKLOG rows produced,
-        even as a transient state visible between store writes."""
+        land at QUEUED in a single write with only one transition row
+        recorded per item."""
         (self.root / "backlog.md").write_text("- [ ] A\n- [ ] B\n")
         cfg = _mk_config(self.root, ["backlog.md"])
         scan_once(cfg, self.store)
-        self.assertEqual(len(self.store.list_by_status(ItemStatus.BACKLOG)), 0)
         self.assertEqual(len(self.store.list_by_status(ItemStatus.QUEUED)), 2)
         # Only one transition recorded per item — the NULL → QUEUED insert.
         for item in self.store.list_by_status(ItemStatus.QUEUED):

@@ -115,7 +115,7 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
     #     error is noise regardless of class.
     auto_recovered: list[str] = []
     active_states = [
-        ItemStatus.QUEUED, ItemStatus.BACKLOG,
+        ItemStatus.QUEUED,
         ItemStatus.AWAITING_PLAN_REVIEW, ItemStatus.AWAITING_REVIEW,
         ItemStatus.DEFERRED, ItemStatus.REJECTED,
     ]

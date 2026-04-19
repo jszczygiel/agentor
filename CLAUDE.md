@@ -31,7 +31,7 @@ Pipeline: **watched markdown files → extracted Items → SQLite queue → daem
 
 Key modules:
 
-- `agentor/models.py` — `Item` (immutable, sha1 of `source_file+title+body`) and `ItemStatus` lifecycle: `queued → working → awaiting_plan_review → working → awaiting_review → merged | rejected | errored | conflicted | cancelled | deferred`. `backlog` is a legacy enum value kept for DB round-trip compatibility with old rows; new items no longer land there.
+- `agentor/models.py` — `Item` (immutable, sha1 of `source_file+title+body`) and `ItemStatus` lifecycle: `queued → working → awaiting_plan_review → working → awaiting_review → merged | rejected | errored | conflicted | cancelled | deferred`. The legacy `backlog` enum value was removed; `Store._migrate` heals any stale `'backlog'` strings on open.
 - `agentor/config.py` — loads `agentor.toml`. Project root resolves relative to the config file's directory unless absolute. Knobs worth knowing: `agent.pool_size` (caps concurrent `working` items; default 0 — operator bumps via `+` in the dashboard), `agent.runner` (`stub` | `claude` | `codex`), `agent.single_phase` (skip the plan phase), `sources.watch` (glob list), `parsing.mode` (`checkbox` | `heading` | `frontmatter`), `git.merge_mode` (`merge` | `rebase`).
 - `agentor/extract.py` — parses markdown into Items. Modes:
   - **checkbox**: each `- [ ]` is an item; continuation lines form the body; `- [x]` skipped.

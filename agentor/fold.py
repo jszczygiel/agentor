@@ -21,7 +21,6 @@ from .store import Store
 # CANCELLED/ERRORED are terminal — a prior fold item in one of those
 # should NOT block a new one from being queued.
 _NON_TERMINAL_STATUSES: tuple[ItemStatus, ...] = (
-    ItemStatus.BACKLOG,
     ItemStatus.QUEUED,
     ItemStatus.WORKING,
     ItemStatus.AWAITING_PLAN_REVIEW,

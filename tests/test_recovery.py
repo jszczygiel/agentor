@@ -166,13 +166,12 @@ class TestRecoveryAutoRecoveredErrors(unittest.TestCase):
 
     def _seed(self, id: str, status: ItemStatus, last_error: str | None) -> None:
         self.store.upsert_discovered(_mk_item(id))
-        if status != ItemStatus.BACKLOG:
-            self.store.transition(id, ItemStatus.QUEUED, last_error=last_error)
-            if status != ItemStatus.QUEUED:
-                self.store.transition(id, status, last_error=last_error)
+        if status != ItemStatus.QUEUED:
+            self.store.transition(id, status, last_error=last_error)
         else:
-            # BACKLOG: write last_error directly via a self-loop transition.
-            self.store.transition(id, ItemStatus.BACKLOG, last_error=last_error)
+            # Self-loop transition so the seed item can carry last_error
+            # without jumping off QUEUED.
+            self.store.transition(id, ItemStatus.QUEUED, last_error=last_error)
 
     def test_benign_error_cleared_status_unchanged(self):
         self._seed("a", ItemStatus.QUEUED, "agentor shutdown")
