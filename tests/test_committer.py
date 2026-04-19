@@ -1,3 +1,4 @@
+import json
 import subprocess
 import time
 import unittest
@@ -314,6 +315,81 @@ class TestRetryMerge(unittest.TestCase):
         self.assertIn("conflict", (final.feedback or "").lower())
         self.assertIn("main", final.feedback or "")
 
+    def test_manual_resubmit_preserves_result_json(self):
+        """Default (force_execute=False) path — e.g. dashboard `[e]resubmit`
+        — must leave result_json byte-identical so the next dispatch re-runs
+        the plan phase as before."""
+        item = self._to_conflicted()
+        original_json = '{"phase":"execute","summary":"done","plan":"p"}'
+        self.store.transition(
+            item.id, ItemStatus.CONFLICTED,
+            result_json=original_json,
+        )
+        item = self.store.get(item.id)
+
+        resubmit_conflicted(self.cfg, self.store, item)
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.result_json, original_json)
+        last = self.store.transitions_for(final.id)[-1]
+        self.assertNotIn("force_execute", last.note or "")
+
+    def test_force_execute_flips_phase_and_preserves_other_keys(self):
+        item = self._to_conflicted()
+        original_json = (
+            '{"phase":"execute","summary":"done","plan":"orig plan",'
+            '"num_turns":12}'
+        )
+        self.store.transition(
+            item.id, ItemStatus.CONFLICTED,
+            result_json=original_json,
+        )
+        item = self.store.get(item.id)
+
+        resubmit_conflicted(self.cfg, self.store, item, force_execute=True)
+
+        final = self.store.get(item.id)
+        data = json.loads(final.result_json)
+        self.assertEqual(data["phase"], "plan")
+        self.assertEqual(data["plan"], "orig plan")
+        self.assertEqual(data["summary"], "done")
+        self.assertEqual(data["num_turns"], 12)
+
+    def test_force_execute_sets_fallback_plan_when_missing(self):
+        """Items that ran in single_phase mode have no `plan` key in
+        result_json; force_execute must still yield a non-empty plan
+        string so the execute prompt's {plan} placeholder substitutes."""
+        item = self._to_conflicted()
+        self.store.transition(
+            item.id, ItemStatus.CONFLICTED,
+            result_json='{"phase":"execute","summary":"done"}',
+        )
+        item = self.store.get(item.id)
+
+        resubmit_conflicted(self.cfg, self.store, item, force_execute=True)
+
+        final = self.store.get(item.id)
+        data = json.loads(final.result_json)
+        self.assertEqual(data["phase"], "plan")
+        self.assertTrue(data.get("plan"))
+        self.assertIn("conflict resolution", data["plan"])
+
+    def test_force_execute_with_absent_result_json(self):
+        """Defensive: null/missing/invalid result_json must still produce
+        a well-formed phase=plan envelope."""
+        item = self._to_conflicted()
+        self.store.transition(
+            item.id, ItemStatus.CONFLICTED, result_json=None,
+        )
+        item = self.store.get(item.id)
+
+        resubmit_conflicted(self.cfg, self.store, item, force_execute=True)
+
+        final = self.store.get(item.id)
+        data = json.loads(final.result_json)
+        self.assertEqual(data["phase"], "plan")
+        self.assertTrue(data.get("plan"))
+
 
 class TestConflictSummaryFormat(unittest.TestCase):
     """Feature-context framing of the CONFLICTED `last_error`."""
@@ -450,7 +526,9 @@ class TestAutoResolveConflicts(unittest.TestCase):
 
     def test_auto_resolve_on_marks_transition_note(self):
         """Chained resubmit tags the CONFLICTED → QUEUED transition so the
-        dashboard can distinguish an auto-chain from a manual resubmit."""
+        dashboard can distinguish an auto-chain from a manual resubmit AND
+        flips result_json so the runner skips the plan phase on the next
+        dispatch (conflict resolution is pure execute work)."""
         from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
         cfg = _mk_config(self.root)
         cfg.git.auto_resolve_conflicts = True
@@ -468,6 +546,17 @@ class TestAutoResolveConflicts(unittest.TestCase):
             (chain[0].note or "").startswith(AUTO_RESOLVE_NOTE_PREFIX),
             f"expected auto-resolve marker, got note={chain[0].note!r}",
         )
+        # Force-execute leg: result_json must be rewritten so the runner's
+        # two-phase dispatch takes the prior-plan branch → _do_execute.
+        data = json.loads(final.result_json)
+        self.assertEqual(data["phase"], "plan",
+                         "phase must be 'plan' so the runner routes "
+                         "straight to _do_execute")
+        self.assertTrue(data.get("plan"),
+                        "plan text must be non-empty so the execute "
+                        "prompt template substitutes cleanly")
+        # Transition note also records the force flag for greppable history.
+        self.assertIn("force_execute", chain[0].note or "")
 
     def test_manual_resubmit_has_no_auto_marker(self):
         """Manual `[e]` resubmit (auto off) must not carry the marker —

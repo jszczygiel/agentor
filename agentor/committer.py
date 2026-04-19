@@ -1,3 +1,4 @@
+import json
 import subprocess
 import threading
 from pathlib import Path
@@ -138,7 +139,8 @@ def approve_and_commit(
                 if refreshed is not None and \
                         refreshed.status == ItemStatus.CONFLICTED:
                     resubmit_conflicted(
-                        config, store, refreshed, note=_AUTO_RESOLVE_NOTE,
+                        config, store, refreshed,
+                        force_execute=True, note=_AUTO_RESOLVE_NOTE,
                     )
             return sha
 
@@ -216,9 +218,29 @@ def retry_merge(
         return True, f"{mode}d {merge_sha[:8]} into {config.git.base_branch}"
 
 
+_FORCE_EXECUTE_PLAN_FALLBACK = "(no plan; conflict resolution — see feedback)"
+
+
+def _coerce_phase_plan(blob: str | None) -> str:
+    """Rewrite a stored `result_json` so the runner's two-phase dispatch
+    routes the next run into execute-only. Preserves all prior keys (usage,
+    session_id, summary, etc.) and guarantees a non-empty `plan` string so
+    the execute prompt template's `{plan}` placeholder substitutes cleanly."""
+    try:
+        data = json.loads(blob) if blob else {}
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["phase"] = "plan"
+    if not (isinstance(data.get("plan"), str) and data["plan"].strip()):
+        data["plan"] = _FORCE_EXECUTE_PLAN_FALLBACK
+    return json.dumps(data)
+
+
 def resubmit_conflicted(
     config: Config, store: Store, item: StoredItem,
-    *, note: str | None = None,
+    *, force_execute: bool = False, note: str | None = None,
 ) -> None:
     """Send a CONFLICTED item back to the agent to resolve the merge
     conflict itself. Transitions CONFLICTED → QUEUED; the worktree,
@@ -230,6 +252,13 @@ def resubmit_conflicted(
     to surface the conflicts, resolve them, and commit. On next approval
     the integration retries — if the feature now includes base's tip,
     the merge fast-forwards.
+
+    `force_execute=True` rewrites `result_json` so the runner skips its
+    plan phase and dispatches straight into execute — conflict resolution
+    is pure execute work (open worktree, resolve markers, re-run tests,
+    commit), and the plan turn is wasted tokens + wall-clock. Used by
+    `approve_and_commit`'s auto-resolve chain; manual `[e]resubmit` from
+    the dashboard keeps the default (re-plans first).
 
     `note` overrides the transition note — `approve_and_commit` passes a
     string prefixed with `AUTO_RESOLVE_NOTE_PREFIX` so the dashboard can
@@ -255,12 +284,20 @@ def resubmit_conflicted(
         f"Conflict summary from the failed integration:\n"
         f"{conflict_detail}"
     )
+    fields: dict[str, object] = {
+        "feedback": feedback,
+        "last_error": None,
+        "attempts": 0,
+    }
+    if force_execute:
+        fields["result_json"] = _coerce_phase_plan(item.result_json)
+    final_note = note or "resubmitted from CONFLICTED — agent will resolve"
+    if force_execute:
+        final_note += " (force_execute: skip plan phase)"
     store.transition(
         item.id, ItemStatus.QUEUED,
-        feedback=feedback,
-        last_error=None,
-        attempts=0,
-        note=note or "resubmitted from CONFLICTED — agent will resolve",
+        note=final_note,
+        **fields,
     )
 
 

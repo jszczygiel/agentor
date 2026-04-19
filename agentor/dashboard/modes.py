@@ -182,8 +182,8 @@ def _inspect_render(
         while True:
             fresh = store.get(item.id) or item
             item = fresh
-            lines = _build_detail_lines(cfg, store, item)
             h, w = stdscr.getmaxyx()
+            lines = _build_detail_lines(cfg, store, item, width=w)
             queue_suffix = (
                 f"  · {remaining} left" if cycle and remaining > 0 else ""
             )
@@ -405,7 +405,9 @@ def _is_auto_resolve_chain(store: Store, item: StoredItem) -> bool:
     return False
 
 
-def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str]:
+def _build_detail_lines(
+    cfg: Config, store: Store, item: StoredItem, *, width: int = 120,
+) -> list[str]:
     out: list[str] = []
     data = _result_data(item)
     progress = _progress_data(item)
@@ -481,14 +483,34 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
     if rows:
         out.append("")
         out.append("── per-model tokens ──")
-        out.append(f"{'MODEL':<36} {'IN':>10} {'OUT':>10} "
-                   f"{'CACHE_R':>12} {'CACHE_W':>10}")
-        for r in rows:
-            out.append(f"{r['model']:<36} "
-                       f"{_fmt_tokens(r['input']):>10} "
-                       f"{_fmt_tokens(r['output']):>10} "
-                       f"{_fmt_tokens(r['cache_read']):>12} "
-                       f"{_fmt_tokens(r['cache_create']):>10}")
+        # Tabular form needs ~80 cols (36 model + 4 × 10 numbers + pads).
+        # 60–79 stacks to a 2-line compact per model; <60 goes fully
+        # vertical so no field wraps mid-row.
+        if width >= 80:
+            out.append(f"{'MODEL':<36} {'IN':>10} {'OUT':>10} "
+                       f"{'CACHE_R':>12} {'CACHE_W':>10}")
+            for r in rows:
+                out.append(f"{r['model']:<36} "
+                           f"{_fmt_tokens(r['input']):>10} "
+                           f"{_fmt_tokens(r['output']):>10} "
+                           f"{_fmt_tokens(r['cache_read']):>12} "
+                           f"{_fmt_tokens(r['cache_create']):>10}")
+        elif width >= 60:
+            for r in rows:
+                out.append(f"model: {r['model']}")
+                out.append(
+                    f"  in={_fmt_tokens(r['input'])} "
+                    f"out={_fmt_tokens(r['output'])} "
+                    f"cr={_fmt_tokens(r['cache_read'])} "
+                    f"cw={_fmt_tokens(r['cache_create'])}"
+                )
+        else:
+            for r in rows:
+                out.append(f"model:   {r['model']}")
+                out.append(f"  in:      {_fmt_tokens(r['input'])}")
+                out.append(f"  out:     {_fmt_tokens(r['output'])}")
+                out.append(f"  cache_r: {_fmt_tokens(r['cache_read'])}")
+                out.append(f"  cache_w: {_fmt_tokens(r['cache_create'])}")
     if item.status == ItemStatus.AWAITING_PLAN_REVIEW:
         plan_text = data.get("plan") or data.get("summary")
         if plan_text:

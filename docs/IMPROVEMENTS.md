@@ -26,6 +26,14 @@ the current task's scope.
   automatic. Consider tagging the transition note (or surfacing an auto-resolve
   badge in the main table) so operators can distinguish a human `[e]` resubmit
   from a committer-driven one.
+- Audit for other stale `ItemStatus.BACKLOG` references across the codebase.
+  `agentor/dashboard/render.py:_STATE_GLYPHS` carried a `BACKLOG: "B"` entry
+  that broke every import after the enum member was removed on main — the
+  responsive-dashboard branch and the remove-BACKLOG branch landed
+  conflict-free via auto-merge but interacted badly. Fixed inline while
+  reconciling the force-execute branch (needed to run the test suite), but a
+  wider grep + mypy `strict_optional=True` + per-member enum exhaustiveness
+  check should be considered so this class of drift is caught pre-merge.
 - The new-issue bug/idea note prompt at `dashboard/modes.py:784` is still
   single-line (`_prompt_text`). Same long-form argument as the feedback paths
   that moved to `_prompt_multiline` — operators would benefit from newlines
