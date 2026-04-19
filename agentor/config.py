@@ -135,9 +135,11 @@ class AgentConfig:
         "    ## Stop if\n"
         "    - symptoms that should halt a future similar attempt\n\n"
         "   Skip sections with nothing to say — an empty run produces no "
-        "file. Include this file in your commit. A human will periodically "
-        "grep `docs/agent-logs/` and fold durable lessons into CLAUDE.md "
-        "/ skills.\n\n"
+        "file. Include this file in your commit. When `docs/agent-logs/` "
+        "accumulates ≥ `agent.fold_threshold` files (default 10), the "
+        "daemon auto-queues a fold item whose agent clusters durable "
+        "lessons into CLAUDE.md / skills and deletes the consumed logs "
+        "in the same commit.\n\n"
         "9. Commit on this branch. Do NOT push, do NOT merge — a human "
         "reviewer and agentor's committer handle integration. Use a "
         "concise conventional-commit-style message summarizing the "
@@ -162,6 +164,11 @@ class AgentConfig:
     # Custom `agent.command` overrides that drop the `{settings_path}`
     # placeholder silently skip enforcement.
     large_file_line_threshold: int = 400
+    # When `docs/agent-logs/` has accumulated at least this many files,
+    # the daemon auto-queues a "Fold agent log lessons" backlog item so
+    # a future agent clusters the Surprises/Gotchas into CLAUDE.md and
+    # deletes the consumed logs in a single commit. 0 disables.
+    fold_threshold: int = 10
 
 
 @dataclass

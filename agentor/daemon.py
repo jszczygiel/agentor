@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .config import Config
+from .fold import maybe_enqueue_fold_item
 from .models import ItemStatus
 from .recovery import recover_on_startup
 from .runner import InfrastructureError, ProcRegistry, Runner, plan_worktree
@@ -266,6 +267,13 @@ class Daemon:
             if result.new_items:
                 self.log(f"scan: {result.new_items} new items")
             self.try_fill_pool()
+            try:
+                created = maybe_enqueue_fold_item(self.config, self.store)
+            except Exception as e:
+                self.log(f"fold-queue error: {e}")
+            else:
+                if created is not None:
+                    self.log(f"queued agent-log fold item: {created}")
             self._maybe_log_heartbeat(result.new_items)
             self.stop_event.wait(self.scan_interval)
 
