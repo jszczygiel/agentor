@@ -546,6 +546,8 @@ def _show_help(stdscr) -> None:
         "",
         "inspect actions (inside the detail view)",
         "  x                  delete current item (any status, confirms first)",
+        "  +  /  P  /  Shift+↑  bump this item's priority up",
+        "  -  /  O  /  Shift+↓  bump this item's priority down",
         "",
         "state glyphs (narrow tier)",
         "  Q queued   W working   P awaiting plan   R awaiting review",
