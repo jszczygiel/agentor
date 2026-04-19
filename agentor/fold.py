@@ -102,11 +102,13 @@ def maybe_enqueue_fold_item(config: Config, store: Store) -> Path | None:
     today = date.today().isoformat()
     target = backlog_dir / f"fold-agent-lessons-{today}.md"
 
-    # Same-day retry: if the file already exists but no non-terminal item
-    # in the store tracks it yet (e.g. scan_once hasn't run), leave it be
-    # — the next scan will pick it up. Prevents an in-flight rewrite.
+    # Same-day retry: if the file already exists (typical after a prior
+    # fold item errored — terminal status no longer blocks the guard),
+    # leave it be and report nothing new this tick. Prevents both an
+    # in-flight rewrite and per-tick log spam; scan_once has already
+    # reconciled the file against the store.
     if target.exists():
-        return target
+        return None
 
     root = config.project_root.resolve()
     rel_paths = [

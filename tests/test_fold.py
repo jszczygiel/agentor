@@ -150,9 +150,12 @@ class TestFoldThreshold(unittest.TestCase):
         self.assertIsNotNone(first)
         original = first.read_text()
         # Second call: same-day file already exists; the helper MUST NOT
-        # rewrite it (no in-flight edits) and MUST NOT raise.
+        # rewrite it, MUST NOT raise, and MUST return None so the daemon
+        # doesn't re-log "queued agent-log fold item" every tick after a
+        # prior fold item errored (terminal status no longer blocks the
+        # guard; only the on-disk file does).
         second = maybe_enqueue_fold_item(cfg, self.store)
-        self.assertEqual(second, first)
+        self.assertIsNone(second)
         self.assertEqual(first.read_text(), original)
         # Exactly one file in the backlog dir.
         backlog_files = list((self.root / "docs" / "backlog").glob("*.md"))
