@@ -172,6 +172,32 @@ class TestInspectDispatch(unittest.TestCase):
         )
         self.assertEqual(self.daemon.filled, 1)
 
+    def test_deferred_delete_confirmed_removes_item(self):
+        self._seed("del1", ItemStatus.DEFERRED)
+        with patch("agentor.dashboard.modes._prompt_yn", return_value=True):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("del1"), "x",
+            )
+        self.assertTrue(acted)
+        self.assertEqual(msg, "deleted")
+        self.assertIsNone(self.store.get("del1"))
+        self.assertTrue(self.store.is_deleted("del1"))
+
+    def test_deferred_delete_cancelled_leaves_item(self):
+        self._seed("del2", ItemStatus.DEFERRED)
+        with patch("agentor.dashboard.modes._prompt_yn", return_value=False):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("del2"), "x",
+            )
+        self.assertFalse(acted)
+        self.assertEqual(msg, "")
+        got = self.store.get("del2")
+        self.assertIsNotNone(got)
+        self.assertEqual(got.status, ItemStatus.DEFERRED)
+        self.assertFalse(self.store.is_deleted("del2"))
+
     def test_terminal_status_ignores_all_keys(self):
         self._seed("done1", ItemStatus.QUEUED)
         self.store.transition("done1", ItemStatus.WORKING, note="t")
