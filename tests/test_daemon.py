@@ -694,5 +694,92 @@ class TestStaleSessionWatchdog(unittest.TestCase):
         self.assertIn("a", d.stale_session_alerts)
 
 
+class TestAutoAcceptPlan(unittest.TestCase):
+    """After the runner leaves an item at AWAITING_PLAN_REVIEW, the
+    daemon invokes the auto-accept predicate. A pass demotes the item
+    to QUEUED with an `auto-accepted: <reason>` transition note, so
+    the next dispatch tick picks up the execute phase with no operator
+    keypress."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _queue(self, id: str) -> None:
+        self.store.upsert_discovered(_mk_item(id))
+        self.store.transition(id, ItemStatus.QUEUED)
+
+    def _plan_behavior(self):
+        """Runner that simulates plan-phase completion: transitions the
+        claimed item into AWAITING_PLAN_REVIEW and returns a successful
+        RunResult. Mirrors what ClaudeRunner.run does at runner.py:570."""
+        store = self.store
+
+        def behavior(runner, item):
+            store.transition(
+                item.id, ItemStatus.AWAITING_PLAN_REVIEW,
+                result_json='{"phase":"plan","plan":"sketch"}',
+                note="plan ready for human review",
+            )
+            return RunResult(item.id, Path("/x"), "br", "plan ok", [], "")
+        return behavior
+
+    def _factory(self, behavior):
+        def make(cfg, store):
+            return FakeRunner(cfg, store, behavior)
+        return make
+
+    def test_always_mode_demotes_to_queued_with_audit_note(self):
+        self._queue("a")
+        cfg = _mk_config(self.root, pool_size=1)
+        cfg.agent.auto_accept_plan = "always"
+        d = Daemon(cfg, self.store, self._factory(self._plan_behavior()),
+                   install_signals=False, log=lambda m: None)
+        d._dispatch_one()
+        _drain_workers(d)
+
+        item = self.store.get("a")
+        self.assertEqual(item.status, ItemStatus.QUEUED)
+        last = self.store.transitions_for("a")[-1]
+        self.assertEqual(last.note, "auto-accepted: always")
+
+    def test_off_mode_leaves_item_at_plan_review(self):
+        self._queue("a")
+        cfg = _mk_config(self.root, pool_size=1)  # default auto_accept_plan="off"
+        d = Daemon(cfg, self.store, self._factory(self._plan_behavior()),
+                   install_signals=False, log=lambda m: None)
+        d._dispatch_one()
+        _drain_workers(d)
+
+        item = self.store.get("a")
+        self.assertEqual(item.status, ItemStatus.AWAITING_PLAN_REVIEW)
+        last = self.store.transitions_for("a")[-1]
+        self.assertNotIn("auto-accepted", last.note or "")
+
+    def test_runner_error_skips_auto_accept(self):
+        """A failed run must not trigger the auto-accept path — the item
+        isn't at AWAITING_PLAN_REVIEW, so the predicate is never consulted."""
+        self._queue("a")
+
+        def behavior(runner, item):
+            return RunResult(item.id, Path("/x"), "br", "", [], "",
+                             error="agent crashed")
+
+        cfg = _mk_config(self.root, pool_size=1)
+        cfg.agent.auto_accept_plan = "always"
+        d = Daemon(cfg, self.store, self._factory(behavior),
+                   install_signals=False, log=lambda m: None)
+        d._dispatch_one()
+        _drain_workers(d)
+
+        item = self.store.get("a")
+        self.assertNotEqual(item.status, ItemStatus.QUEUED)
+
+
 if __name__ == "__main__":
     unittest.main()

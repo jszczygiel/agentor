@@ -14,6 +14,10 @@ class TestInspectActionMap(unittest.TestCase):
     action surface for each status so a regression that silently drops an
     action is caught."""
 
+    def test_queued_has_feedback_reject_defer_delete(self):
+        keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[ItemStatus.QUEUED]}
+        self.assertEqual(keys, {"f", "r", "s", "x"})
+
     def test_awaiting_plan_review_has_approve_feedback_defer_delete(self):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[
             ItemStatus.AWAITING_PLAN_REVIEW
@@ -51,10 +55,11 @@ class TestInspectActionMap(unittest.TestCase):
                 self.assertIn("x", keys)
 
     def test_view_only_statuses_have_only_delete(self):
-        """QUEUED, WORKING, and the terminal states expose only `x`; other
-        actions (approve/defer/merge/etc.) aren't meaningful there."""
+        """WORKING and the terminal success states expose only `x`; other
+        actions (approve/defer/merge/etc.) aren't meaningful there.
+        QUEUED is excluded — operators can reject/feedback/defer a
+        freshly discovered item before the daemon picks it up."""
         for st in (
-            ItemStatus.QUEUED,
             ItemStatus.WORKING,
             ItemStatus.APPROVED,
             ItemStatus.MERGED,
@@ -76,14 +81,17 @@ class TestInspectActionMap(unittest.TestCase):
     def test_approve_key_is_a_where_an_approve_action_exists(self):
         # "a" is the primary forward action in every status that has a
         # non-delete action (approve / retry / restore). Statuses whose
-        # only action is `[x]delete` (QUEUED, WORKING, APPROVED, MERGED,
-        # CANCELLED) and CONFLICTED (uses m/e/s instead) are excluded.
+        # only action is `[x]delete` (WORKING, APPROVED, MERGED, CANCELLED)
+        # are excluded, as are CONFLICTED (uses m/e/s instead) and QUEUED
+        # (item is already destined for dispatch — reject/feedback/defer
+        # are the meaningful ops, not a redundant approve).
         delete_only = {"x"}
+        no_approve = {ItemStatus.CONFLICTED, ItemStatus.QUEUED}
         for st, pairs in _ACTION_KEYS_BY_STATUS.items():
             keys = {k for k, _ in pairs}
             if not keys or keys == delete_only:
                 continue
-            if st == ItemStatus.CONFLICTED:
+            if st in no_approve:
                 self.assertNotIn("a", keys)
                 continue
             with self.subTest(status=st):

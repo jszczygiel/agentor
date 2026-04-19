@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from .auto_accept import should_auto_accept
 from .config import Config
 from .fold import maybe_enqueue_fold_item
 from .models import ItemStatus
@@ -223,6 +224,7 @@ class Daemon:
             else:
                 self.stats.completed += 1
                 self.log(f"awaiting_review: {claimed.id} — {result.summary}")
+                self._maybe_auto_accept_plan(claimed.id)
         except InfrastructureError as e:
             # Don't count as a failure (the item didn't fail; the system
             # did). Item was left in WORKING by note_infra_failure with
@@ -289,6 +291,35 @@ class Daemon:
                 f"last transcript write"
             )
 
+    def _maybe_auto_accept_plan(self, item_id: str) -> None:
+        """If the just-finished run left the item at AWAITING_PLAN_REVIEW
+        and the auto-accept predicate passes, approve immediately so the
+        next dispatch tick picks up the execute phase with no operator
+        keypress. Predicate errors are logged but do not strand the item —
+        it remains at AWAITING_PLAN_REVIEW and the operator can approve
+        by hand. `approve_plan` is imported lazily to avoid the circular
+        import via `store` (see `dashboard/modes.py` for the same pattern)."""
+        item = self.store.get(item_id)
+        if item is None or item.status != ItemStatus.AWAITING_PLAN_REVIEW:
+            return
+        try:
+            decision, reason = should_auto_accept(self.config, item)
+        except Exception as e:
+            self.log(f"auto-accept predicate error on {item_id}: {e}")
+            return
+        if not decision:
+            return
+        from .committer import approve_plan
+        try:
+            approve_plan(
+                self.store, item,
+                note=f"auto-accepted: {reason}",
+            )
+        except Exception as e:
+            self.log(f"auto-accept approve_plan failed on {item_id}: {e}")
+            return
+        self.log(f"auto-accepted plan: {item_id} ({reason})")
+
     def _install_signal_handlers(self) -> None:
         def handler(signum, frame):
             if self.force_stop:
@@ -314,6 +345,9 @@ class Daemon:
         if rec.stale_sessions:
             self.log(f"auto-recovered {len(rec.stale_sessions)} items "
                      f"with stale claude session")
+        if rec.auto_approved:
+            self.log(f"auto-approved {len(rec.auto_approved)} stranded "
+                     f"plan-review item(s) on recovery")
         if rec.resumable:
             # Resumable items are now demoted to QUEUED by recovery; the
             # normal dispatch loop claims them when a pool slot opens, and
