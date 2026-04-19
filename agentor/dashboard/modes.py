@@ -1,6 +1,7 @@
 import subprocess
 import time
 from pathlib import Path
+from typing import Callable
 
 from ..config import Config
 from ..daemon import Daemon
@@ -325,11 +326,13 @@ def _inspect_dispatch(
             if not item.worktree_path:
                 return False, "no worktree — nothing to diff"
             wt = Path(item.worktree_path)
+            def _diff_work(p: Callable[[str], None]) -> str:
+                p("git diff vs base")
+                return diff_vs_base(wt, cfg.git.base_branch)
             try:
                 diff = _run_with_progress(
                     stdscr, f"  diff · {item.title}",
-                    lambda p: (p("git diff vs base"),
-                               diff_vs_base(wt, cfg.git.base_branch))[-1],
+                    _diff_work,
                     hint="git diff against base branch.",
                 )
             except Exception as e:
@@ -788,12 +791,14 @@ def _new_issue_mode(
     )
     if not note:
         return
+    def _expand_work(p: Callable[[str], None]) -> str:
+        p("calling claude to expand note")
+        return _expand_note_via_claude(
+            note, cfg, expand_kind, timeout=180.0)
     try:
         content = _run_with_progress(
             stdscr, f"  expanding note → {dest.name}…",
-            lambda p: (p("calling claude to expand note"),
-                       _expand_note_via_claude(
-                           note, cfg, expand_kind, timeout=180.0))[-1],
+            _expand_work,
             hint="one-shot claude call; may take 10-60s.",
         )
     except Exception as e:
