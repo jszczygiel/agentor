@@ -546,8 +546,6 @@ def _show_help(stdscr) -> None:
         "",
         "inspect actions (inside the detail view)",
         "  x                  delete current item (any status, confirms first)",
-        "  +  /  P  /  Shift+↑  bump this item's priority up",
-        "  -  /  O  /  Shift+↓  bump this item's priority down",
         "",
         "state glyphs (narrow tier)",
         "  Q queued   W working   P awaiting plan   R awaiting review",
@@ -752,19 +750,6 @@ def _prompt_multiline(stdscr, label: str, *, rows: int | None = None) -> str:
     inner_cols = box_w - 2
     top = (h - box_h) // 2
     left = (w - box_w) // 2
-
-    # Blank stdscr so pre-existing dashboard cells (main table, right panel)
-    # don't leak around the 80-col popup on wide terminals. A_DIM signals
-    # the dashboard is inert while the modal is up. The main loop erases
-    # stdscr every REFRESH_MS tick, so the blanked backdrop repaints the
-    # live dashboard shortly after the popup closes.
-    blank = " " * max(0, w - 1)
-    for y in range(h):
-        try:
-            stdscr.addnstr(y, 0, blank, w - 1, curses.A_DIM)
-        except curses.error:
-            pass
-    stdscr.refresh()
 
     frame = curses.newwin(box_h, box_w, top, left)
     frame.bkgd(" ", curses.A_NORMAL)

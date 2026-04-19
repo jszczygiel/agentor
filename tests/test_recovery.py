@@ -371,55 +371,5 @@ class TestRecoveryStaleSession(unittest.TestCase):
         self.assertTrue(_is_auto_recoverable_error(_STALE_SESSION_MARKER))
 
 
-class TestRecoveryAutoAcceptPlan(unittest.TestCase):
-    """A crash between the runner's AWAITING_PLAN_REVIEW transition and
-    the daemon's auto-accept call would strand the item at the gate
-    until an operator noticed. The recovery sweep re-runs the predicate
-    so `auto_accept_plan = always` items resume unattended."""
-
-    def setUp(self):
-        self.td = TemporaryDirectory()
-        self.root = Path(self.td.name)
-        self.store = Store(self.root / ".agentor" / "state.db")
-        self.patcher = patch("agentor.recovery.git_ops.worktree_remove")
-        self.patcher.start()
-
-    def tearDown(self):
-        self.patcher.stop()
-        self.store.close()
-        self.td.cleanup()
-
-    def _seed_at_plan_review(self, id: str = "a") -> None:
-        self.store.upsert_discovered(_mk_item(id))
-        self.store.transition(id, ItemStatus.QUEUED)
-        self.store.transition(
-            id, ItemStatus.AWAITING_PLAN_REVIEW,
-            result_json='{"phase":"plan","plan":"sketch"}',
-        )
-
-    def test_always_mode_auto_approves_on_startup(self):
-        self._seed_at_plan_review("a")
-        cfg = _mk_config(self.root)
-        cfg.agent.auto_accept_plan = "always"
-
-        result = recover_on_startup(cfg, self.store)
-
-        self.assertEqual(result.auto_approved, ["a"])
-        item = self.store.get("a")
-        self.assertEqual(item.status, ItemStatus.QUEUED)
-        last = self.store.transitions_for("a")[-1]
-        self.assertEqual(last.note, "auto-accepted on recovery: always")
-
-    def test_off_mode_leaves_item_untouched(self):
-        self._seed_at_plan_review("a")
-        cfg = _mk_config(self.root)  # default "off"
-
-        result = recover_on_startup(cfg, self.store)
-
-        self.assertEqual(result.auto_approved, [])
-        item = self.store.get("a")
-        self.assertEqual(item.status, ItemStatus.AWAITING_PLAN_REVIEW)
-
-
 if __name__ == "__main__":
     unittest.main()

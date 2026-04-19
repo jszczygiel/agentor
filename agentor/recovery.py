@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import git_ops
-from .auto_accept import should_auto_accept
 from .config import Config
 from .models import ItemStatus
 from .store import Store, StoredItem
@@ -75,11 +74,6 @@ class RecoveryResult:
     # session_id cleared so the next dispatch starts a fresh plan run
     # instead of paying for a doomed `claude --resume`.
     stale_sessions: list[str] = field(default_factory=list)
-    # AWAITING_PLAN_REVIEW items that the auto-accept predicate approves on
-    # startup — typically stranded by a crash between plan-done and the
-    # daemon's auto-accept call. Demoted to QUEUED so the normal dispatch
-    # loop picks up the execute phase without operator input.
-    auto_approved: list[str] = field(default_factory=list)
 
 
 def _has_dead_session_failure(store: Store, item_id: str) -> bool:
@@ -214,34 +208,8 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
             if item.last_error:
                 store.clear_error_and_reset_attempts(item.id)
                 auto_recovered.append(item.id)
-
-    # Re-run the auto-accept predicate against any AWAITING_PLAN_REVIEW
-    # items. Handles the crash window between the runner's plan-done
-    # transition and the daemon's in-worker auto-accept call — without
-    # this, an item stranded by a restart would sit at the gate until an
-    # operator noticed. Lazy import of `approve_plan` keeps recovery free
-    # of the committer → store → recovery cycle.
-    auto_approved: list[str] = []
-    for item in store.list_by_status(ItemStatus.AWAITING_PLAN_REVIEW):
-        try:
-            decision, reason = should_auto_accept(config, item)
-        except Exception:
-            continue
-        if not decision:
-            continue
-        from .committer import approve_plan
-        try:
-            approve_plan(
-                store, item,
-                note=f"auto-accepted on recovery: {reason}",
-            )
-        except Exception:
-            continue
-        auto_approved.append(item.id)
-
     return RecoveryResult(
         requeued=requeued, resumable=resumable,
         auto_recovered=auto_recovered,
         stale_sessions=stale_sessions,
-        auto_approved=auto_approved,
     )
