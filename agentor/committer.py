@@ -43,7 +43,7 @@ _RAW_CAP = 1500
 
 # Marker prefix on the CONFLICTED → QUEUED transition note when the
 # auto-resolve chain fires from `approve_and_commit`. The dashboard reads
-# this to distinguish an auto-chained resubmit from a manual `[e]` press.
+# this to flag an auto-chained resubmit in the transitions history.
 AUTO_RESOLVE_NOTE_PREFIX = "auto-resolve"
 _AUTO_RESOLVE_NOTE = (
     f"{AUTO_RESOLVE_NOTE_PREFIX}: resubmitted from CONFLICTED — agent will resolve"
@@ -142,6 +142,28 @@ def approve_and_commit(
         sha = git_ops.run(wt, "rev-parse", "HEAD").stdout.strip()
         note_prefix = "recorded existing commit"
 
+    # Per-run findings log compliance gate. Diffed against `base_branch`
+    # after the feature commit is finalised but before the integration
+    # lock, so a block short-circuits without ever touching the merge
+    # machinery. A miss records ", no agent-log written" on the MERGED
+    # note; `agent.require_agent_log` upgrades that to a CONFLICTED
+    # block with `last_error = "agent-log missing"`.
+    logs_added = git_ops.added_agent_logs(
+        repo, item.branch, config.git.base_branch,
+    )
+    if not logs_added:
+        if config.agent.require_agent_log:
+            p("blocked: no agent-log added on feature branch")
+            store.transition(
+                item.id, ItemStatus.CONFLICTED,
+                last_error="agent-log missing",
+                note="blocked: agent-log missing",
+            )
+            return sha
+        log_suffix = ", no agent-log written"
+    else:
+        log_suffix = ""
+
     tmp_root = repo / ".agentor" / "merge-tmp"
     mode = config.git.merge_mode
     verb = "rebasing onto" if mode == "rebase" else "merging into"
@@ -196,7 +218,7 @@ def approve_and_commit(
         store.transition(
             item.id, ItemStatus.MERGED,
             note=f"{note_prefix} {sha[:8]}, {mode}d {merge_sha[:8]} into "
-                 f"{config.git.base_branch}{checkout_suffix}",
+                 f"{config.git.base_branch}{checkout_suffix}{log_suffix}",
         )
         return sha
 
