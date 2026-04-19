@@ -291,15 +291,20 @@ def _token_windows(store: Store, daemon_started_at: float) -> dict[str, dict]:
     return result
 
 
-def _fmt_token_line(label: str, totals: dict) -> str:
+def _fmt_token_line(label: str, totals: dict, budget: int = 0) -> str:
     """One compact row for the token-usage panel. Kept narrow so it fits in
-    80-column terminals: `session  in 1.5M  out 120k  cache_r 8.0M  cache_c 350k  Σ 10.0M`."""
+    80-column terminals: `session  in 1.5M  out 120k  cache_r 8.0M  cache_c 350k  Σ 10.0M`.
+
+    When `budget` is non-zero, a `(NN%)` suffix is appended to the Σ so
+    operators can eyeball proximity to the configured session/weekly cap
+    without doing the math."""
+    total = int(totals.get('total', 0))
     return (f"{label:<8}"
             f"in {_fmt_tokens(int(totals.get('input', 0))):>6}  "
             f"out {_fmt_tokens(int(totals.get('output', 0))):>6}  "
             f"cache_r {_fmt_tokens(int(totals.get('cache_read', 0))):>6}  "
             f"cache_c {_fmt_tokens(int(totals.get('cache_create', 0))):>6}  "
-            f"Σ {_fmt_tokens(int(totals.get('total', 0))):>6}")
+            f"Σ {_fmt_tokens(total):>6}{_fmt_pct_of_budget(total, budget)}")
 
 
 def _fmt_pct_of_budget(total: int, budget: int) -> str:
@@ -334,21 +339,25 @@ def _fmt_token_compact(windows: dict, agent_cfg=None) -> str:
             f"wk={_fmt_tokens(wk)}{wk_pct}")
 
 
-def _fmt_token_line_mid(label: str, totals: dict) -> str:
+def _fmt_token_line_mid(label: str, totals: dict, budget: int = 0) -> str:
     """Mid-tier (60–79 col) compact form. Drops the cache columns and
-    leads with Σ so the most operator-relevant number isn't clipped."""
+    leads with Σ so the most operator-relevant number isn't clipped.
+    `budget>0` appends a `(NN%)` suffix next to Σ."""
+    total = int(totals.get('total', 0))
     return (f"{label:<8}"
-            f"Σ {_fmt_tokens(int(totals.get('total', 0))):>6}  "
+            f"Σ {_fmt_tokens(total):>6}{_fmt_pct_of_budget(total, budget)}  "
             f"in {_fmt_tokens(int(totals.get('input', 0))):>6}  "
             f"out {_fmt_tokens(int(totals.get('output', 0))):>6}")
 
 
-def _fmt_token_line_narrow(label: str, totals: dict) -> str:
+def _fmt_token_line_narrow(label: str, totals: dict, budget: int = 0) -> str:
     """Narrow-tier (<60 col) form. Label is truncated to 4 chars and
-    only Σ survives — the other fields live in the inspect view."""
+    only Σ survives — the other fields live in the inspect view.
+    `budget>0` appends a `(NN%)` suffix next to Σ."""
     short = label[:4]
+    total = int(totals.get('total', 0))
     return (f"{short:<5}"
-            f"Σ {_fmt_tokens(int(totals.get('total', 0))):>6}")
+            f"Σ {_fmt_tokens(total):>6}{_fmt_pct_of_budget(total, budget)}")
 
 
 def _build_commit_message(item: StoredItem) -> str:
