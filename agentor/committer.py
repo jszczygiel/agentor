@@ -1,13 +1,17 @@
 import json
 import subprocess
 import threading
+import time
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from . import git_ops
 from .config import Config
 from .models import ItemStatus
 from .store import Store, StoredItem
+
+if TYPE_CHECKING:  # pragma: no cover — import cycle guard only
+    from .daemon import Daemon
 
 ProgressCb = Callable[[str], None]
 
@@ -407,15 +411,80 @@ def retry(store: Store, item: StoredItem) -> None:
     )
 
 
-def delete_idea(store: Store, item: StoredItem) -> None:
-    """Permanently remove an item from the store. Drops the items row,
-    its failures, and its transitions; writes a tombstone in `deletions`
-    so `scan_once` does not re-enqueue the id if the source markdown
-    still carries it. Source file is left intact."""
-    store.delete_item(
-        item.id,
-        note=f"deleted from {item.status.value}",
-    )
+_DELETE_WAIT_SECONDS = 5.0
+_DELETE_POLL_INTERVAL = 0.1
+
+
+def delete_idea(
+    config: Config | None, store: Store, daemon: "Daemon | None",
+    item: StoredItem,
+) -> bool:
+    """Unified delete for the inspect view. Hard-removes the item from
+    the store (via `Store.delete_item` — row + failures + transitions
+    cleared, tombstoned in `deletions`) after tearing down any live
+    runner state. Returns True when the deletion happened, False when
+    the row was already tombstoned or vanished between read and write.
+
+    Teardown order matters:
+      1. If WORKING, signal the registered subprocess via
+         `daemon.proc_registry.kill_one(item.id)` and poll the store until
+         the runner's own error path writes a terminal-ish status (ERRORED
+         / QUEUED / AWAITING_*). Bounded at ~5s so a wedged runner can't
+         hang the dashboard. Waiting here narrows (but does not eliminate)
+         the window where a late runner write hits a tombstoned row and
+         raises KeyError; the worker swallows that via
+         `Daemon._run_worker`'s broad `except Exception`.
+      2. If a worktree_path is recorded (live, resumable, or forensic),
+         force-remove the git worktree, prune stale registrations, and
+         force-delete the feature branch. Best-effort — git errors don't
+         block the hard-delete.
+      3. Call `store.delete_item` LAST. This drops dependent rows + the
+         items row and records a `deletions` tombstone so `scan_once`
+         refuses to re-enqueue the id from the unchanged source markdown.
+
+    `config` is only required for worktree/branch cleanup; callers with
+    no worktree can pass None. `daemon` is only needed to kill a live
+    subprocess; None is safe for non-WORKING items."""
+    prev_status = item.status
+    if store.is_deleted(item.id) or store.get(item.id) is None:
+        return False
+
+    if prev_status == ItemStatus.WORKING and daemon is not None:
+        daemon.proc_registry.kill_one(item.id)
+        deadline = time.monotonic() + _DELETE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            refreshed = store.get(item.id)
+            if refreshed is None or refreshed.status != ItemStatus.WORKING:
+                break
+            time.sleep(_DELETE_POLL_INTERVAL)
+
+    if config is not None and item.worktree_path:
+        wt = Path(item.worktree_path)
+        try:
+            git_ops.worktree_remove(config.project_root, wt, force=True)
+            git_ops.worktree_prune(config.project_root)
+        except git_ops.GitError:
+            pass
+        if item.branch:
+            try:
+                git_ops.branch_delete(
+                    config.project_root, item.branch, force=True,
+                )
+            except git_ops.GitError:
+                pass
+
+    try:
+        store.delete_item(
+            item.id, note=f"deleted from {prev_status.value}",
+        )
+    except KeyError:
+        # Runner thread raced us and tombstoned the row (or removed it
+        # via some other path) between our precheck and the write. Treat
+        # as a no-op rather than propagating — the end state the operator
+        # wanted is already in place.
+        return False
+    return True
+    return True
 
 
 def defer(store: Store, item: StoredItem) -> None:

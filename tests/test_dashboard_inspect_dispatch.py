@@ -21,12 +21,27 @@ from agentor.models import Item, ItemStatus
 from agentor.store import Store
 
 
+class _FakeProcRegistry:
+    """Captures `kill_one` invocations so delete tests can assert that the
+    WORKING-item teardown path fires. Mirrors the real `ProcRegistry` API
+    surface touched by `delete_idea`."""
+
+    def __init__(self) -> None:
+        self.killed: list[str] = []
+
+    def kill_one(self, key: str) -> bool:
+        self.killed.append(key)
+        return False
+
+
 class _FakeDaemon:
-    """Minimal daemon stub — `_inspect_dispatch` only needs
-    `try_fill_pool` to exist."""
+    """Minimal daemon stub — `_inspect_dispatch` needs `try_fill_pool` for
+    restore/approve paths and `proc_registry` for the unified delete
+    path's WORKING-teardown branch."""
 
     def __init__(self) -> None:
         self.filled = 0
+        self.proc_registry = _FakeProcRegistry()
 
     def try_fill_pool(self) -> None:
         self.filled += 1
@@ -198,20 +213,175 @@ class TestInspectDispatch(unittest.TestCase):
         self.assertEqual(got.status, ItemStatus.DEFERRED)
         self.assertFalse(self.store.is_deleted("del2"))
 
-    def test_terminal_status_ignores_all_keys(self):
+    def test_terminal_status_ignores_non_delete_keys(self):
+        """MERGED is view-only for every action key except the new unified
+        `x` delete, which must still work at every status."""
         self._seed("done1", ItemStatus.QUEUED)
         self.store.transition("done1", ItemStatus.WORKING, note="t")
         self.store.transition(
             "done1", ItemStatus.AWAITING_REVIEW, note="t",
         )
         self.store.transition("done1", ItemStatus.MERGED, note="t")
-        for key in ("a", "s", "r", "m", "e", "x", "f", "v"):
+        for key in ("a", "s", "r", "m", "e", "f", "v"):
             with self.subTest(key=key):
                 acted, _ = _inspect_dispatch(
                     None, None, self.store, self.daemon,
                     self._fresh("done1"), key,
                 )
                 self.assertFalse(acted)
+        # MERGED → hard-deleted + tombstoned via `x`. stdscr=None works
+        # because `_prompt_yn` is patched to auto-confirm.
+        with patch(
+            "agentor.dashboard.modes._prompt_yn", return_value=True,
+        ):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("done1"), "x",
+            )
+        self.assertTrue(acted)
+        self.assertEqual(msg, "deleted")
+        self.assertIsNone(self.store.get("done1"))
+        self.assertTrue(self.store.is_deleted("done1"))
+
+    def test_delete_tombstones_item_from_every_status(self):
+        """`x` must hard-delete regardless of where the item started.
+        Seed one item per status and drive the dispatcher with the
+        confirmation prompt patched to auto-yes."""
+        cases = {
+            ItemStatus.QUEUED: lambda sid: None,
+            ItemStatus.WORKING: lambda sid: self.store.transition(
+                sid, ItemStatus.WORKING, note="t"),
+            ItemStatus.AWAITING_PLAN_REVIEW: lambda sid: (
+                self.store.transition(sid, ItemStatus.WORKING, note="t"),
+                self.store.transition(
+                    sid, ItemStatus.AWAITING_PLAN_REVIEW, note="t"),
+            ),
+            ItemStatus.AWAITING_REVIEW: lambda sid: (
+                self.store.transition(sid, ItemStatus.WORKING, note="t"),
+                self.store.transition(
+                    sid, ItemStatus.AWAITING_REVIEW, note="t"),
+            ),
+            ItemStatus.CONFLICTED: lambda sid: (
+                self.store.transition(sid, ItemStatus.WORKING, note="t"),
+                self.store.transition(
+                    sid, ItemStatus.AWAITING_REVIEW, note="t"),
+                self.store.transition(
+                    sid, ItemStatus.CONFLICTED, note="t"),
+            ),
+            ItemStatus.ERRORED: lambda sid: (
+                self.store.transition(sid, ItemStatus.WORKING, note="t"),
+                self.store.transition(
+                    sid, ItemStatus.ERRORED, note="t"),
+            ),
+            ItemStatus.REJECTED: lambda sid: (
+                self.store.transition(sid, ItemStatus.WORKING, note="t"),
+                self.store.transition(
+                    sid, ItemStatus.AWAITING_REVIEW, note="t"),
+                self.store.transition(
+                    sid, ItemStatus.REJECTED, note="t"),
+            ),
+            ItemStatus.DEFERRED: lambda sid: (
+                self.store.transition(sid, ItemStatus.WORKING, note="t"),
+                self.store.transition(
+                    sid, ItemStatus.DEFERRED, note="t"),
+            ),
+            ItemStatus.APPROVED: lambda sid: self.store.transition(
+                sid, ItemStatus.APPROVED, note="t"),
+            ItemStatus.MERGED: lambda sid: (
+                self.store.transition(sid, ItemStatus.WORKING, note="t"),
+                self.store.transition(
+                    sid, ItemStatus.AWAITING_REVIEW, note="t"),
+                self.store.transition(
+                    sid, ItemStatus.MERGED, note="t"),
+            ),
+        }
+        for idx, (status, setup) in enumerate(cases.items()):
+            with self.subTest(status=status):
+                sid = f"del{idx}"
+                self._seed(sid, ItemStatus.QUEUED)
+                setup(sid)
+                self.assertEqual(
+                    self.store.get(sid).status, status,
+                    f"setup left {sid} in wrong state",
+                )
+                # Shrink the WORKING-teardown poll budget so the subTest
+                # that seeds WORKING doesn't burn 5s of real time waiting
+                # for a runner thread that doesn't exist.
+                with patch(
+                    "agentor.dashboard.modes._prompt_yn",
+                    return_value=True,
+                ), patch(
+                    "agentor.committer._DELETE_WAIT_SECONDS", 0.2,
+                ):
+                    acted, msg = _inspect_dispatch(
+                        None, None, self.store, self.daemon,
+                        self._fresh(sid), "x",
+                    )
+                self.assertTrue(acted)
+                self.assertEqual(msg, "deleted")
+                self.assertIsNone(self.store.get(sid))
+                self.assertTrue(self.store.is_deleted(sid))
+
+    def test_delete_already_tombstoned_is_noop(self):
+        """Pressing `x` on an id that's already been tombstoned reports
+        the no-op without raising — `delete_idea` short-circuits when the
+        row is gone."""
+        self._seed("can1", ItemStatus.QUEUED)
+        stale = self._fresh("can1")
+        self.store.delete_item("can1", note="pre-tombstoned")
+        self.assertTrue(self.store.is_deleted("can1"))
+        with patch(
+            "agentor.dashboard.modes._prompt_yn", return_value=True,
+        ):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon, stale, "x",
+            )
+        self.assertTrue(acted)
+        self.assertEqual(msg, "already deleted")
+        self.assertIsNone(self.store.get("can1"))
+
+    def test_delete_prompt_cancel_leaves_item_alone(self):
+        """User answers no to the confirm prompt → no transition, no proc
+        kill, no flash."""
+        self._seed("keep1", ItemStatus.QUEUED)
+        self.store.transition("keep1", ItemStatus.WORKING, note="t")
+        with patch(
+            "agentor.dashboard.modes._prompt_yn", return_value=False,
+        ):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("keep1"), "x",
+            )
+        self.assertFalse(acted)
+        self.assertEqual(msg, "")
+        self.assertEqual(
+            self.store.get("keep1").status, ItemStatus.WORKING,
+        )
+        self.assertEqual(self.daemon.proc_registry.killed, [])
+
+    def test_delete_working_kills_subprocess_and_tombstones(self):
+        """WORKING delete must (a) invoke `proc_registry.kill_one(item.id)`,
+        (b) hard-delete the row, (c) record a tombstone. cfg=None skips
+        git cleanup — exercised separately by the committer-level test."""
+        self._seed("live1", ItemStatus.QUEUED)
+        self.store.transition(
+            "live1", ItemStatus.WORKING,
+            worktree_path="/tmp/nope", branch="agent/live1",
+            session_id="sess-abc", note="t",
+        )
+        with patch(
+            "agentor.dashboard.modes._prompt_yn", return_value=True,
+        ), patch(
+            "agentor.committer._DELETE_WAIT_SECONDS", 0.2,
+        ):
+            acted, _ = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("live1"), "x",
+            )
+        self.assertTrue(acted)
+        self.assertEqual(self.daemon.proc_registry.killed, ["live1"])
+        self.assertIsNone(self.store.get("live1"))
+        self.assertTrue(self.store.is_deleted("live1"))
 
 
 class TestIsAutoResolveChain(unittest.TestCase):

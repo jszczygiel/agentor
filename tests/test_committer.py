@@ -834,8 +834,9 @@ class TestConcurrentIntegration(unittest.TestCase):
 
 class TestDeleteIdea(unittest.TestCase):
     """`delete_idea` is the committer-layer wrapper the dashboard calls
-    when the operator confirms `x` in deferred mode. It must hard-delete
-    (not just CANCELLED-transition) and tombstone the id."""
+    when the operator confirms `x` in the inspect view. It must
+    hard-delete (not just CANCELLED-transition) and tombstone the id,
+    tearing down any live runner state on the way."""
 
     def setUp(self):
         self.td = TemporaryDirectory()
@@ -859,7 +860,10 @@ class TestDeleteIdea(unittest.TestCase):
         item = self.store.get("d1")
         self.assertIsNotNone(item)
 
-        delete_idea(self.store, item)
+        # DEFERRED items have no worktree and no live subprocess, so
+        # config/daemon can be None — the cross-status inspect delete
+        # exercises the other branches.
+        delete_idea(None, self.store, None, item)
 
         self.assertIsNone(self.store.get("d1"))
         self.assertTrue(self.store.is_deleted("d1"))
