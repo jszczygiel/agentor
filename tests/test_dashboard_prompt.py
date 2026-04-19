@@ -24,6 +24,13 @@ class _FakeStdscr:
         self.nodelay_calls: list[bool] = []
         self.refresh_calls = 0
         self.touchwin_calls = 0
+        # Paint log for the backdrop-ordering test. Each entry is the
+        # positional args tuple passed to addnstr().
+        self.addnstr_calls: list[tuple] = []
+        # Ordered event log so tests can assert backdrop paints happen
+        # before popup windows are created. Shared with the newwin patch
+        # via _install_fakes.
+        self.event_log: list[str] = []
 
     def getmaxyx(self):
         return (self._h, self._w)
@@ -36,6 +43,10 @@ class _FakeStdscr:
 
     def refresh(self):
         self.refresh_calls += 1
+
+    def addnstr(self, *args, **_kw):
+        self.addnstr_calls.append(args)
+        self.event_log.append("addnstr")
 
 
 class _FakeWin:
@@ -52,15 +63,20 @@ class _FakeWin:
     def keypad(self, flag): self.keypad_calls.append(flag)
 
 
-def _install_fakes(monkey, textbox_factory, newwin_calls=None):
+def _install_fakes(monkey, textbox_factory, newwin_calls=None,
+                   event_log=None):
     """Patch the curses entry points `_prompt_multiline` calls. Returns the
     unittest.mock.patch context managers started for cleanup by the caller.
 
     When `newwin_calls` is a list, each `curses.newwin(...)` call is appended
-    so tests can inspect the sizes the overlay requested."""
+    so tests can inspect the sizes the overlay requested. When `event_log`
+    is a list, each newwin call appends `"newwin"` so tests can assert
+    relative ordering of stdscr paints vs. popup window creation."""
     def _newwin(*a, **_kw):
         if newwin_calls is not None:
             newwin_calls.append(a)
+        if event_log is not None:
+            event_log.append("newwin")
         return _FakeWin()
 
     patches = [
@@ -222,6 +238,60 @@ class TestPromptMultiline(unittest.TestCase):
         self.assertEqual(out, "hi")
         self.assertIn("label", called["message"])
         self.assertIn("empty=cancel", called["message"])
+
+    def test_backdrop_painted_before_popup_on_wide_terminal(self):
+        # On wide terminals (~160+ cols) the 80-col popup doesn't cover the
+        # screen; the overlay must blank stdscr before drawing its frame so
+        # pre-existing table/panel cells don't bleed through the margins.
+        class FakeTextbox:
+            def __init__(self, win):
+                self.stripspaces = True
+            def edit(self, validator): pass
+            def gather(self): return ""
+
+        stdscr = _FakeStdscr(h=40, w=200)
+        _install_fakes(self.ctx, FakeTextbox,
+                       newwin_calls=None, event_log=stdscr.event_log)
+        render._prompt_multiline(stdscr, "label")
+
+        # Backdrop covers every row of stdscr.
+        self.assertEqual(len(stdscr.addnstr_calls), 40)
+        # Every paint targets column 0 with width w-1 and carries A_DIM so
+        # the modal signals the dashboard is inert.
+        for y, (ay, ax, text, n, attr) in enumerate(stdscr.addnstr_calls):
+            self.assertEqual(ay, y)
+            self.assertEqual(ax, 0)
+            self.assertEqual(n, 199)
+            self.assertEqual(text, " " * 199)
+            self.assertTrue(attr & curses.A_DIM)
+        # All backdrop paints precede the first popup window creation.
+        first_newwin = stdscr.event_log.index("newwin")
+        self.assertTrue(all(e == "addnstr"
+                            for e in stdscr.event_log[:first_newwin]))
+        self.assertEqual(stdscr.event_log.count("addnstr"), 40)
+
+    def test_backdrop_swallows_curses_error(self):
+        # If a row-paint raises curses.error (bottom-right cell quirks on
+        # some curses builds) the widget must keep going and still open the
+        # popup — the leak fix is best-effort, not a new failure mode.
+        class FakeTextbox:
+            def __init__(self, win):
+                self.stripspaces = True
+            def edit(self, validator): pass
+            def gather(self): return ""
+
+        class _RaisingStdscr(_FakeStdscr):
+            def addnstr(self, *args, **kw):
+                super().addnstr(*args, **kw)
+                raise curses.error("boom")
+
+        stdscr = _RaisingStdscr(h=20, w=120)
+        newwin_calls: list[tuple] = []
+        _install_fakes(self.ctx, FakeTextbox, newwin_calls=newwin_calls)
+        # Must not raise despite every addnstr failing.
+        render._prompt_multiline(stdscr, "label")
+        # Frame + edit_win still created.
+        self.assertEqual(len(newwin_calls), 2)
 
 
 class TestNewIssueNoteIsMultiline(unittest.TestCase):
