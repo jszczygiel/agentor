@@ -763,8 +763,9 @@ def _prompt_text(stdscr, message: str) -> str:
 
 def _prompt_multiline(stdscr, label: str, *, rows: int | None = None) -> str:
     """Multi-line text entry in a centered overlay. Enter inserts a newline;
-    Ctrl-G submits; Ctrl-C or Esc cancels (empty string). Empty submit also
-    returns empty. Falls back to `_prompt_text` on very small terminals.
+    Ctrl-G or Ctrl-X submits; Ctrl-C or Esc cancels (empty string). Empty
+    submit also returns empty. Falls back to `_prompt_text` on very small
+    terminals.
 
     `rows` is the visible edit area height. When None, it adapts to the
     terminal — larger terminals get more room for longer feedback, capped
@@ -797,7 +798,7 @@ def _prompt_multiline(stdscr, label: str, *, rows: int | None = None) -> str:
                       header, box_w - 2, curses.A_BOLD | curses.A_REVERSE)
     except curses.error:
         pass
-    footer = " Ctrl-G submit · Ctrl-C cancel · empty=cancel "[: box_w - 2]
+    footer = " Ctrl-G/X submit · Ctrl-C cancel · empty=cancel "[: box_w - 2]
     try:
         frame.addnstr(box_h - 1, max(1, (box_w - len(footer)) // 2),
                       footer, box_w - 2, curses.A_DIM)
@@ -818,6 +819,8 @@ def _prompt_multiline(stdscr, label: str, *, rows: int | None = None) -> str:
         if ch in (3, 27):  # Ctrl-C, Esc
             cancelled["flag"] = True
             return 7  # Ctrl-G — terminate edit()
+        if ch == 24:  # Ctrl-X — nano-style submit
+            return 7
         if ch in (127, curses.KEY_BACKSPACE, 8):
             return curses.KEY_BACKSPACE
         return ch
