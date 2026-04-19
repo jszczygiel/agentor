@@ -11,7 +11,6 @@ _COL_ID = 10      # 8 chars + 2 pad
 _COL_STATE = 18   # widest status name + pad
 _COL_ELAPSED = 9
 _COL_CTX = 6      # "100%  " — last-turn context fill vs window
-_COL_SOURCE = 26
 
 
 def _fmt_elapsed(sec: float | None) -> str:
