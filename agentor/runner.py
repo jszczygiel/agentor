@@ -13,6 +13,7 @@ from pathlib import Path
 from . import git_ops
 from .config import Config
 from .models import ItemStatus
+from .resume_primer import build_primer
 from .slug import slugify
 from .store import Store, StoredItem
 
@@ -572,6 +573,17 @@ class ClaudeRunner(Runner):
             plan=plan,
         )
         prompt += _mark_done_instruction(self.config, item.source_file)
+        # Kill-resume primer. An existing `.execute.log` means a prior
+        # attempt was interrupted (e.g. `agentor shutdown` mid-run). The
+        # resumed claude session keeps its prompt cache but has no
+        # structured record of which files it already Read/Grep'd, so it
+        # cold-starts discovery and re-Reads — ~18k tokens wasted in the
+        # worst observed case. Summarise the prior tool activity and
+        # prepend it so the agent knows what not to re-fetch. The subprocess
+        # will overwrite this log on start, so we read it before launching.
+        primer = build_primer(self._execute_transcript_path(item))
+        if primer:
+            prompt = f"{primer}\n{prompt}"
         prompt = self._prepend_feedback(item, prompt, phase="execute")
         summary, stdout = self._invoke_claude(item, worktree, prompt)
         files = _list_changes(worktree, self.config.git.base_branch)
@@ -610,6 +622,15 @@ class ClaudeRunner(Runner):
         )
         return block + prompt
 
+    def _transcript_path(self, item: StoredItem, phase_tag: str) -> Path:
+        return (
+            self.config.project_root / ".agentor" / "transcripts"
+            / f"{item.id}.{phase_tag}.log"
+        )
+
+    def _execute_transcript_path(self, item: StoredItem) -> Path:
+        return self._transcript_path(item, "execute")
+
     def _invoke_claude(
         self, item: StoredItem, worktree: Path, prompt: str,
     ) -> tuple[str, str]:
@@ -646,10 +667,7 @@ class ClaudeRunner(Runner):
             args += ["--session-id", session_id]
 
         phase_tag = "execute" if had_session else "plan"
-        transcript_path = (
-            self.config.project_root / ".agentor" / "transcripts"
-            / f"{item.id}.{phase_tag}.log"
-        )
+        transcript_path = self._transcript_path(item, phase_tag)
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
 
         streaming = "stream-json" in args
