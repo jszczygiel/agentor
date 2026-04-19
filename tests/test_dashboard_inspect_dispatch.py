@@ -601,6 +601,26 @@ class TestInspectPriorityKeys(unittest.TestCase):
         self._drive(curses.KEY_SF)
         self.assertEqual(self.store.get("pri1").priority, 2)
 
+    def test_plus_bumps_priority_up(self):
+        self._drive(ord("+"))
+        self.assertEqual(self.store.get("pri1").priority, 1)
+
+    def test_minus_clamps_priority_at_zero(self):
+        self._drive(ord("-"))
+        self.assertEqual(self.store.get("pri1").priority, 0)
+
+    def test_minus_decrements_non_zero_priority(self):
+        self.store.bump_priority("pri1", 3)
+        self._drive(ord("-"))
+        self.assertEqual(self.store.get("pri1").priority, 2)
+
+    def test_repeated_plus_accumulates_without_status_change(self):
+        status_before = self.store.get("pri1").status
+        self._drive(ord("+"), ord("+"), ord("+"))
+        got = self.store.get("pri1")
+        self.assertEqual(got.priority, 3)
+        self.assertEqual(got.status, status_before)
+
     def test_repeated_bumps_accumulate_without_status_change(self):
         status_before = self.store.get("pri1").status
         self._drive(ord("P"), ord("P"), ord("P"))
@@ -610,17 +630,17 @@ class TestInspectPriorityKeys(unittest.TestCase):
 
 
 class TestInspectFooterPriorityHint(unittest.TestCase):
-    """The inspect footer must advertise `[P/O]priority` regardless of
-    whether the current status has any action keys, so the binding stays
+    """The inspect footer must advertise the priority bindings regardless
+    of whether the current status has any action keys, so the binding stays
     discoverable on view-only screens (WORKING, QUEUED, MERGED)."""
 
     def test_priority_hint_present_on_view_only_status(self):
         footer = _inspect_footer(ItemStatus.WORKING, cycle=False)
-        self.assertIn("[P/O]priority", footer)
+        self.assertIn("[+/-/P/O]priority", footer)
 
     def test_priority_hint_present_alongside_actions(self):
         footer = _inspect_footer(ItemStatus.AWAITING_PLAN_REVIEW, cycle=False)
-        self.assertIn("[P/O]priority", footer)
+        self.assertIn("[+/-/P/O]priority", footer)
         self.assertIn("[a]approve→execute", footer)
 
 
