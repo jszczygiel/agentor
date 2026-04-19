@@ -357,14 +357,30 @@ def resubmit_conflicted(
 
 def reject(store: Store, item: StoredItem, feedback: str) -> None:
     """Terminal rejection. Keeps worktree+session around for forensics but
-    moves the item out of the active flow. Valid at either plan or code
-    review stage."""
+    moves the item out of the active flow. Valid at plan review, code
+    review, or direct from QUEUED (operator discards a freshly discovered
+    item before the daemon picks it up)."""
     assert item.status in (
-        ItemStatus.AWAITING_REVIEW, ItemStatus.AWAITING_PLAN_REVIEW,
+        ItemStatus.AWAITING_REVIEW,
+        ItemStatus.AWAITING_PLAN_REVIEW,
+        ItemStatus.QUEUED,
     )
     store.transition(
         item.id, ItemStatus.REJECTED,
         feedback=feedback, note="rejected by user",
+    )
+
+
+def set_feedback(store: Store, item: StoredItem, feedback: str) -> None:
+    """Seed `item.feedback` for a QUEUED item so the runner's
+    `_prepend_feedback` injects it into the first prompt on dispatch.
+    Writes a same-state transition for audit history; the runner clears
+    the column on consumption so a later run starts clean."""
+    assert item.status == ItemStatus.QUEUED
+    store.transition(
+        item.id, ItemStatus.QUEUED,
+        feedback=feedback,
+        note="feedback seeded for next run",
     )
 
 

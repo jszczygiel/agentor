@@ -875,6 +875,59 @@ class TestDeleteIdea(unittest.TestCase):
         self.assertEqual(row["note"], "deleted from deferred")
 
 
+class TestRejectAndSetFeedback(unittest.TestCase):
+    """`reject` and `set_feedback` are the committer-layer entry points
+    the inspect view invokes for the new QUEUED actions. Cover the
+    cross-status reach of `reject` and verify `set_feedback` seeds
+    `item.feedback` without mutating status so the runner consumes it on
+    first dispatch."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.store = Store(Path(self.td.name) / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _seed_queued(self, id: str = "q1"):
+        from agentor.models import Item
+        self.store.upsert_discovered(Item(
+            id=id, title="idea", body="b",
+            source_file="backlog.md", source_line=1, tags={},
+        ))
+        return self.store.get(id)
+
+    def test_reject_from_queued_sets_feedback_and_status(self):
+        from agentor.committer import reject
+        item = self._seed_queued("q1")
+        reject(self.store, item, "no thanks")
+        got = self.store.get("q1")
+        self.assertEqual(got.status, ItemStatus.REJECTED)
+        self.assertEqual(got.feedback, "no thanks")
+
+    def test_set_feedback_keeps_item_queued(self):
+        from agentor.committer import set_feedback
+        item = self._seed_queued("q1")
+        set_feedback(self.store, item, "please use X")
+        got = self.store.get("q1")
+        self.assertEqual(got.status, ItemStatus.QUEUED)
+        self.assertEqual(got.feedback, "please use X")
+
+    def test_set_feedback_writes_same_state_audit_row(self):
+        """`set_feedback` persists a QUEUED → QUEUED transition so the
+        history view shows when an operator seeded a note."""
+        from agentor.committer import set_feedback
+        item = self._seed_queued("q1")
+        set_feedback(self.store, item, "please use X")
+        notes = [
+            t.note for t in self.store.transitions_for("q1")
+            if t.from_status == ItemStatus.QUEUED
+            and t.to_status == ItemStatus.QUEUED
+        ]
+        self.assertIn("feedback seeded for next run", notes)
+
+
 class TestAdvanceUserCheckout(unittest.TestCase):
     """After a clean auto-merge CAS-advances refs/heads/<base>, the user's
     primary checkout at `project.root` should fast-forward so its index
