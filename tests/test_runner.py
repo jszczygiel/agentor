@@ -1023,6 +1023,223 @@ class TestErrorClassifiers(unittest.TestCase):
         self.assertNotEqual(s1, s3)
 
 
+class TestTransientClassifier(unittest.TestCase):
+    def test_retryable_errors(self):
+        from agentor.runner import _is_transient_error
+        for msg in (
+            "claude exited 1: 429 rate limited",
+            "claude exited 1: HTTP 500 Internal Server Error",
+            "claude exited 1: HTTP 502 Bad Gateway",
+            "claude exited 1: HTTP 503 Service Unavailable",
+            "claude exited 1: HTTP 504 Gateway Timeout",
+            "claude exited 1: Connection reset by peer",
+            "claude exited 1: Connection refused",
+            "claude exited 1: Temporary failure in name resolution",
+            "claude exited 1: urllib3.exceptions.ReadTimeoutError: read timed out",
+            "claude exited 1: overloaded_error",
+        ):
+            self.assertTrue(
+                _is_transient_error(msg, 1.0, 100.0),
+                f"{msg!r} should be transient",
+            )
+
+    def test_fatal_errors(self):
+        from agentor.runner import _is_transient_error
+        for msg in (
+            "claude exited 1: Invalid API key provided",
+            "claude exited 1: unauthorized",
+            "claude exited 1: 403 Forbidden",
+            "claude exited 1: quota exceeded",
+            "claude exited 1: credit balance is too low",
+            "claude exited 1: SyntaxError in foo.py line 42",
+            "claude killed: max_turns=30 hit",
+            "claude killed: max_cost_usd=3.0 hit",
+            "do_work: No conversation found with session ID: abc",
+            "do_work: claude killed: agentor shutdown",
+            "worktree_add: fatal: not a git repository",
+            "",
+        ):
+            self.assertFalse(
+                _is_transient_error(msg, 1.0, 100.0),
+                f"{msg!r} should not be transient",
+            )
+
+    def test_timeout_near_budget_is_not_transient(self):
+        """A real hang (elapsed at/above 90% of the configured budget)
+        should not retry — the agent isn't coming back."""
+        from agentor.runner import _is_transient_error
+        self.assertFalse(_is_transient_error(
+            "claude timed out after 30s", elapsed=30.0, timeout_seconds=30.0))
+        self.assertFalse(_is_transient_error(
+            "claude timed out after 30s", elapsed=27.0, timeout_seconds=30.0))
+
+    def test_subbudget_timeout_is_transient(self):
+        """A timeout-looking error that fired well before the configured
+        budget is a hiccup worth retrying."""
+        from agentor.runner import _is_transient_error
+        self.assertTrue(_is_transient_error(
+            "HTTPConnection.read timed out", elapsed=2.0,
+            timeout_seconds=100.0))
+
+    def test_backoff_delay_grows_and_clamps(self):
+        from agentor.runner import _backoff_delay, _RETRY_DELAYS
+        d0 = _backoff_delay(0)
+        d1 = _backoff_delay(1)
+        d2 = _backoff_delay(2)
+        d9 = _backoff_delay(9)
+        # Each delay is within [base, base * (1 + jitter)]
+        self.assertGreaterEqual(d0, _RETRY_DELAYS[0])
+        self.assertGreater(d1, d0 - 1)  # grows monotonically in expectation
+        self.assertGreaterEqual(d2, _RETRY_DELAYS[2])
+        # Indexes past the table clamp to the final value
+        self.assertGreaterEqual(d9, _RETRY_DELAYS[-1])
+        self.assertLess(d9, _RETRY_DELAYS[-1] * 2)
+
+
+class TestTransientRetry(unittest.TestCase):
+    """Fake-claude-based integration: loop retries on transient errors,
+    refunds the attempt on success, fails fast on fatal errors."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name) / "proj"
+        self.root.mkdir()
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] do X\n")
+        self.store = Store(self.root / ".agentor" / "state.db")
+        # Replace the module-level sleep with a no-op so the backoff loop
+        # doesn't actually wait. Restore on tearDown.
+        from agentor import runner as runner_mod
+        self._runner_mod = runner_mod
+        self._orig_sleep = runner_mod._sleep
+        runner_mod._sleep = lambda _s: None
+
+    def tearDown(self):
+        self._runner_mod._sleep = self._orig_sleep
+        self.store.close()
+        self.td.cleanup()
+
+    def _cfg(self, bin_dir: Path, transient_retries: int,
+             max_attempts: int = 2) -> Config:
+        return Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                runner="claude", pool_size=1, max_attempts=max_attempts,
+                command=[str(bin_dir / "claude"), "-p", "{prompt}"],
+                plan_prompt_template="PLAN: {title}",
+                execute_prompt_template="EXEC: {title}\nplan={plan}",
+                timeout_seconds=10,
+                transient_retries=transient_retries,
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+
+    def _run(self, cfg: Config):
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        runner_inst = make_runner(cfg, self.store)
+        return claimed, runner_inst.run(claimed)
+
+    def test_transient_then_success_does_not_charge_attempt(self):
+        counter = Path(self.td.name) / "counter"
+        bin_dir = Path(self.td.name) / "bin"
+        # Two transient 429s then a normal plan response on the third call.
+        script = f"""
+N=$(cat "{counter}" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "{counter}"
+if [ "$N" -lt 3 ]; then
+  echo "Error: 429 rate limited" >&2
+  exit 1
+fi
+echo "plan text ok"
+"""
+        _write_fake_claude(bin_dir, script)
+        cfg = self._cfg(bin_dir, transient_retries=3)
+        claimed, result = self._run(cfg)
+        self.assertIsNone(result.error, msg=result.error)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_PLAN_REVIEW)
+        # claim_next_queued charges one attempt; in-dispatch retries don't
+        # add more — a transient flap must not burn max_attempts.
+        self.assertEqual(refreshed.attempts, 1)
+        self.assertEqual(counter.read_text().strip(), "3")
+        transcript = (
+            self.root / ".agentor" / "transcripts"
+            / f"{claimed.id}.plan.log"
+        ).read_text()
+        self.assertIn("RETRY 1/3", transcript)
+        self.assertIn("RETRY 2/3", transcript)
+        self.assertIn("429", transcript)
+
+    def test_transient_budget_exhausted_surfaces_error(self):
+        counter = Path(self.td.name) / "counter"
+        bin_dir = Path(self.td.name) / "bin"
+        script = f"""
+N=$(cat "{counter}" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "{counter}"
+echo "Error: 429 rate limited" >&2
+exit 1
+"""
+        _write_fake_claude(bin_dir, script)
+        cfg = self._cfg(bin_dir, transient_retries=2)
+        claimed, result = self._run(cfg)
+        self.assertIsNotNone(result.error)
+        self.assertIn("429", result.error)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.ERRORED)
+        # 1 initial + 2 retries = 3 invocations.
+        self.assertEqual(counter.read_text().strip(), "3")
+
+    def test_non_transient_error_fails_fast(self):
+        counter = Path(self.td.name) / "counter"
+        bin_dir = Path(self.td.name) / "bin"
+        script = f"""
+N=$(cat "{counter}" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "{counter}"
+echo "SyntaxError: invalid syntax at foo.py line 42" >&2
+exit 1
+"""
+        _write_fake_claude(bin_dir, script)
+        cfg = self._cfg(bin_dir, transient_retries=3)
+        claimed, result = self._run(cfg)
+        self.assertIsNotNone(result.error)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.ERRORED)
+        # No retry — fatal classifier short-circuits immediately.
+        self.assertEqual(counter.read_text().strip(), "1")
+        transcript = (
+            self.root / ".agentor" / "transcripts"
+            / f"{claimed.id}.plan.log"
+        ).read_text()
+        self.assertNotIn("RETRY", transcript)
+
+    def test_transient_retries_zero_disables_loop(self):
+        counter = Path(self.td.name) / "counter"
+        bin_dir = Path(self.td.name) / "bin"
+        script = f"""
+N=$(cat "{counter}" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "{counter}"
+echo "Error: 429 rate limited" >&2
+exit 1
+"""
+        _write_fake_claude(bin_dir, script)
+        cfg = self._cfg(bin_dir, transient_retries=0)
+        claimed, result = self._run(cfg)
+        self.assertIsNotNone(result.error)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.ERRORED)
+        self.assertEqual(counter.read_text().strip(), "1")
+
+
 class TestProcRegistry(unittest.TestCase):
     def test_register_kill_unregister(self):
         from agentor.runner import ProcRegistry

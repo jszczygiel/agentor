@@ -152,6 +152,11 @@ class AgentConfig:
     # Hard cap on agent turns. 0 disables. Live stream watches num_turns
     # and kills the child when exceeded.
     max_turns: int = 0
+    # In-dispatch retry budget for transient CLI failures (HTTP 429/5xx,
+    # network resets, DNS blips, sub-budget timeouts). Each retry uses
+    # exponential backoff; a success refunds the attempt because the
+    # retries happen inside a single claim. 0 disables the loop.
+    transient_retries: int = 3
     # Seconds to pause between successive dispatches in a single
     # try_fill_pool burst, so the first agent can populate the shared
     # system-prompt cache before siblings race for the same prefix.
