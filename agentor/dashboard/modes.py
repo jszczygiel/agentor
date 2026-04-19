@@ -71,7 +71,6 @@ _ACTION_KEYS_BY_STATUS: dict[ItemStatus, list[tuple[str, str]]] = {
     ],
     ItemStatus.CONFLICTED: [
         ("m", "[m]retry merge"),
-        ("e", "[e]resubmit to agent"),
         ("s", "[s]defer"),
         ("x", "[x]delete"),
     ],
@@ -301,7 +300,6 @@ def _inspect_dispatch(
         delete_idea,
         reject_and_retry,
         restore_deferred,
-        resubmit_conflicted,
         retry,
         retry_merge,
     )
@@ -393,14 +391,6 @@ def _inspect_dispatch(
                 _, msg = ok_msg  # type: ignore[misc]
             except Exception as e:
                 msg = f"retry failed: {e}"
-            return True, msg
-        if key == "e":
-            try:
-                resubmit_conflicted(cfg, store, item)
-                msg = (f"resubmitted: {item.id[:8]} → queued "
-                       f"(agent will resolve)")
-            except Exception as e:
-                msg = f"resubmit failed: {e}"
             return True, msg
         if key == "s":
             defer(store, item)

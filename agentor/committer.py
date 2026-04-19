@@ -311,12 +311,11 @@ def resubmit_conflicted(
     plan phase and dispatches straight into execute — conflict resolution
     is pure execute work (open worktree, resolve markers, re-run tests,
     commit), and the plan turn is wasted tokens + wall-clock. Used by
-    `approve_and_commit`'s auto-resolve chain; manual `[e]resubmit` from
-    the dashboard keeps the default (re-plans first).
+    `approve_and_commit`'s auto-resolve chain.
 
     `note` overrides the transition note — `approve_and_commit` passes a
     string prefixed with `AUTO_RESOLVE_NOTE_PREFIX` so the dashboard can
-    tell an auto-chained resubmit apart from a manual `[e]` press."""
+    flag an auto-chained resubmit in the transitions history."""
     assert item.status == ItemStatus.CONFLICTED, \
         f"resubmit_conflicted expects CONFLICTED, got {item.status}"
     assert item.worktree_path and item.branch

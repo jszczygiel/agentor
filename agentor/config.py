@@ -222,8 +222,9 @@ class GitConfig:
     # When true, a CONFLICTED transition from approve_and_commit is
     # immediately followed by resubmit_conflicted — the item lands in
     # QUEUED with conflict-resolution feedback so the agent fixes the
-    # merge in-place. Off by default: existing workflows keep the manual
-    # [m] retry_merge / [e] resubmit dashboard gates.
+    # merge in-place. Off by default: the operator resolves conflicts
+    # by hand in the feature worktree and presses `[m]` in the dashboard
+    # inspect view to re-run the merge.
     auto_resolve_conflicts: bool = False
     # After a clean auto-merge CAS-advances `refs/heads/<base_branch>`, the
     # user's primary checkout at `project.root` still reads stale files

@@ -449,6 +449,68 @@ class TestInspectDispatch(unittest.TestCase):
         self.assertIsNone(self.store.get("live1"))
         self.assertTrue(self.store.is_deleted("live1"))
 
+    def _seed_conflicted(self, id: str) -> None:
+        """CONFLICTED is reached via AWAITING_REVIEW → CONFLICTED, matching
+        the real committer flow. Required so the tested dispatch sees the
+        status gate the inspect view presents."""
+        self._seed(id, ItemStatus.QUEUED)
+        self.store.transition(id, ItemStatus.WORKING, note="t")
+        self.store.transition(id, ItemStatus.AWAITING_REVIEW, note="t")
+        self.store.transition(
+            id, ItemStatus.CONFLICTED,
+            worktree_path="/tmp/nope", branch=f"agent/{id}",
+            note="conflict",
+        )
+
+    def test_conflicted_m_invokes_retry_merge(self):
+        """`[m]` is the sole CONFLICTED action after the [e] collapse — it
+        routes through `_run_with_progress` to `retry_merge`. The dispatch
+        surfaces the (ok, msg) tuple message as the flash string."""
+        self._seed_conflicted("cm1")
+
+        called = {}
+
+        def fake_retry_merge(cfg, store, item, *, progress=None):
+            called["args"] = (cfg, store, item.id)
+            return True, "merged deadbeef into main"
+
+        def fake_progress(stdscr, title, work, hint=None):
+            return work(lambda _m: None)
+
+        with patch(
+            "agentor.committer.retry_merge", side_effect=fake_retry_merge,
+        ), patch(
+            "agentor.dashboard.modes._run_with_progress",
+            side_effect=fake_progress,
+        ):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("cm1"), "m",
+            )
+        self.assertTrue(acted)
+        self.assertEqual(msg, "merged deadbeef into main")
+        self.assertEqual(called["args"][2], "cm1")
+
+    def test_conflicted_e_key_is_no_op_after_collapse(self):
+        """`[e]resubmit to agent` was collapsed out; pressing `e` at a
+        CONFLICTED row must not transition the item or fire the committer
+        resubmit entry-point."""
+        self._seed_conflicted("ce1")
+        import agentor.committer as _committer
+        with patch.object(
+            _committer, "resubmit_conflicted",
+        ) as mock_resubmit:
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("ce1"), "e",
+            )
+        self.assertFalse(acted)
+        self.assertEqual(msg, "")
+        mock_resubmit.assert_not_called()
+        self.assertEqual(
+            self.store.get("ce1").status, ItemStatus.CONFLICTED,
+        )
+
 
 class TestIsAutoResolveChain(unittest.TestCase):
     """The inspect detail view uses `_is_auto_resolve_chain` to decide

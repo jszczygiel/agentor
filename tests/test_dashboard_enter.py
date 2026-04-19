@@ -26,9 +26,12 @@ class TestInspectActionMap(unittest.TestCase):
         ]}
         self.assertEqual(keys, {"a", "r", "s", "v", "x"})
 
-    def test_conflicted_has_retry_merge_resubmit_defer(self):
+    def test_conflicted_has_retry_merge_defer_delete(self):
+        # [e]resubmit-to-agent collapsed into the [m]retry-merge binding:
+        # operators pick one or the other via `git.auto_resolve_conflicts`,
+        # which automates the resubmit path when enabled.
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[ItemStatus.CONFLICTED]}
-        self.assertEqual(keys, {"m", "e", "s", "x"})
+        self.assertEqual(keys, {"m", "s", "x"})
 
     def test_errored_has_retry_and_defer(self):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[ItemStatus.ERRORED]}
@@ -77,7 +80,7 @@ class TestInspectActionMap(unittest.TestCase):
         # "a" is the primary forward action in every status that has a
         # non-delete action (approve / retry / restore). Statuses whose
         # only action is `[x]delete` (QUEUED, WORKING, APPROVED, MERGED,
-        # CANCELLED) and CONFLICTED (uses m/e/s instead) are excluded.
+        # CANCELLED) and CONFLICTED (uses m/s instead) are excluded.
         delete_only = {"x"}
         for st, pairs in _ACTION_KEYS_BY_STATUS.items():
             keys = {k for k, _ in pairs}
