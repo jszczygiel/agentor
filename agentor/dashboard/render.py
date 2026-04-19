@@ -57,7 +57,6 @@ _STATE_GLYPHS: dict[ItemStatus, str] = {
     ItemStatus.REJECTED: "X",
     ItemStatus.CANCELLED: "K",
     ItemStatus.DEFERRED: "D",
-    ItemStatus.BACKLOG: "B",
     ItemStatus.APPROVED: "A",
 }
 
