@@ -36,6 +36,14 @@ def _has_uncommitted(wt: Path) -> bool:
 _BODY_CAP = 2000
 _RAW_CAP = 1500
 
+# Marker prefix on the CONFLICTED → QUEUED transition note when the
+# auto-resolve chain fires from `approve_and_commit`. The dashboard reads
+# this to distinguish an auto-chained resubmit from a manual `[e]` press.
+AUTO_RESOLVE_NOTE_PREFIX = "auto-resolve"
+_AUTO_RESOLVE_NOTE = (
+    f"{AUTO_RESOLVE_NOTE_PREFIX}: resubmitted from CONFLICTED — agent will resolve"
+)
+
 
 def _build_conflict_summary(
     item: StoredItem, mode: str, base: str, raw: str, *, retry: bool = False,
@@ -129,7 +137,9 @@ def approve_and_commit(
                 refreshed = store.get(item.id)
                 if refreshed is not None and \
                         refreshed.status == ItemStatus.CONFLICTED:
-                    resubmit_conflicted(config, store, refreshed)
+                    resubmit_conflicted(
+                        config, store, refreshed, note=_AUTO_RESOLVE_NOTE,
+                    )
             return sha
 
         assert merge_sha is not None
@@ -208,6 +218,7 @@ def retry_merge(
 
 def resubmit_conflicted(
     config: Config, store: Store, item: StoredItem,
+    *, note: str | None = None,
 ) -> None:
     """Send a CONFLICTED item back to the agent to resolve the merge
     conflict itself. Transitions CONFLICTED → QUEUED; the worktree,
@@ -218,7 +229,11 @@ def resubmit_conflicted(
     The agent's instructions: run `git merge <base>` in its own worktree
     to surface the conflicts, resolve them, and commit. On next approval
     the integration retries — if the feature now includes base's tip,
-    the merge fast-forwards."""
+    the merge fast-forwards.
+
+    `note` overrides the transition note — `approve_and_commit` passes a
+    string prefixed with `AUTO_RESOLVE_NOTE_PREFIX` so the dashboard can
+    tell an auto-chained resubmit apart from a manual `[e]` press."""
     assert item.status == ItemStatus.CONFLICTED, \
         f"resubmit_conflicted expects CONFLICTED, got {item.status}"
     assert item.worktree_path and item.branch
@@ -245,7 +260,7 @@ def resubmit_conflicted(
         feedback=feedback,
         last_error=None,
         attempts=0,
-        note="resubmitted from CONFLICTED — agent will resolve",
+        note=note or "resubmitted from CONFLICTED — agent will resolve",
     )
 
 

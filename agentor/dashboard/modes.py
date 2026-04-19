@@ -413,6 +413,23 @@ def _inspect_dispatch(
     return False, ""
 
 
+def _is_auto_resolve_chain(store: Store, item: StoredItem) -> bool:
+    """True when the item most recently entered QUEUED via the auto-resolve
+    chain from `approve_and_commit` — i.e. the last CONFLICTED → QUEUED
+    transition's note carries `AUTO_RESOLVE_NOTE_PREFIX`. Also matches the
+    still-in-CONFLICTED case after a bounce-back. Scans the tail of the
+    transition history to stay cheap on long-lived items."""
+    # Lazy import — see CLAUDE.md "Lazy `..committer` imports in dashboard".
+    from ..committer import AUTO_RESOLVE_NOTE_PREFIX
+
+    history = store.transitions_for(item.id)
+    for t in reversed(history[-10:]):
+        if t.from_status == ItemStatus.CONFLICTED \
+                and t.to_status == ItemStatus.QUEUED:
+            return (t.note or "").startswith(AUTO_RESOLVE_NOTE_PREFIX)
+    return False
+
+
 def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str]:
     out: list[str] = []
     data = _result_data(item)
@@ -427,6 +444,10 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
     out.append(f"session:  {item.session_id or '—'}")
     out.append(f"attempts: {item.attempts} / {cfg.agent.max_attempts}")
     out.append(f"agentor:  {item.agentor_version or '—'}")
+    if item.status in (ItemStatus.QUEUED, ItemStatus.WORKING,
+                       ItemStatus.CONFLICTED) \
+            and _is_auto_resolve_chain(store, item):
+        out.append("flow:     auto-resolve chain (agent resolving own conflict)")
     elapsed = _elapsed_for(store, item.id)
     if elapsed is not None:
         out.append(f"elapsed:  {_fmt_elapsed(elapsed)} (since enter WORKING)")
