@@ -5,6 +5,11 @@ the current task's scope.
 
 ## Open
 
+- `CodexRunner` does not yet wire `CheckpointEmitter`. Codex uses its own
+  JSONL event shape and `thread_id` resume semantics — the emitter module
+  is runner-agnostic so a follow-up PR can gate on `_CodexStreamState`
+  (no per-turn `output_tokens`, so a turn-count-only gate is the
+  minimum-viable wiring). Scope kept to Claude for this task.
 - `tests/test_config.py` has three unused-import F401 ruff errors (`ReviewConfig`,
   `ParsingConfig`, `SourcesConfig` on lines 9-10). CI runs `ruff check` so these
   should already be failing the workflow — check whether the CI config ignores
