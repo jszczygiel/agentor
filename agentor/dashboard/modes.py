@@ -1,3 +1,4 @@
+import curses
 import subprocess
 import time
 from pathlib import Path
@@ -202,6 +203,20 @@ def _inspect_render(
             if new_scroll >= 0:
                 scroll = new_scroll
                 continue
+            if ch in (curses.KEY_SR, ord("P")):
+                try:
+                    new_val = store.bump_priority(item.id, 1)
+                    _flash(stdscr, f"priority {new_val}")
+                except KeyError:
+                    pass
+                continue
+            if ch in (curses.KEY_SF, ord("O")):
+                try:
+                    new_val = store.bump_priority(item.id, -1)
+                    _flash(stdscr, f"priority {new_val}")
+                except KeyError:
+                    pass
+                continue
             k = chr(ch).lower() if 0 < ch < 256 else ""
             if k == "q":
                 return "quit"
@@ -233,7 +248,9 @@ def _inspect_footer(status: ItemStatus, *, cycle: bool) -> str:
     action_label = _inspect_action_label(status)
     nav = "[j/k]scroll · [space/pgdn]page · auto-refresh 1s"
     close = "[n]ext  [q]uit" if cycle else "[q/enter]close"
-    parts = [action_label, close] if action_label else [close]
+    priority = "[P/O]priority"
+    parts = [action_label] if action_label else []
+    parts += [priority, close]
     return " " + "  ".join(parts) + " · " + nav + " "
 
 

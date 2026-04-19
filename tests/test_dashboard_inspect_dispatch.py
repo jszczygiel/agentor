@@ -3,12 +3,20 @@ tests cover the action keys that don't open a curses prompt so stdscr
 can be passed as None — they pin the state-transition contract the
 unified inspect view offers."""
 
+import curses
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
-from agentor.dashboard.modes import _inspect_dispatch, _is_auto_resolve_chain
+from agentor.dashboard.modes import (
+    _inspect_dispatch,
+    _inspect_footer,
+    _inspect_render,
+    _is_auto_resolve_chain,
+)
 from agentor.models import Item, ItemStatus
 from agentor.store import Store
 
@@ -243,6 +251,115 @@ class TestIsAutoResolveChain(unittest.TestCase):
         self.store.transition("a1", ItemStatus.AWAITING_REVIEW, note="t")
         self.store.transition("a1", ItemStatus.CONFLICTED, note="still")
         self.assertTrue(_is_auto_resolve_chain(self.store, self._fresh("a1")))
+
+
+class _KeyFeedStdscr:
+    """Minimal stdscr fake that feeds `_inspect_render` a scripted key
+    sequence. Returns each queued keycode once, then `ord("q")` forever so
+    the render loop always terminates even if the test forgets to append
+    the quit key."""
+
+    def __init__(self, keys, h: int = 40, w: int = 120):
+        self._keys = list(keys)
+        self._h = h
+        self._w = w
+
+    def getmaxyx(self):
+        return (self._h, self._w)
+
+    def getch(self):
+        return self._keys.pop(0) if self._keys else ord("q")
+
+    def timeout(self, _ms):
+        pass
+
+    def nodelay(self, _flag):
+        pass
+
+    def erase(self):
+        pass
+
+    def addnstr(self, *_a, **_kw):
+        pass
+
+    def refresh(self):
+        pass
+
+
+def _fake_cfg(project_root: Path) -> SimpleNamespace:
+    """Minimal Config stub — `_build_detail_lines` only reads
+    `cfg.project_root` (for transcript path) and `cfg.agent.max_attempts`."""
+    return SimpleNamespace(
+        project_root=project_root,
+        agent=SimpleNamespace(max_attempts=3),
+    )
+
+
+class TestInspectPriorityKeys(unittest.TestCase):
+    """`_inspect_render` must accept priority bump keys (P/O and
+    Shift+Up/Shift+Down) without closing the view or changing item status.
+    The main-dashboard loop already handles these — the inspect view
+    mirrors the bindings so the operator doesn't need to close the detail
+    screen to prioritize."""
+
+    def setUp(self) -> None:
+        self.td = TemporaryDirectory()
+        self.store = Store(Path(self.td.name) / "state.db")
+        self.store.upsert_discovered(_mk("pri1"))
+        self.cfg = _fake_cfg(Path(self.td.name))
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self.td.cleanup()
+
+    def _drive(self, *keys):
+        fresh = self.store.get("pri1")
+        stdscr = _KeyFeedStdscr(list(keys) + [ord("q")])
+        # `_flash` sleeps 1200ms via curses.napms — skip that in tests.
+        # `_show_item_screen` touches curses.color_pair which needs initscr().
+        with patch("agentor.dashboard.render.curses.napms", lambda *_a: None), \
+                patch("agentor.dashboard.render.curses.color_pair",
+                      return_value=0):
+            _inspect_render(stdscr, self.cfg, self.store, fresh, None)
+
+    def test_capital_P_bumps_priority_up(self):
+        self._drive(ord("P"))
+        self.assertEqual(self.store.get("pri1").priority, 1)
+
+    def test_capital_O_clamps_priority_at_zero(self):
+        self._drive(ord("O"))
+        self.assertEqual(self.store.get("pri1").priority, 0)
+
+    def test_shift_up_bumps_priority_up(self):
+        self._drive(curses.KEY_SR)
+        self.assertEqual(self.store.get("pri1").priority, 1)
+
+    def test_shift_down_reduces_priority(self):
+        self.store.bump_priority("pri1", 3)
+        self._drive(curses.KEY_SF)
+        self.assertEqual(self.store.get("pri1").priority, 2)
+
+    def test_repeated_bumps_accumulate_without_status_change(self):
+        status_before = self.store.get("pri1").status
+        self._drive(ord("P"), ord("P"), ord("P"))
+        got = self.store.get("pri1")
+        self.assertEqual(got.priority, 3)
+        self.assertEqual(got.status, status_before)
+
+
+class TestInspectFooterPriorityHint(unittest.TestCase):
+    """The inspect footer must advertise `[P/O]priority` regardless of
+    whether the current status has any action keys, so the binding stays
+    discoverable on view-only screens (WORKING, QUEUED, MERGED)."""
+
+    def test_priority_hint_present_on_view_only_status(self):
+        footer = _inspect_footer(ItemStatus.WORKING, cycle=False)
+        self.assertIn("[P/O]priority", footer)
+
+    def test_priority_hint_present_alongside_actions(self):
+        footer = _inspect_footer(ItemStatus.AWAITING_PLAN_REVIEW, cycle=False)
+        self.assertIn("[P/O]priority", footer)
+        self.assertIn("[a]approve→execute", footer)
 
 
 if __name__ == "__main__":
