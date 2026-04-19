@@ -54,6 +54,15 @@ class Daemon:
         # clear_alert) once the user has fixed the underlying problem.
         self.system_alert: str | None = None
         self.paused: bool = False
+        # Item IDs currently flagged as stale (transcript hasn't been
+        # written to within `agent.stale_session_alert_seconds`). Value is
+        # the transcript mtime_ns at the moment the alert fired, used as
+        # the de-dupe key so a second tick with the same mtime won't spam
+        # logs. `_stale_session_seen` mirrors it but is NOT cleared by
+        # `clear_alert`, so acknowledging ('u') mutes a still-stuck item
+        # until its transcript actually advances.
+        self.stale_session_alerts: dict[str, int] = {}
+        self._stale_session_seen: dict[str, int] = {}
         self._heartbeat_last: float = 0.0
         self._heartbeat_dispatched: int = 0
         # Epoch set when run() starts; used as the "since-daemon-start" cutoff
@@ -88,6 +97,10 @@ class Daemon:
         dashboard 'u' key after the user has fixed the broken slot/repo."""
         self.system_alert = None
         self.paused = False
+        # Clear active stale-session banners; leave `_stale_session_seen`
+        # populated so a still-stuck item (same mtime) stays muted until
+        # its transcript actually moves.
+        self.stale_session_alerts.clear()
         self.log("alert cleared; dispatch resumed")
 
     def _make_runner(self) -> Runner:
@@ -227,6 +240,55 @@ class Daemon:
         finally:
             self.workers.discard(threading.current_thread())
 
+    def _transcript_mtime_ns(self, item_id: str) -> int | None:
+        """Newest mtime_ns across this item's plan/execute transcripts, or
+        None if neither file exists. The runner writes `{id}.{phase}.log`
+        under `.agentor/transcripts/`; checking both phases lets the
+        watchdog survive plan→execute handoff without losing signal."""
+        base = self.config.project_root / ".agentor" / "transcripts"
+        newest: int | None = None
+        for phase in ("plan", "execute"):
+            p = base / f"{item_id}.{phase}.log"
+            try:
+                m = p.stat().st_mtime_ns
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            if newest is None or m > newest:
+                newest = m
+        return newest
+
+    def _check_stale_sessions(self, now_ns: int) -> None:
+        """Walk WORKING items with a live session_id; flag any whose
+        newest transcript mtime is older than the configured threshold.
+        Informational — does not pause dispatch or kill the child."""
+        threshold_s = self.config.agent.stale_session_alert_seconds
+        if threshold_s <= 0:
+            return
+        threshold_ns = threshold_s * 1_000_000_000
+        for item in self.store.list_by_status(ItemStatus.WORKING):
+            if not item.session_id:
+                continue
+            mtime_ns = self._transcript_mtime_ns(item.id)
+            if mtime_ns is None:
+                continue
+            if now_ns - mtime_ns <= threshold_ns:
+                # Session is alive; forget any prior alert so a recurrence
+                # after recovery fires fresh.
+                self.stale_session_alerts.pop(item.id, None)
+                self._stale_session_seen.pop(item.id, None)
+                continue
+            if self._stale_session_seen.get(item.id) == mtime_ns:
+                continue
+            self.stale_session_alerts[item.id] = mtime_ns
+            self._stale_session_seen[item.id] = mtime_ns
+            minutes = (now_ns - mtime_ns) // 60_000_000_000
+            self.log(
+                f"[ALERT] stale session {item.id} — {minutes}m since "
+                f"last transcript write"
+            )
+
     def _install_signal_handlers(self) -> None:
         def handler(signum, frame):
             if self.force_stop:
@@ -275,6 +337,7 @@ class Daemon:
             if result.new_items:
                 self.log(f"scan: {result.new_items} new items")
             self.try_fill_pool()
+            self._check_stale_sessions(time.time_ns())
             try:
                 created = maybe_enqueue_fold_item(self.config, self.store)
             except Exception as e:

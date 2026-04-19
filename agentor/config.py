@@ -202,6 +202,11 @@ class AgentConfig:
     # a future agent clusters the Surprises/Gotchas into CLAUDE.md and
     # deletes the consumed logs in a single commit. 0 disables.
     fold_threshold: int = 10
+    # Seconds of silence on a WORKING item's transcript before the daemon
+    # surfaces a sticky dashboard alert flagging the session as possibly
+    # stuck. Informational only — `timeout_seconds` still owns the kill
+    # decision. 0 disables the check entirely.
+    stale_session_alert_seconds: int = 300
 
 
 @dataclass
