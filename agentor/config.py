@@ -220,6 +220,11 @@ class AgentConfig:
     # written` to the MERGED transition note so operators can grep
     # history for the skip rate.
     require_agent_log: bool = False
+    # Seconds of silence on a WORKING item's transcript before the daemon
+    # surfaces a sticky dashboard alert flagging the session as possibly
+    # stuck. Informational only — `timeout_seconds` still owns the kill
+    # decision. 0 disables the check entirely.
+    stale_session_alert_seconds: int = 300
 
 
 @dataclass
