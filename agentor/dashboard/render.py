@@ -17,9 +17,7 @@ from .formatters import (
     _elapsed_for,
     _fmt_elapsed,
     _fmt_token_compact,
-    _fmt_token_line,
-    _fmt_token_line_mid,
-    _fmt_token_line_narrow,
+    _fmt_token_row,
     _phase_for,
     _token_windows,
 )
@@ -200,8 +198,9 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     )
     _safe_addstr(stdscr, row, 0, status_line, w)
     row += 1
-    row = _render_token_panel(stdscr, row, w, store, daemon, tier,
-                              windows=token_windows)
+    token_row = " " + _fmt_token_row(token_windows, cfg.agent, tier)
+    _safe_addstr(stdscr, row, 0, token_row.ljust(w), w, curses.A_DIM)
+    row += 1
     _safe_addstr(stdscr, row, 0, "─" * w, w, curses.A_DIM)
     row += 1
 
@@ -374,35 +373,6 @@ def _build_status_line(tier: str, cfg, stats, counts: dict,
         f" p={cfg.agent.pool_size} w={worker_count} "
         f"R={review} e={counts[ItemStatus.ERRORED]}"
     )
-
-
-def _render_token_panel(stdscr, row: int, w: int, store, daemon,
-                        tier: str = "wide",
-                        windows: dict | None = None) -> int:
-    """Draw the cumulative token-usage panel: one line per time window
-    (session / today / 7d). Tier-aware so the 71-char wide format
-    doesn't silently clip on phone-width terminals. Returns the next
-    free row.
-
-    `windows` may be pre-computed by the caller to avoid a second
-    `_token_windows` call in the same render tick (the 2s cache also
-    deduplicates, but explicit sharing keeps call-ownership obvious)."""
-    if windows is None:
-        windows = _token_windows(store, daemon.started_at)
-    if tier != "narrow":
-        _safe_addstr(stdscr, row, 0, " tokens".ljust(w), w,
-                     curses.A_DIM | curses.A_BOLD)
-        row += 1
-    for label, totals in windows.items():
-        if tier == "wide":
-            line = " " + _fmt_token_line(label, totals)
-        elif tier == "mid":
-            line = " " + _fmt_token_line_mid(label, totals)
-        else:
-            line = " " + _fmt_token_line_narrow(label, totals)
-        _safe_addstr(stdscr, row, 0, line.ljust(w), w, curses.A_DIM)
-        row += 1
-    return row
 
 
 def _safe_addstr(stdscr, y, x, s, w, attr=0):

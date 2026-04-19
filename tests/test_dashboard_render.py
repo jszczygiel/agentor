@@ -19,7 +19,6 @@ from agentor.dashboard.render import (
     _layout_tier,
     _render,
     _render_table,
-    _render_token_panel,
     _state_glyph,
     _table_header,
     _table_row,
@@ -384,9 +383,12 @@ class TestRenderFitsWidth(unittest.TestCase):
         self.assertIn("+2 more stale session", joined)
 
 
-class TestRenderTokenPanel(unittest.TestCase):
-    """Smoke: the panel writes a header and one line per window into the
-    curses surface. Runs against a real Store so the SELECT path executes."""
+class TestRenderTokenRow(unittest.TestCase):
+    """The token panel was collapsed to a single dim row emitted directly
+    under the status line. Verify the renderer produces exactly one row
+    carrying all three windows (session/today/7d) at each width tier, and
+    that no residual `_render_token_panel` rows (header + 3 window lines)
+    remain."""
 
     def setUp(self):
         self.td = TemporaryDirectory()
@@ -394,6 +396,7 @@ class TestRenderTokenPanel(unittest.TestCase):
         item = Item(id="a", title="t", body="", source_file="s.md",
                     source_line=1, tags={})
         self.store.upsert_discovered(item)
+        # 1234 + 56 + 78000 + 9 = 79299 → "79.3k" via _fmt_tokens.
         self.store.update_result_json("a", json.dumps({
             "usage": {
                 "input_tokens": 1234,
@@ -402,24 +405,63 @@ class TestRenderTokenPanel(unittest.TestCase):
                 "cache_creation_input_tokens": 9,
             },
         }))
+        _token_windows_invalidate()
 
     def tearDown(self):
         self.store.close()
         self.td.cleanup()
 
-    def test_panel_draws_header_and_three_windows(self):
-        stdscr = _FakeStdscr()
-        daemon = SimpleNamespace(started_at=0.0)
-        next_row = _render_token_panel(stdscr, 0, 120, self.store, daemon)
-        # 1 header + 3 window rows = row pointer advances by 4.
-        self.assertEqual(next_row, 4)
-        joined = "\n".join(s for _, s in stdscr.lines)
-        self.assertIn("tokens", joined)
-        self.assertIn("session", joined)
-        self.assertIn("today", joined)
-        self.assertIn("7d", joined)
-        # Values are formatted via _fmt_tokens — 78000 → "78.0k".
-        self.assertIn("78.0k", joined)
+    def _render_at(self, width: int) -> list[tuple[int, str]]:
+        stdscr = _FakeStdscr(width=width)
+        cfg = SimpleNamespace(
+            project_name="demo",
+            agent=SimpleNamespace(runner="stub", pool_size=1,
+                                  context_window=200_000),
+        )
+        daemon = SimpleNamespace(
+            stats=SimpleNamespace(completed=0),
+            system_alert=None,
+            started_at=0.0,
+            workers=set(),
+        )
+        with patch("agentor.dashboard.render.curses.color_pair",
+                   return_value=0), \
+             patch("agentor.dashboard.render._set_terminal_title"):
+            _render(stdscr, cfg, self.store, daemon, log_ring=[],
+                    filter_idx=0, selected_id=None)
+        return stdscr.lines
+
+    def test_wide_emits_single_token_row(self):
+        lines = self._render_at(120)
+        token_lines = [s for _, s in lines if "tokens" in s and "7d" in s]
+        self.assertEqual(len(token_lines), 1)
+        row = token_lines[0]
+        self.assertIn("session", row)
+        self.assertIn("today", row)
+        self.assertIn("7d", row)
+        # daemon not started → session mirrors today; totals are 79.3k.
+        self.assertIn("79.3k", row)
+
+    def test_mid_emits_single_token_row(self):
+        lines = self._render_at(70)
+        token_lines = [s for _, s in lines if "tokens" in s and "7d" in s]
+        self.assertEqual(len(token_lines), 1)
+
+    def test_narrow_uses_short_token_labels(self):
+        lines = self._render_at(50)
+        # Narrow drops `tokens` prefix for `tok` and uses s=/t=/w= shorts.
+        token_lines = [s for _, s in lines if "tok " in s and "w=" in s]
+        self.assertEqual(len(token_lines), 1)
+        self.assertIn("s=", token_lines[0])
+        self.assertIn("t=", token_lines[0])
+
+    def test_no_residual_panel_header(self):
+        # Old panel emitted a bare " tokens" header row above the window
+        # lines. The new one-liner has `tokens` + `session`/`today`/`7d`
+        # all on the same row, so a lone ` tokens` header must not appear.
+        lines = self._render_at(120)
+        stripped = [s.strip() for _, s in lines]
+        self.assertNotIn("tokens", stripped)
 
 
 class TestRenderStatusLineTokenIndicator(unittest.TestCase):
