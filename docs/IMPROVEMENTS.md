@@ -19,7 +19,3 @@ the current task's scope.
   automatic. Consider tagging the transition note (or surfacing an auto-resolve
   badge in the main table) so operators can distinguish a human `[e]` resubmit
   from a committer-driven one.
-- mypy reports `func-returns-value` in `agentor/dashboard/modes.py` around the
-  `_capture_note_for_expansion` callsite — a `(p("…"), call())[-1]` tuple trick
-  trips the checker because `p` returns None. Pre-existing; switch to an inner
-  helper that calls `p(...)` then returns the real value to clear the warning.
