@@ -57,6 +57,14 @@ def _main_sha(repo: Path) -> str:
     return cp.stdout.strip()
 
 
+def _head_sha(repo: Path) -> str:
+    cp = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo, capture_output=True, text=True, check=True,
+    )
+    return cp.stdout.strip()
+
+
 class TestAutoMerge(unittest.TestCase):
     def setUp(self):
         self.td = TemporaryDirectory()
@@ -861,6 +869,203 @@ class TestDeleteIdea(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["last_status"], ItemStatus.DEFERRED.value)
         self.assertEqual(row["note"], "deleted from deferred")
+
+
+class TestAdvanceUserCheckout(unittest.TestCase):
+    """After a clean auto-merge CAS-advances refs/heads/<base>, the user's
+    primary checkout at `project.root` should fast-forward so its index
+    and working tree match the new tip — unless any of the safety guards
+    trip, in which case it's left untouched silently."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        # Gitignore + commit backlog so self.root starts truly clean —
+        # the guard rejects any `status --porcelain` output, including
+        # untracked files like the `.agentor/` state dir.
+        (self.root / ".gitignore").write_text(".agentor/\n")
+        (self.root / "backlog.md").write_text(
+            "- [ ] Touch a file\n  details\n"
+        )
+        _git(self.root, "add", ".gitignore", "backlog.md")
+        _git(self.root, "commit", "-q", "-m", "seed backlog")
+        self.cfg = _mk_config(self.root)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        scan_once(self.cfg, self.store)
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _claim_and_stub(self):
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(self.cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        StubRunner(self.cfg, self.store).run(claimed)
+        return self.store.get(claimed.id)
+
+    def test_happy_path_advances_checkout_to_new_base_tip(self):
+        """Default config, checkout on main + clean: HEAD, index, and
+        working tree all land at the new merge commit."""
+        item = self._claim_and_stub()
+        base_before = _main_sha(self.root)
+        self.assertEqual(_head_sha(self.root), base_before)
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        new_main = _main_sha(self.root)
+        self.assertNotEqual(new_main, base_before, "ref should advance")
+        self.assertEqual(
+            _head_sha(self.root), new_main,
+            "HEAD at user checkout should follow new base tip",
+        )
+        # Working tree has the stub's note file — reachable because the
+        # reset pulled in the new tree.
+        ls = subprocess.run(
+            ["git", "ls-files"],
+            cwd=self.root, capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertIn(".agentor-note-", ls,
+                      "stub note should be in the user's working tree")
+        # No spurious staged/unstaged diff vs HEAD.
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=self.root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(status, "",
+                         f"checkout should be clean post-advance: {status!r}")
+
+    def test_config_off_skipped(self):
+        self.cfg.git.advance_user_checkout = False
+        item = self._claim_and_stub()
+        base_before = _main_sha(self.root)
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        self.assertNotEqual(_main_sha(self.root), base_before,
+                            "ref must still advance")
+        # HEAD symbolically follows the ref on the base branch, so
+        # rev-parse HEAD returns the new sha regardless — the real signal
+        # for "skipped" is the stale index: status --porcelain reports
+        # the merge commit's diff as staged changes.
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=self.root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertNotEqual(
+            status, "",
+            "without advance, checkout's index should be stale vs new HEAD",
+        )
+
+    def test_dirty_worktree_skipped(self):
+        """Uncommitted user work at `project.root` must survive the merge."""
+        (self.root / "user_scratch.txt").write_text("uncommitted\n")
+        item = self._claim_and_stub()
+        base_before = _main_sha(self.root)
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        self.assertNotEqual(_main_sha(self.root), base_before)
+        self.assertTrue(
+            (self.root / "user_scratch.txt").exists(),
+            "uncommitted user file must not be clobbered",
+        )
+        self.assertEqual(
+            (self.root / "user_scratch.txt").read_text(), "uncommitted\n",
+        )
+
+    def test_different_branch_skipped(self):
+        """Operator parked on a different branch → advance must skip so
+        the sidecar branch isn't silently reset."""
+        _git(self.root, "checkout", "-b", "sidecar")
+        item = self._claim_and_stub()
+        sidecar_before = _head_sha(self.root)
+        base_before = _main_sha(self.root)
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        self.assertNotEqual(_main_sha(self.root), base_before,
+                            "main ref must still advance")
+        self.assertEqual(
+            _head_sha(self.root), sidecar_before,
+            "HEAD on sidecar must be untouched",
+        )
+        cp = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            cwd=self.root, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(cp.stdout.strip(), "sidecar")
+
+    def test_detached_head_skipped(self):
+        """Detached HEAD at `project.root` must not be touched."""
+        base_before = _main_sha(self.root)
+        _git(self.root, "checkout", "--detach", base_before)
+        item = self._claim_and_stub()
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        self.assertNotEqual(_main_sha(self.root), base_before,
+                            "ref must advance")
+        self.assertEqual(
+            _head_sha(self.root), base_before,
+            "detached HEAD must stay pinned",
+        )
+        # Still detached (symbolic-ref fails with non-zero rc).
+        cp = subprocess.run(
+            ["git", "symbolic-ref", "--quiet", "HEAD"],
+            cwd=self.root, capture_output=True, text=True,
+        )
+        self.assertNotEqual(cp.returncode, 0,
+                            "HEAD must remain detached")
+
+    def test_diverged_head_skipped(self):
+        """Local commit on base above the dispatched base_sha_before →
+        advance must skip (unit-level check on the guard)."""
+        from agentor import git_ops
+
+        # Repo starts on main, clean. Capture base_sha_before, then add
+        # a local commit so HEAD diverges from the captured sha.
+        base_sha_before = _main_sha(self.root)
+        (self.root / "local.txt").write_text("local work\n")
+        _git(self.root, "add", "local.txt")
+        _git(self.root, "commit", "-q", "-m", "local commit")
+        self.assertNotEqual(_head_sha(self.root), base_sha_before)
+
+        self.assertFalse(
+            git_ops.advance_user_checkout_allowed(
+                self.root, "main", base_sha_before,
+            ),
+            "guard must reject when HEAD diverges from captured base sha",
+        )
+
+    def test_guard_allows_only_when_all_checks_pass(self):
+        """Direct unit test of the guard helper — all four code paths."""
+        from agentor import git_ops
+
+        base = _main_sha(self.root)
+        # Happy: on main, clean, HEAD == base.
+        self.assertTrue(
+            git_ops.advance_user_checkout_allowed(self.root, "main", base),
+        )
+        # Dirty.
+        (self.root / "dirt.txt").write_text("x")
+        self.assertFalse(
+            git_ops.advance_user_checkout_allowed(self.root, "main", base),
+        )
+        (self.root / "dirt.txt").unlink()
+        # Wrong branch.
+        _git(self.root, "checkout", "-b", "other")
+        self.assertFalse(
+            git_ops.advance_user_checkout_allowed(self.root, "main", base),
+        )
+        _git(self.root, "checkout", "main")
+        # Wrong base_sha_before.
+        self.assertFalse(
+            git_ops.advance_user_checkout_allowed(
+                self.root, "main", "0" * 40,
+            ),
+        )
 
 
 if __name__ == "__main__":

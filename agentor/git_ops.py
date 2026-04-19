@@ -140,6 +140,48 @@ def fast_forward_to_base(
     return False, (cp.stdout + cp.stderr).strip() or "ff-only refused"
 
 
+def advance_user_checkout_allowed(
+    repo: Path, base_branch: str, base_sha_before: str,
+) -> bool:
+    """Pre-CAS guard check for `advance_user_checkout`. Call BEFORE
+    `merge_feature_into_base` runs its CAS ref update — once the ref has
+    moved, HEAD symbolically follows it and both the HEAD and the clean-
+    tree guards become unreliable (stale index reports spurious staged
+    diffs against the new HEAD tree).
+
+    All three guards must hold, otherwise return False (silent — no error,
+    no warning):
+      - `repo`'s current branch is `base_branch` (detached HEAD returns
+        "HEAD" from `current_branch` and fails the equality check).
+      - working tree is clean (`git status --porcelain` empty) — never
+        risk clobbering uncommitted user work.
+      - HEAD resolves to `base_sha_before` — the checkout sits exactly at
+        the pre-merge base tip (no local commits above base)."""
+    if current_branch(repo) != base_branch:
+        return False
+    if run(repo, "status", "--porcelain", check=False).stdout.strip():
+        return False
+    head = run(repo, "rev-parse", "HEAD", check=False).stdout.strip()
+    return head == base_sha_before
+
+
+def advance_user_checkout(repo: Path, new_sha: str) -> bool:
+    """Sync `repo`'s primary checkout (index + working tree) to `new_sha`
+    after `merge_feature_into_base` has CAS-advanced the ref. The ref
+    itself already points at `new_sha`; this brings HEAD's working-tree
+    view up to date so `git status` doesn't report spurious staged diffs
+    and editors don't read stale files.
+
+    Must only be called after `advance_user_checkout_allowed` returned
+    True against the pre-CAS state — this function intentionally does no
+    guards of its own (post-CAS guard checks are unreliable, see
+    `advance_user_checkout_allowed`). Uses `git reset --hard` so no hooks
+    fire (unlike `git merge --ff-only`, which triggers post-merge).
+    Returns True iff the reset succeeded."""
+    cp = run(repo, "reset", "--hard", new_sha, check=False)
+    return cp.returncode == 0
+
+
 def merge_feature_into_base(
     repo: Path, feature_branch: str, base_branch: str, message: str,
     tmp_root: Path, mode: str = "merge",

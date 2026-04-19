@@ -114,6 +114,20 @@ def approve_and_commit(
     mode = config.git.merge_mode
     verb = "rebasing onto" if mode == "rebase" else "merging into"
     with _INTEGRATION_LOCK:
+        # Capture pre-CAS state under the lock: the base sha the CAS will
+        # use as OLD, plus whether the user's checkout is safely advanceable.
+        # Once merge_feature_into_base runs, refs/heads/<base> has moved and
+        # HEAD symbolically follows it — the clean-tree and HEAD-equals-
+        # base_sha_before guards both become unreliable post-CAS.
+        base_sha_before = git_ops.run(
+            repo, "rev-parse", f"refs/heads/{config.git.base_branch}",
+        ).stdout.strip()
+        will_advance_checkout = (
+            config.git.advance_user_checkout
+            and git_ops.advance_user_checkout_allowed(
+                repo, config.git.base_branch, base_sha_before,
+            )
+        )
         p(f"{verb} {config.git.base_branch}")
         merge_sha, conflict = git_ops.merge_feature_into_base(
             repo, item.branch, config.git.base_branch,
@@ -148,6 +162,8 @@ def approve_and_commit(
         p("cleaning up worktree and branch")
         git_ops.worktree_remove(repo, wt, force=False)
         git_ops.branch_delete(repo, item.branch, force=True)
+        if will_advance_checkout:
+            git_ops.advance_user_checkout(repo, merge_sha)
         store.transition(
             item.id, ItemStatus.MERGED,
             note=f"{note_prefix} {sha[:8]}, {mode}d {merge_sha[:8]} into "
@@ -188,6 +204,15 @@ def retry_merge(
     mode = config.git.merge_mode
     verb = "rebasing onto" if mode == "rebase" else "merging into"
     with _INTEGRATION_LOCK:
+        base_sha_before = git_ops.run(
+            repo, "rev-parse", f"refs/heads/{config.git.base_branch}",
+        ).stdout.strip()
+        will_advance_checkout = (
+            config.git.advance_user_checkout
+            and git_ops.advance_user_checkout_allowed(
+                repo, config.git.base_branch, base_sha_before,
+            )
+        )
         p(f"{verb} {config.git.base_branch} (retry)")
         merge_sha, conflict = git_ops.merge_feature_into_base(
             repo, item.branch, config.git.base_branch,
@@ -210,6 +235,8 @@ def retry_merge(
         p("cleaning up worktree and branch")
         git_ops.worktree_remove(repo, wt, force=False)
         git_ops.branch_delete(repo, item.branch, force=True)
+        if will_advance_checkout:
+            git_ops.advance_user_checkout(repo, merge_sha)
         store.transition(
             item.id, ItemStatus.MERGED,
             last_error=None,
