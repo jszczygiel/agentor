@@ -50,11 +50,19 @@ class _FakeWin:
     def keypad(self, flag): self.keypad_calls.append(flag)
 
 
-def _install_fakes(monkey, textbox_factory):
+def _install_fakes(monkey, textbox_factory, newwin_calls=None):
     """Patch the curses entry points `_prompt_multiline` calls. Returns the
-    unittest.mock.patch context managers started for cleanup by the caller."""
+    unittest.mock.patch context managers started for cleanup by the caller.
+
+    When `newwin_calls` is a list, each `curses.newwin(...)` call is appended
+    so tests can inspect the sizes the overlay requested."""
+    def _newwin(*a, **_kw):
+        if newwin_calls is not None:
+            newwin_calls.append(a)
+        return _FakeWin()
+
     patches = [
-        patch.object(curses, "newwin", lambda *a, **kw: _FakeWin()),
+        patch.object(curses, "newwin", _newwin),
         patch.object(curses, "curs_set", lambda *_a: 0),
         patch("curses.textpad.Textbox", textbox_factory),
     ]
@@ -153,6 +161,50 @@ class TestPromptMultiline(unittest.TestCase):
         render._prompt_multiline(stdscr, "label")
         self.assertEqual(returned,
                          [curses.KEY_BACKSPACE] * 3)
+
+    def _run_capture_newwin(self, *, stdscr, rows=None):
+        """Run the widget and return the edit-window size `curses.newwin`
+        was called with. The overlay calls newwin twice (frame, then edit
+        window) — the edit window is the second call and its first arg is
+        the row count."""
+        newwin_calls: list[tuple] = []
+
+        class FakeTextbox:
+            def __init__(self, win):
+                self.stripspaces = True
+
+            def edit(self, validator): pass
+            def gather(self): return ""
+
+        _install_fakes(self.ctx, FakeTextbox, newwin_calls=newwin_calls)
+        if rows is None:
+            render._prompt_multiline(stdscr, "label")
+        else:
+            render._prompt_multiline(stdscr, "label", rows=rows)
+        # frame is first newwin; edit window is second.
+        self.assertGreaterEqual(len(newwin_calls), 2)
+        edit_rows = newwin_calls[1][0]
+        return edit_rows
+
+    def test_default_rows_grow_with_terminal(self):
+        # On a 40-row terminal the adaptive default should give well over
+        # the old hard-coded 8 rows of edit area.
+        edit_rows = self._run_capture_newwin(stdscr=_FakeStdscr(h=40, w=100))
+        self.assertGreaterEqual(edit_rows, 20)
+
+    def test_default_rows_capped_on_huge_terminal(self):
+        # Very tall terminal must not produce a gigantic overlay — the cap
+        # keeps the inner edit area ≤ 30 rows regardless of screen height.
+        edit_rows = self._run_capture_newwin(stdscr=_FakeStdscr(h=200, w=100))
+        self.assertLessEqual(edit_rows, 30)
+
+    def test_explicit_rows_override_respected(self):
+        # Callers passing a concrete `rows=` still get that value (bounded
+        # by terminal) — lets future callsites opt out of the adaptive
+        # default if they need a specific shape.
+        edit_rows = self._run_capture_newwin(
+            stdscr=_FakeStdscr(h=40, w=100), rows=12)
+        self.assertEqual(edit_rows, 12)
 
     def test_tiny_terminal_falls_back_to_prompt_text(self):
         # 9 rows is under the 10-row floor; widget must defer to single-line
