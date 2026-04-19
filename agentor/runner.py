@@ -1273,37 +1273,49 @@ def _default_claude_command() -> list[str]:
 
 
 def _read_hook_path() -> Path:
-    """Absolute path to the shipped PreToolUse hook script."""
+    """Absolute path to the shipped PreToolUse Read hook script."""
     return (Path(__file__).resolve().parent / "read_hook.py")
+
+
+def _grep_hook_path() -> Path:
+    """Absolute path to the shipped PreToolUse Grep hook script."""
+    return (Path(__file__).resolve().parent / "grep_hook.py")
 
 
 def write_claude_settings(
     config: Config, item_id: str,
 ) -> Path:
-    """Write a Claude settings JSON registering the large-file Read hook
-    into `<project>/.agentor/claude-settings/<item_id>.json`. When the
-    threshold is <= 0 the file still exists (claude needs a readable
-    --settings path) but its hooks list is empty."""
+    """Write a Claude settings JSON registering the bundled PreToolUse
+    hooks into `<project>/.agentor/claude-settings/<item_id>.json`. Each
+    enforcement can be toggled independently:
+      - Read offset/limit gate: `agent.large_file_line_threshold` (>0).
+      - Grep head_limit gate: `agent.enforce_grep_head_limit`.
+    The file always exists (claude needs a readable --settings path); if
+    every toggle is off, the hooks list is simply empty."""
     threshold = int(config.agent.large_file_line_threshold or 0)
+    enforce_grep = bool(config.agent.enforce_grep_head_limit)
     settings_dir = (
         config.project_root / ".agentor" / "claude-settings"
     )
     settings_dir.mkdir(parents=True, exist_ok=True)
     settings_path = settings_dir / f"{item_id}.json"
-    settings: dict = {"hooks": {}}
+    pretool: list[dict] = []
     if threshold > 0:
-        hook_cmd = (
+        read_cmd = (
             f"AGENTOR_READ_THRESHOLD={threshold} "
             f"python3 {_read_hook_path()}"
         )
-        settings["hooks"] = {
-            "PreToolUse": [
-                {
-                    "matcher": "Read",
-                    "hooks": [{"type": "command", "command": hook_cmd}],
-                }
-            ]
-        }
+        pretool.append({
+            "matcher": "Read",
+            "hooks": [{"type": "command", "command": read_cmd}],
+        })
+    if enforce_grep:
+        grep_cmd = f"python3 {_grep_hook_path()}"
+        pretool.append({
+            "matcher": "Grep",
+            "hooks": [{"type": "command", "command": grep_cmd}],
+        })
+    settings: dict = {"hooks": {"PreToolUse": pretool} if pretool else {}}
     settings_path.write_text(json.dumps(settings, indent=2))
     return settings_path
 

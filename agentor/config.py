@@ -162,6 +162,11 @@ class AgentConfig:
     # Custom `agent.command` overrides that drop the `{settings_path}`
     # placeholder silently skip enforcement.
     large_file_line_threshold: int = 400
+    # When true, a PreToolUse hook rejects `Grep` calls with
+    # `output_mode: content` that don't also pass `head_limit`, so the
+    # agent can't dump hundreds of match lines into context. Content-mode
+    # is the only gated mode — `count` and `files_with_matches` stay free.
+    enforce_grep_head_limit: bool = True
 
 
 @dataclass

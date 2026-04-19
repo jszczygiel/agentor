@@ -1555,17 +1555,24 @@ class TestClaudeSettingsHookWiring(unittest.TestCase):
     def tearDown(self):
         self.td.cleanup()
 
-    def _cfg(self, threshold: int) -> Config:
+    def _cfg(self, threshold: int = 400,
+             enforce_grep: bool = True) -> Config:
         return Config(
             project_name="proj", project_root=self.root,
             sources=SourcesConfig(watch=[], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
-            agent=AgentConfig(large_file_line_threshold=threshold),
+            agent=AgentConfig(
+                large_file_line_threshold=threshold,
+                enforce_grep_head_limit=enforce_grep,
+            ),
             git=GitConfig(), review=ReviewConfig(),
         )
 
+    def _pre_by_matcher(self, data: dict) -> dict[str, dict]:
+        return {e["matcher"]: e for e in data["hooks"]["PreToolUse"]}
+
     def test_settings_written_with_threshold(self):
-        cfg = self._cfg(threshold=400)
+        cfg = self._cfg(threshold=400, enforce_grep=False)
         path = write_claude_settings(cfg, "abcdef1234")
         self.assertTrue(path.exists())
         data = json.loads(path.read_text())
@@ -1581,14 +1588,41 @@ class TestClaudeSettingsHookWiring(unittest.TestCase):
         self.assertTrue(Path(hook_path_token).is_absolute())
         self.assertTrue(Path(hook_path_token).exists())
 
-    def test_settings_disabled_when_threshold_zero(self):
-        cfg = self._cfg(threshold=0)
+    def test_settings_disabled_when_all_hooks_off(self):
+        cfg = self._cfg(threshold=0, enforce_grep=False)
         path = write_claude_settings(cfg, "abcdef1234")
         self.assertTrue(path.exists())
         data = json.loads(path.read_text())
         # Hooks object present but empty — claude still accepts --settings
         # without choking, but no PreToolUse gate is registered.
         self.assertEqual(data.get("hooks"), {})
+
+    def test_grep_matcher_registered_by_default(self):
+        """Default config enables the Grep head_limit hook."""
+        cfg = self._cfg()
+        path = write_claude_settings(cfg, "abcdef1234")
+        data = json.loads(path.read_text())
+        by_matcher = self._pre_by_matcher(data)
+        self.assertIn("Grep", by_matcher)
+        cmd = by_matcher["Grep"]["hooks"][0]["command"]
+        self.assertIn("grep_hook.py", cmd)
+        hook_path_token = [t for t in cmd.split() if t.endswith("grep_hook.py")][0]
+        self.assertTrue(Path(hook_path_token).is_absolute())
+        self.assertTrue(Path(hook_path_token).exists())
+
+    def test_grep_matcher_absent_when_disabled(self):
+        cfg = self._cfg(enforce_grep=False)
+        path = write_claude_settings(cfg, "abcdef1234")
+        data = json.loads(path.read_text())
+        pre = data["hooks"].get("PreToolUse", [])
+        self.assertNotIn("Grep", [e.get("matcher") for e in pre])
+
+    def test_both_hooks_registered_together(self):
+        cfg = self._cfg(threshold=400, enforce_grep=True)
+        path = write_claude_settings(cfg, "abcdef1234")
+        data = json.loads(path.read_text())
+        by_matcher = self._pre_by_matcher(data)
+        self.assertEqual(set(by_matcher), {"Read", "Grep"})
 
     def test_default_claude_command_contains_settings_placeholder(self):
         cmd = _default_claude_command()
