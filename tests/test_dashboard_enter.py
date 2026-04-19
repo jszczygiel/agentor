@@ -42,12 +42,6 @@ class TestInspectActionMap(unittest.TestCase):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[ItemStatus.DEFERRED]}
         self.assertEqual(keys, {"a", "x"})
 
-    def test_backlog_legacy_has_approve_and_delete(self):
-        # BACKLOG is a legacy status — new items no longer land there, but
-        # stale rows must stay actionable from the unified view.
-        keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[ItemStatus.BACKLOG]}
-        self.assertEqual(keys, {"a", "x"})
-
     def test_terminal_and_mid_flight_statuses_have_no_actions(self):
         for st in (
             ItemStatus.MERGED,

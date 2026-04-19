@@ -37,6 +37,14 @@ def _has_uncommitted(wt: Path) -> bool:
 _BODY_CAP = 2000
 _RAW_CAP = 1500
 
+# Marker prefix on the CONFLICTED → QUEUED transition note when the
+# auto-resolve chain fires from `approve_and_commit`. The dashboard reads
+# this to distinguish an auto-chained resubmit from a manual `[e]` press.
+AUTO_RESOLVE_NOTE_PREFIX = "auto-resolve"
+_AUTO_RESOLVE_NOTE = (
+    f"{AUTO_RESOLVE_NOTE_PREFIX}: resubmitted from CONFLICTED — agent will resolve"
+)
+
 
 def _build_conflict_summary(
     item: StoredItem, mode: str, base: str, raw: str, *, retry: bool = False,
@@ -131,7 +139,8 @@ def approve_and_commit(
                 if refreshed is not None and \
                         refreshed.status == ItemStatus.CONFLICTED:
                     resubmit_conflicted(
-                        config, store, refreshed, force_execute=True,
+                        config, store, refreshed,
+                        force_execute=True, note=_AUTO_RESOLVE_NOTE,
                     )
             return sha
 
@@ -231,7 +240,7 @@ def _coerce_phase_plan(blob: str | None) -> str:
 
 def resubmit_conflicted(
     config: Config, store: Store, item: StoredItem,
-    *, force_execute: bool = False,
+    *, force_execute: bool = False, note: str | None = None,
 ) -> None:
     """Send a CONFLICTED item back to the agent to resolve the merge
     conflict itself. Transitions CONFLICTED → QUEUED; the worktree,
@@ -249,7 +258,11 @@ def resubmit_conflicted(
     is pure execute work (open worktree, resolve markers, re-run tests,
     commit), and the plan turn is wasted tokens + wall-clock. Used by
     `approve_and_commit`'s auto-resolve chain; manual `[e]resubmit` from
-    the dashboard keeps the default (re-plans first)."""
+    the dashboard keeps the default (re-plans first).
+
+    `note` overrides the transition note — `approve_and_commit` passes a
+    string prefixed with `AUTO_RESOLVE_NOTE_PREFIX` so the dashboard can
+    tell an auto-chained resubmit apart from a manual `[e]` press."""
     assert item.status == ItemStatus.CONFLICTED, \
         f"resubmit_conflicted expects CONFLICTED, got {item.status}"
     assert item.worktree_path and item.branch
@@ -276,13 +289,14 @@ def resubmit_conflicted(
         "last_error": None,
         "attempts": 0,
     }
-    note = "resubmitted from CONFLICTED — agent will resolve"
     if force_execute:
         fields["result_json"] = _coerce_phase_plan(item.result_json)
-        note += " (force_execute: skip plan phase)"
+    final_note = note or "resubmitted from CONFLICTED — agent will resolve"
+    if force_execute:
+        final_note += " (force_execute: skip plan phase)"
     store.transition(
         item.id, ItemStatus.QUEUED,
-        note=note,
+        note=final_note,
         **fields,
     )
 

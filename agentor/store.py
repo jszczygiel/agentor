@@ -74,6 +74,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
         )
+    # Legacy BACKLOG rows: the enum member was removed once new items began
+    # landing at QUEUED directly. Residual 'backlog' strings on items.status
+    # would fail decode; the same values in transitions.from_status /
+    # to_status would break transitions_for for any item with pre-migration
+    # history. Heal both.
+    conn.execute("UPDATE items SET status = 'queued' WHERE status = 'backlog'")
+    conn.execute(
+        "UPDATE transitions SET from_status = 'queued' "
+        "WHERE from_status = 'backlog'"
+    )
+    conn.execute(
+        "UPDATE transitions SET to_status = 'queued' "
+        "WHERE to_status = 'backlog'"
+    )
 
 
 def _encode_status(status: ItemStatus) -> str:

@@ -524,25 +524,65 @@ class TestAutoResolveConflicts(unittest.TestCase):
         self.assertIn("main", fb)
         self.assertIn("README.md", fb)
 
-    def test_auto_resolve_flips_result_json_to_execute_phase(self):
-        """The auto-resolve chain must rewrite result_json so the runner's
-        two-phase dispatch skips plan and goes straight to execute — plan
-        is wasted turns when the task is pure merge-conflict resolution."""
+    def test_auto_resolve_on_marks_transition_note(self):
+        """Chained resubmit tags the CONFLICTED → QUEUED transition so the
+        dashboard can distinguish an auto-chain from a manual resubmit AND
+        flips result_json so the runner skips the plan phase on the next
+        dispatch (conflict resolution is pure execute work)."""
+        from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
         cfg = _mk_config(self.root)
         cfg.git.auto_resolve_conflicts = True
         final = self._drive_to_conflict(cfg)
 
         self.assertEqual(final.status, ItemStatus.QUEUED)
+        history = self.store.transitions_for(final.id)
+        chain = [
+            t for t in history
+            if t.from_status == ItemStatus.CONFLICTED
+            and t.to_status == ItemStatus.QUEUED
+        ]
+        self.assertEqual(len(chain), 1)
+        self.assertTrue(
+            (chain[0].note or "").startswith(AUTO_RESOLVE_NOTE_PREFIX),
+            f"expected auto-resolve marker, got note={chain[0].note!r}",
+        )
+        # Force-execute leg: result_json must be rewritten so the runner's
+        # two-phase dispatch takes the prior-plan branch → _do_execute.
         data = json.loads(final.result_json)
         self.assertEqual(data["phase"], "plan",
-                         "phase must be 'plan' so runner takes the "
-                         "prior-plan branch → _do_execute")
+                         "phase must be 'plan' so the runner routes "
+                         "straight to _do_execute")
         self.assertTrue(data.get("plan"),
                         "plan text must be non-empty so the execute "
                         "prompt template substitutes cleanly")
-        # Transition note records the force flag so history is greppable.
-        last = self.store.transitions_for(final.id)[-1]
-        self.assertIn("force_execute", last.note or "")
+        # Transition note also records the force flag for greppable history.
+        self.assertIn("force_execute", chain[0].note or "")
+
+    def test_manual_resubmit_has_no_auto_marker(self):
+        """Manual `[e]` resubmit (auto off) must not carry the marker —
+        the dashboard uses its absence to keep the indicator silent."""
+        from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
+        cfg = _mk_config(self.root)
+        # auto_resolve_conflicts stays False — drive reaches CONFLICTED only.
+        conflicted = self._drive_to_conflict(cfg)
+        self.assertEqual(conflicted.status, ItemStatus.CONFLICTED)
+
+        resubmit_conflicted(cfg, self.store, conflicted)
+
+        final = self.store.get(conflicted.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        history = self.store.transitions_for(final.id)
+        chain = [
+            t for t in history
+            if t.from_status == ItemStatus.CONFLICTED
+            and t.to_status == ItemStatus.QUEUED
+        ]
+        self.assertEqual(len(chain), 1)
+        self.assertFalse(
+            (chain[0].note or "").startswith(AUTO_RESOLVE_NOTE_PREFIX),
+            f"manual resubmit should not carry the auto marker: "
+            f"note={chain[0].note!r}",
+        )
 
 
 class TestRetryErrored(unittest.TestCase):

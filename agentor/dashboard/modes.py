@@ -1,6 +1,7 @@
 import subprocess
 import time
 from pathlib import Path
+from typing import Callable
 
 from ..config import Config
 from ..daemon import Daemon
@@ -70,10 +71,6 @@ _ACTION_KEYS_BY_STATUS: dict[ItemStatus, list[tuple[str, str]]] = {
     ],
     ItemStatus.DEFERRED: [
         ("a", "[a]restore"),
-        ("x", "[x]delete"),
-    ],
-    ItemStatus.BACKLOG: [
-        ("a", "[a]approve→queued"),
         ("x", "[x]delete"),
     ],
 }
@@ -184,8 +181,8 @@ def _inspect_render(
         while True:
             fresh = store.get(item.id) or item
             item = fresh
-            lines = _build_detail_lines(cfg, store, item)
             h, w = stdscr.getmaxyx()
+            lines = _build_detail_lines(cfg, store, item, width=w)
             queue_suffix = (
                 f"  · {remaining} left" if cycle and remaining > 0 else ""
             )
@@ -325,11 +322,13 @@ def _inspect_dispatch(
             if not item.worktree_path:
                 return False, "no worktree — nothing to diff"
             wt = Path(item.worktree_path)
+            def _diff_work(p: Callable[[str], None]) -> str:
+                p("git diff vs base")
+                return diff_vs_base(wt, cfg.git.base_branch)
             try:
                 diff = _run_with_progress(
                     stdscr, f"  diff · {item.title}",
-                    lambda p: (p("git diff vs base"),
-                               diff_vs_base(wt, cfg.git.base_branch))[-1],
+                    _diff_work,
                     hint="git diff against base branch.",
                 )
             except Exception as e:
@@ -375,14 +374,7 @@ def _inspect_dispatch(
 
     if status == ItemStatus.DEFERRED:
         if key == "a":
-            restored = restore_deferred(store, item)
-            if restored == ItemStatus.BACKLOG:
-                # Legacy rows whose history leads back to BACKLOG — the
-                # gate no longer exists, so skip it straight to QUEUED.
-                store.transition(
-                    item.id, ItemStatus.QUEUED,
-                    note="approved by user (legacy backlog → queued)",
-                )
+            restore_deferred(store, item)
             if daemon is not None:
                 daemon.try_fill_pool()
             return True, "restored"
@@ -392,25 +384,29 @@ def _inspect_dispatch(
             delete_idea(store, item)
             return True, "deleted"
 
-    if status == ItemStatus.BACKLOG:
-        if key == "a":
-            store.transition(
-                item.id, ItemStatus.QUEUED,
-                note="approved by user (backlog → queued)",
-            )
-            if daemon is not None:
-                daemon.try_fill_pool()
-            return True, "queued"
-        if key == "x":
-            if not _prompt_yn(stdscr, "delete this idea?"):
-                return False, ""
-            delete_idea(store, item)
-            return True, "deleted"
-
     return False, ""
 
 
-def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str]:
+def _is_auto_resolve_chain(store: Store, item: StoredItem) -> bool:
+    """True when the item most recently entered QUEUED via the auto-resolve
+    chain from `approve_and_commit` — i.e. the last CONFLICTED → QUEUED
+    transition's note carries `AUTO_RESOLVE_NOTE_PREFIX`. Also matches the
+    still-in-CONFLICTED case after a bounce-back. Scans the tail of the
+    transition history to stay cheap on long-lived items."""
+    # Lazy import — see CLAUDE.md "Lazy `..committer` imports in dashboard".
+    from ..committer import AUTO_RESOLVE_NOTE_PREFIX
+
+    history = store.transitions_for(item.id)
+    for t in reversed(history[-10:]):
+        if t.from_status == ItemStatus.CONFLICTED \
+                and t.to_status == ItemStatus.QUEUED:
+            return (t.note or "").startswith(AUTO_RESOLVE_NOTE_PREFIX)
+    return False
+
+
+def _build_detail_lines(
+    cfg: Config, store: Store, item: StoredItem, *, width: int = 120,
+) -> list[str]:
     out: list[str] = []
     data = _result_data(item)
     progress = _progress_data(item)
@@ -424,6 +420,10 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
     out.append(f"session:  {item.session_id or '—'}")
     out.append(f"attempts: {item.attempts} / {cfg.agent.max_attempts}")
     out.append(f"agentor:  {item.agentor_version or '—'}")
+    if item.status in (ItemStatus.QUEUED, ItemStatus.WORKING,
+                       ItemStatus.CONFLICTED) \
+            and _is_auto_resolve_chain(store, item):
+        out.append("flow:     auto-resolve chain (agent resolving own conflict)")
     elapsed = _elapsed_for(store, item.id)
     if elapsed is not None:
         out.append(f"elapsed:  {_fmt_elapsed(elapsed)} (since enter WORKING)")
@@ -482,14 +482,34 @@ def _build_detail_lines(cfg: Config, store: Store, item: StoredItem) -> list[str
     if rows:
         out.append("")
         out.append("── per-model tokens ──")
-        out.append(f"{'MODEL':<36} {'IN':>10} {'OUT':>10} "
-                   f"{'CACHE_R':>12} {'CACHE_W':>10}")
-        for r in rows:
-            out.append(f"{r['model']:<36} "
-                       f"{_fmt_tokens(r['input']):>10} "
-                       f"{_fmt_tokens(r['output']):>10} "
-                       f"{_fmt_tokens(r['cache_read']):>12} "
-                       f"{_fmt_tokens(r['cache_create']):>10}")
+        # Tabular form needs ~80 cols (36 model + 4 × 10 numbers + pads).
+        # 60–79 stacks to a 2-line compact per model; <60 goes fully
+        # vertical so no field wraps mid-row.
+        if width >= 80:
+            out.append(f"{'MODEL':<36} {'IN':>10} {'OUT':>10} "
+                       f"{'CACHE_R':>12} {'CACHE_W':>10}")
+            for r in rows:
+                out.append(f"{r['model']:<36} "
+                           f"{_fmt_tokens(r['input']):>10} "
+                           f"{_fmt_tokens(r['output']):>10} "
+                           f"{_fmt_tokens(r['cache_read']):>12} "
+                           f"{_fmt_tokens(r['cache_create']):>10}")
+        elif width >= 60:
+            for r in rows:
+                out.append(f"model: {r['model']}")
+                out.append(
+                    f"  in={_fmt_tokens(r['input'])} "
+                    f"out={_fmt_tokens(r['output'])} "
+                    f"cr={_fmt_tokens(r['cache_read'])} "
+                    f"cw={_fmt_tokens(r['cache_create'])}"
+                )
+        else:
+            for r in rows:
+                out.append(f"model:   {r['model']}")
+                out.append(f"  in:      {_fmt_tokens(r['input'])}")
+                out.append(f"  out:     {_fmt_tokens(r['output'])}")
+                out.append(f"  cache_r: {_fmt_tokens(r['cache_read'])}")
+                out.append(f"  cache_w: {_fmt_tokens(r['cache_create'])}")
     if item.status == ItemStatus.AWAITING_PLAN_REVIEW:
         plan_text = data.get("plan") or data.get("summary")
         if plan_text:
@@ -788,12 +808,14 @@ def _new_issue_mode(
     )
     if not note:
         return
+    def _expand_work(p: Callable[[str], None]) -> str:
+        p("calling claude to expand note")
+        return _expand_note_via_claude(
+            note, cfg, expand_kind, timeout=180.0)
     try:
         content = _run_with_progress(
             stdscr, f"  expanding note → {dest.name}…",
-            lambda p: (p("calling claude to expand note"),
-                       _expand_note_via_claude(
-                           note, cfg, expand_kind, timeout=180.0))[-1],
+            _expand_work,
             hint="one-shot claude call; may take 10-60s.",
         )
     except Exception as e:

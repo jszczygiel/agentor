@@ -18,14 +18,51 @@ from .formatters import (
     _elapsed_for,
     _fmt_elapsed,
     _fmt_token_line,
+    _fmt_token_line_mid,
+    _fmt_token_line_narrow,
     _phase_for,
     _token_windows,
 )
 
 
-ACTIONS = ("[↑/↓/j/k]nav  [enter]open  [n]ew  [r]eview  "
-           "[d]eferred  [i]nspect  [tab]filter  [+/-]pool  [⇧↑/⇧↓]pri  "
-           "[q]uit")
+ACTIONS_WIDE = ("[↑/↓/j/k]nav  [enter]open  [n]ew  [r]eview  "
+                "[d]eferred  [i]nspect  [tab]filter  [+/-]pool  [⇧↑/⇧↓]pri  "
+                "[q]uit")
+ACTIONS_MID = "[↑↓][⏎][n][r][d][i][tab][+/-][?]help [q]uit"
+ACTIONS_NARROW = "↑↓ ⏎ tab q  [?]help"
+
+# Back-compat alias — existing tests import ACTIONS and assert tokens in it.
+ACTIONS = ACTIONS_WIDE
+
+
+def _layout_tier(w: int) -> str:
+    """Width tier for responsive rendering. One source of truth so every
+    renderer (hint bar, status line, table columns, inspect view) agrees."""
+    if w >= 80:
+        return "wide"
+    if w >= 60:
+        return "mid"
+    return "narrow"
+
+
+# One-character glyph per status for the narrow-tier STATE column.
+_STATE_GLYPHS: dict[ItemStatus, str] = {
+    ItemStatus.QUEUED: "Q",
+    ItemStatus.WORKING: "W",
+    ItemStatus.AWAITING_PLAN_REVIEW: "P",
+    ItemStatus.AWAITING_REVIEW: "R",
+    ItemStatus.MERGED: "M",
+    ItemStatus.CONFLICTED: "C",
+    ItemStatus.ERRORED: "E",
+    ItemStatus.REJECTED: "X",
+    ItemStatus.CANCELLED: "K",
+    ItemStatus.DEFERRED: "D",
+    ItemStatus.APPROVED: "A",
+}
+
+
+def _state_glyph(status: ItemStatus) -> str:
+    return _STATE_GLYPHS.get(status, "?")
 
 # Filter views: ordered list cycled by Tab. Each entry maps a filter name
 # to the statuses to display (None = all).
@@ -95,30 +132,31 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
             selected_id: str | None = None) -> list[StoredItem]:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
+    tier = _layout_tier(w)
     row = 0
 
     # header bar — show project + active filter
     filter_name, _ = FILTERS[filter_idx]
-    title = f" agentor — {cfg.project_name}    filter: {filter_name} ({filter_idx + 1}/{len(FILTERS)}) "
+    if tier == "narrow":
+        title = f" agentor · {filter_name} ({filter_idx + 1}/{len(FILTERS)}) "
+    else:
+        title = (f" agentor — {cfg.project_name}    filter: {filter_name} "
+                 f"({filter_idx + 1}/{len(FILTERS)}) ")
     _safe_addstr(stdscr, row, 0, title.ljust(w), w,
                  curses.A_BOLD | curses.A_REVERSE)
     row += 1
 
     # actions bar
-    _safe_addstr(stdscr, row, 0, f" {ACTIONS}".ljust(w), w, curses.A_REVERSE)
+    hint = {"wide": ACTIONS_WIDE, "mid": ACTIONS_MID,
+            "narrow": ACTIONS_NARROW}[tier]
+    _safe_addstr(stdscr, row, 0, f" {hint}".ljust(w), w, curses.A_REVERSE)
     row += 1
 
     # system alert banner — sticky red row when daemon has paused itself
     # because of an infrastructure failure. Truncated to fit; full message
     # is in the log ring.
     if daemon.system_alert:
-        # Tail of the message is usually the most informative part of a git
-        # error (the actual failure line). Show the prefix and let the user
-        # scroll the log for the full text.
-        msg = daemon.system_alert.replace("\n", " ").strip()
-        if len(msg) > w - 30:
-            msg = msg[: w - 33] + "..."
-        banner = f" ⚠ PAUSED — {msg}  (press [u] to resume) "
+        banner = _build_alert_banner(daemon.system_alert, w)
         _safe_addstr(stdscr, row, 0, banner.ljust(w), w,
                      curses.color_pair(4) | curses.A_BOLD | curses.A_REVERSE)
         row += 1
@@ -130,22 +168,10 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     # unresolved last_error. Surfaces stuck/faulty items in the header
     # even when the default 'all' filter would visually smear them into
     # the rest of the queue.
-    status_line = (
-        f" {cfg.agent.runner}  pool={cfg.agent.pool_size}  "
-        f"workers={len(daemon.workers)}  "
-        f"done={s.completed}  errored={counts[ItemStatus.ERRORED]}  "
-        f"conflicted={counts[ItemStatus.CONFLICTED]}  │  "
-        f"queued={counts[ItemStatus.QUEUED]}  "
-        f"working={counts[ItemStatus.WORKING]}  "
-        f"plan?={counts[ItemStatus.AWAITING_PLAN_REVIEW]}  "
-        f"awaiting={counts[ItemStatus.AWAITING_REVIEW]}  "
-        f"deferred={counts[ItemStatus.DEFERRED]}  "
-        f"merged={counts[ItemStatus.MERGED]}  "
-        f"rejected={counts[ItemStatus.REJECTED]}"
-    )
+    status_line = _build_status_line(tier, cfg, s, counts, len(daemon.workers))
     _safe_addstr(stdscr, row, 0, status_line, w)
     row += 1
-    row = _render_token_panel(stdscr, row, w, store, daemon)
+    row = _render_token_panel(stdscr, row, w, store, daemon, tier)
     _safe_addstr(stdscr, row, 0, "─" * w, w, curses.A_DIM)
     row += 1
 
@@ -178,16 +204,147 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     return rendered
 
 
-def _render_token_panel(stdscr, row: int, w: int, store, daemon) -> int:
+def _table_header(tier: str) -> str:
+    """Header row for the main table. Narrow drops STATE label to a glyph
+    column; mid/narrow drop SOURCE entirely so TITLE gets the slack."""
+    if tier == "wide":
+        return (f" {'ID':<{_COL_ID-1}}{'STATE':<{_COL_STATE}}"
+                f"{'ELAPSED':<{_COL_ELAPSED}}{'CTX':<{_COL_CTX}}"
+                f"{'SOURCE':<{_COL_SOURCE}}TITLE")
+    if tier == "mid":
+        return (f" {'ID':<{_COL_ID-1}}{'STATE':<{_COL_STATE}}"
+                f"{'ELAPSED':<{_COL_ELAPSED}}{'CTX':<{_COL_CTX}}TITLE")
+    # narrow: 2-char glyph column (marker + letter)
+    return (f" {'ID':<{_COL_ID-1}}{'S':<3}"
+            f"{'ELAPSED':<{_COL_ELAPSED}}TITLE")
+
+
+def _table_row(tier: str, item, st, elapsed_s: str, ctx_s: str,
+               has_err: bool, w: int) -> str:
+    """Compose one main-table row respecting the active width tier.
+    The priority glyph (`*` for priority>0, space otherwise) is always
+    reserved before the TITLE so pinned rows stay column-aligned with
+    ordinary ones."""
+    marker = "!" if has_err else " "
+    pri_glyph = "*" if item.priority > 0 else " "
+    pri_cell = f"{pri_glyph} "  # glyph + separator
+
+    if tier == "narrow":
+        glyph = _state_glyph(st)
+        state_cell = f"{marker}{glyph} "  # 3 chars total — matches header
+        cols_used = 1 + (_COL_ID - 1) + 3 + _COL_ELAPSED + len(pri_cell)
+        title_max = max(0, w - cols_used)
+        title = item.title[:title_max]
+        return (f" {item.id[:8]:<{_COL_ID-1}}{state_cell}"
+                f"{elapsed_s:<{_COL_ELAPSED}}{pri_cell}{title}")
+
+    state_label = st.value
+    if st == ItemStatus.WORKING:
+        phase = _phase_for(item)
+        if not phase:
+            phase = "execute" if item.session_id else "plan"
+        state_label = f"{state_label}·{'plan' if phase == 'plan' else 'exec'}"
+    state_cell = f"{marker}{state_label}"[: _COL_STATE]
+
+    if tier == "mid":
+        cols_used = (1 + (_COL_ID - 1) + _COL_STATE
+                     + _COL_ELAPSED + _COL_CTX + len(pri_cell))
+        title_max = max(0, w - cols_used)
+        title = item.title[:title_max]
+        return (f" {item.id[:8]:<{_COL_ID-1}}{state_cell:<{_COL_STATE}}"
+                f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
+                f"{pri_cell}{title}")
+
+    # wide
+    src = item.source_file
+    if len(src) > _COL_SOURCE - 1:
+        src = "…" + src[-(_COL_SOURCE - 2):]
+    cols_used = (1 + (_COL_ID - 1) + _COL_STATE + _COL_ELAPSED
+                 + _COL_CTX + _COL_SOURCE + len(pri_cell))
+    title_max = max(0, w - cols_used)
+    title = item.title[:title_max]
+    return (f" {item.id[:8]:<{_COL_ID-1}}{state_cell:<{_COL_STATE}}"
+            f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
+            f"{src:<{_COL_SOURCE}}{pri_cell}{title}")
+
+
+def _build_alert_banner(alert: str, w: int) -> str:
+    """Compose the system-alert banner so it never overflows `w`. Picks
+    one of three wrappers depending on how much room is left after the
+    chrome (PAUSED marker + unpause prompt)."""
+    msg = (alert or "").replace("\n", " ").strip()
+    if w < 33:
+        return " ⚠ PAUSED [u] "[:w]
+    if w < 50:
+        prefix = " ⚠ PAUSED — "
+        suffix = " [u]"
+        budget = w - len(prefix) - len(suffix)
+        if msg and len(msg) > budget:
+            msg = msg[: max(0, budget - 3)] + "..."
+        return f"{prefix}{msg}{suffix}"
+    prefix = " ⚠ PAUSED — "
+    suffix = "  (press [u] to resume) "
+    budget = w - len(prefix) - len(suffix)
+    if msg and len(msg) > budget:
+        msg = msg[: max(0, budget - 3)] + "..."
+    return f"{prefix}{msg}{suffix}"
+
+
+def _build_status_line(tier: str, cfg, stats, counts: dict,
+                       worker_count: int) -> str:
+    """Tier-aware status/counts line. Mid/narrow abbreviate heavily so the
+    most important counters (pool/workers/review-queue/errors) survive a
+    phone-width terminal."""
+    if tier == "wide":
+        return (
+            f" {cfg.agent.runner}  pool={cfg.agent.pool_size}  "
+            f"workers={worker_count}  "
+            f"done={stats.completed}  errored={counts[ItemStatus.ERRORED]}  "
+            f"conflicted={counts[ItemStatus.CONFLICTED]}  │  "
+            f"queued={counts[ItemStatus.QUEUED]}  "
+            f"working={counts[ItemStatus.WORKING]}  "
+            f"plan?={counts[ItemStatus.AWAITING_PLAN_REVIEW]}  "
+            f"awaiting={counts[ItemStatus.AWAITING_REVIEW]}  "
+            f"deferred={counts[ItemStatus.DEFERRED]}  "
+            f"merged={counts[ItemStatus.MERGED]}  "
+            f"rejected={counts[ItemStatus.REJECTED]}"
+        )
+    review = (counts[ItemStatus.AWAITING_PLAN_REVIEW]
+              + counts[ItemStatus.AWAITING_REVIEW])
+    if tier == "mid":
+        return (
+            f" {cfg.agent.runner} p={cfg.agent.pool_size} "
+            f"w={worker_count} d={stats.completed} "
+            f"e={counts[ItemStatus.ERRORED]} "
+            f"c={counts[ItemStatus.CONFLICTED]} │ "
+            f"Q={counts[ItemStatus.QUEUED]} "
+            f"W={counts[ItemStatus.WORKING]} R={review}"
+        )
+    # narrow
+    return (
+        f" p={cfg.agent.pool_size} w={worker_count} "
+        f"R={review} e={counts[ItemStatus.ERRORED]}"
+    )
+
+
+def _render_token_panel(stdscr, row: int, w: int, store, daemon,
+                        tier: str = "wide") -> int:
     """Draw the cumulative token-usage panel: one line per time window
-    (session / today / 7d), each showing input / output / cache_read /
-    cache_create totals. Returns the next free row."""
+    (session / today / 7d). Tier-aware so the 71-char wide format
+    doesn't silently clip on phone-width terminals. Returns the next
+    free row."""
     windows = _token_windows(store, daemon.started_at)
-    _safe_addstr(stdscr, row, 0, " tokens".ljust(w), w,
-                 curses.A_DIM | curses.A_BOLD)
-    row += 1
+    if tier != "narrow":
+        _safe_addstr(stdscr, row, 0, " tokens".ljust(w), w,
+                     curses.A_DIM | curses.A_BOLD)
+        row += 1
     for label, totals in windows.items():
-        line = " " + _fmt_token_line(label, totals)
+        if tier == "wide":
+            line = " " + _fmt_token_line(label, totals)
+        elif tier == "mid":
+            line = " " + _fmt_token_line_mid(label, totals)
+        else:
+            line = " " + _fmt_token_line_narrow(label, totals)
         _safe_addstr(stdscr, row, 0, line.ljust(w), w, curses.A_DIM)
         row += 1
     return row
@@ -209,9 +366,8 @@ def _render_table(
     is highlighted; the viewport auto-scrolls to keep it visible."""
     if height <= 0:
         return []
-    header = (f" {'ID':<{_COL_ID-1}}{'STATE':<{_COL_STATE}}"
-              f"{'ELAPSED':<{_COL_ELAPSED}}{'CTX':<{_COL_CTX}}"
-              f"{'SOURCE':<{_COL_SOURCE}}TITLE")
+    tier = _layout_tier(w)
+    header = _table_header(tier)
     _safe_addstr(stdscr, top, 0, header.ljust(w), w,
                  curses.A_BOLD | curses.A_UNDERLINE)
 
@@ -258,23 +414,7 @@ def _render_table(
         elapsed = _elapsed_for(store, it.id) if st == ItemStatus.WORKING else None
         elapsed_s = _fmt_elapsed(elapsed) if elapsed is not None else "—"
         ctx_s = _ctx_fill_pct(it, context_window)
-        src = it.source_file
-        if len(src) > _COL_SOURCE - 1:
-            src = "…" + src[-(_COL_SOURCE - 2):]
-        title_max = max(0, w - 1 - _COL_ID - _COL_STATE - _COL_ELAPSED
-                          - _COL_CTX - _COL_SOURCE)
-        marker = "!" if has_err else " "
-        state_label = st.value
-        if st == ItemStatus.WORKING:
-            phase = _phase_for(it)
-            if not phase:
-                phase = "execute" if it.session_id else "plan"
-            state_label = f"{state_label}·{'plan' if phase == 'plan' else 'exec'}"
-        state_cell = f"{marker}{state_label}"[: _COL_STATE]
-        title = it.title[:title_max]
-        line = (f" {it.id[:8]:<{_COL_ID-1}}{state_cell:<{_COL_STATE}}"
-                f"{elapsed_s:<{_COL_ELAPSED}}{ctx_s:<{_COL_CTX}}"
-                f"{src:<{_COL_SOURCE}}{title}")
+        line = _table_row(tier, it, st, elapsed_s, ctx_s, has_err, w)
         if has_err:
             attr = curses.color_pair(4) | curses.A_BOLD
         else:
@@ -345,6 +485,55 @@ def _show_item_screen(
                      "↓ more below (j)".ljust(w), w, curses.A_DIM)
     _safe_addstr(stdscr, h - 1, 0, action_hint.ljust(w), w, curses.A_REVERSE)
     stdscr.refresh()
+
+
+def _show_help(stdscr) -> None:
+    """Full-legend help overlay. Narrow-tier hint bars collapse to
+    `↑↓ ⏎ q  [?]help`, so the user needs a dedicated surface to see the
+    full keymap when the main-view hints are abbreviated."""
+    lines = [
+        "navigation",
+        "  ↑ / k              move selection up",
+        "  ↓ / j              move selection down",
+        "  PgUp / PgDn        jump 10 rows",
+        "  Home / End         top / bottom",
+        "  Enter              open selected item (inspect/actions)",
+        "  Tab                cycle filter view",
+        "",
+        "global actions",
+        "  n                  new issue",
+        "  r                  review queue walk",
+        "  d                  deferred queue walk",
+        "  i                  inspect by id prefix",
+        "  +  /  -            increase / decrease agent pool size",
+        "  Shift+↑  /  P      bump selected item priority up",
+        "  Shift+↓  /  O      bump priority down",
+        "  u                  acknowledge system alert (unpause)",
+        "  q                  quit",
+        "",
+        "state glyphs (narrow tier)",
+        "  Q queued   W working   P awaiting plan   R awaiting review",
+        "  M merged   C conflicted  E errored  X rejected  D deferred",
+        "  K cancelled  B backlog  A approved",
+        "",
+        "close help: q / enter / esc",
+    ]
+    scroll = 0
+    while True:
+        h, w = stdscr.getmaxyx()
+        _show_item_screen(
+            stdscr, ["  help · agentor dashboard"], lines,
+            " [q/enter]close · [j/k]scroll · [space/pgdn]page ",
+            content_scroll=scroll,
+        )
+        ch = stdscr.getch()
+        new_scroll = _scroll_key(ch, scroll, len(lines), max(1, h - 4))
+        if new_scroll >= 0:
+            scroll = new_scroll
+            continue
+        k = chr(ch).lower() if 0 < ch < 256 else ""
+        if k == "q" or ch in (10, 13, 27):
+            return
 
 
 def _view_text_in_curses(stdscr, text: str) -> None:

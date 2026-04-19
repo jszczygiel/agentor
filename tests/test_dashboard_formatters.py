@@ -3,13 +3,19 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from unittest import mock
+
+from agentor.dashboard import formatters
 from agentor.dashboard.formatters import (
     _ctx_fill_pct,
     _fmt_elapsed,
     _fmt_token_line,
+    _fmt_token_line_mid,
+    _fmt_token_line_narrow,
     _fmt_tokens,
     _token_breakdown,
     _token_windows,
+    _token_windows_invalidate,
 )
 from agentor.models import Item, ItemStatus
 from agentor.store import Store, StoredItem
@@ -246,6 +252,104 @@ class TestTokenWindows(unittest.TestCase):
         self._seed_item("a", 11, updated_at=now)
         windows = _token_windows(self.store, daemon_started_at=0.0)
         self.assertEqual(windows["session"], windows["today"])
+
+
+class _FakeStore:
+    """Minimal stand-in for Store that counts aggregate_token_usage calls.
+    `_token_windows` only needs that one method on its collaborator."""
+
+    def __init__(self) -> None:
+        self.calls: list[float | None] = []
+
+    def aggregate_token_usage(self, since: float | None = None) -> dict:
+        self.calls.append(since)
+        return {"input": 1, "output": 0, "cache_read": 0,
+                "cache_create": 0, "total": 1}
+
+
+class TestTokenWindowsCache(unittest.TestCase):
+    def setUp(self):
+        _token_windows_invalidate()
+
+    def tearDown(self):
+        _token_windows_invalidate()
+
+    def test_first_call_delegates_three_times(self):
+        store = _FakeStore()
+        _token_windows(store, daemon_started_at=0.0)
+        # One aggregate per window (session, today, 7d).
+        self.assertEqual(len(store.calls), 3)
+
+    def test_second_call_within_ttl_is_cached(self):
+        store = _FakeStore()
+        first = _token_windows(store, daemon_started_at=0.0)
+        second = _token_windows(store, daemon_started_at=0.0)
+        self.assertEqual(len(store.calls), 3)  # still 3, not 6
+        # Same dict object returned — confirms the cache hit path.
+        self.assertIs(first, second)
+
+    def test_invalidate_forces_recompute(self):
+        store = _FakeStore()
+        _token_windows(store, daemon_started_at=0.0)
+        _token_windows_invalidate()
+        _token_windows(store, daemon_started_at=0.0)
+        self.assertEqual(len(store.calls), 6)
+
+    def test_ttl_expiry_forces_recompute(self):
+        store = _FakeStore()
+        base = 1_000_000.0
+        with mock.patch.object(formatters.time, "time", return_value=base):
+            _token_windows(store, daemon_started_at=0.0)
+            self.assertEqual(len(store.calls), 3)
+        # Jump past the TTL window (2.0s).
+        with mock.patch.object(formatters.time, "time", return_value=base + 5.0):
+            _token_windows(store, daemon_started_at=0.0)
+        self.assertEqual(len(store.calls), 6)
+
+    def test_different_store_identity_busts_cache(self):
+        store_a = _FakeStore()
+        store_b = _FakeStore()
+        _token_windows(store_a, daemon_started_at=0.0)
+        _token_windows(store_b, daemon_started_at=0.0)
+        # Each store computed its own three aggregates.
+        self.assertEqual(len(store_a.calls), 3)
+        self.assertEqual(len(store_b.calls), 3)
+
+    def test_different_daemon_start_busts_cache(self):
+        store = _FakeStore()
+        _token_windows(store, daemon_started_at=0.0)
+        _token_windows(store, daemon_started_at=123.0)
+        self.assertEqual(len(store.calls), 6)
+
+
+class TestFmtTokenLineTiers(unittest.TestCase):
+    """Tier-specific token-panel line formatters must fit their own
+    minimum width so the dashboard doesn't silently clip the totals."""
+
+    totals = {"input": 1_500_000, "output": 120_000,
+              "cache_read": 8_000_000, "cache_create": 350_000,
+              "total": 10_000_000}
+
+    def test_wide_line_fits_80(self):
+        line = _fmt_token_line("session", self.totals)
+        self.assertLessEqual(len(line) + 1, 80)  # leading space
+
+    def test_mid_line_fits_60(self):
+        line = _fmt_token_line_mid("session", self.totals)
+        self.assertLessEqual(len(line) + 1, 60)
+        # Σ survives in mid tier — most operator-relevant datum.
+        self.assertIn("Σ", line)
+
+    def test_narrow_line_fits_40(self):
+        line = _fmt_token_line_narrow("session", self.totals)
+        self.assertLessEqual(len(line) + 1, 40)
+        self.assertIn("Σ", line)
+
+    def test_narrow_truncates_long_label(self):
+        line = _fmt_token_line_narrow("session", self.totals)
+        # Narrow truncates `session` to 4 chars so Σ never clips.
+        self.assertIn("sess", line)
+        self.assertNotIn("session", line)
 
 
 if __name__ == "__main__":
