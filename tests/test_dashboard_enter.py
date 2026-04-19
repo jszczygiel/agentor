@@ -18,11 +18,11 @@ class TestInspectActionMap(unittest.TestCase):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[ItemStatus.QUEUED]}
         self.assertEqual(keys, {"f", "r", "s", "x"})
 
-    def test_awaiting_plan_review_has_approve_feedback_reject_defer(self):
+    def test_awaiting_plan_review_has_approve_feedback_defer_delete(self):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[
             ItemStatus.AWAITING_PLAN_REVIEW
         ]}
-        self.assertEqual(keys, {"a", "f", "r", "s", "x"})
+        self.assertEqual(keys, {"a", "r", "s", "x"})
 
     def test_awaiting_review_has_approve_reject_defer_diff(self):
         keys = {k for k, _ in _ACTION_KEYS_BY_STATUS[
@@ -131,7 +131,8 @@ class TestInspectFooter(unittest.TestCase):
             ItemStatus.AWAITING_PLAN_REVIEW, cycle=False
         )
         self.assertIn("[a]approve→execute", footer)
-        self.assertIn("[r]eject+feedback", footer)
+        self.assertIn("[r]feedback", footer)
+        self.assertNotIn("[f]approve+feedback", footer)
 
     def test_scroll_hint_always_present(self):
         self.assertIn("[j/k]scroll", _inspect_footer(
