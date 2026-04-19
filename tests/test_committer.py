@@ -1036,40 +1036,185 @@ class TestAdvanceUserCheckout(unittest.TestCase):
         _git(self.root, "commit", "-q", "-m", "local commit")
         self.assertNotEqual(_head_sha(self.root), base_sha_before)
 
+        allowed, reason = git_ops.advance_user_checkout_allowed(
+            self.root, "main", base_sha_before,
+        )
         self.assertFalse(
-            git_ops.advance_user_checkout_allowed(
-                self.root, "main", base_sha_before,
-            ),
+            allowed,
             "guard must reject when HEAD diverges from captured base sha",
         )
+        self.assertEqual(reason, "HEAD diverged from pre-merge base")
 
     def test_guard_allows_only_when_all_checks_pass(self):
-        """Direct unit test of the guard helper — all four code paths."""
+        """Direct unit test of the guard helper — every branch returns
+        the right `(allowed, reason)` tuple so callers can surface the
+        skip cause to the operator."""
         from agentor import git_ops
 
         base = _main_sha(self.root)
         # Happy: on main, clean, HEAD == base.
-        self.assertTrue(
+        self.assertEqual(
             git_ops.advance_user_checkout_allowed(self.root, "main", base),
+            (True, None),
         )
         # Dirty.
         (self.root / "dirt.txt").write_text("x")
-        self.assertFalse(
+        self.assertEqual(
             git_ops.advance_user_checkout_allowed(self.root, "main", base),
+            (False, "dirty worktree"),
         )
         (self.root / "dirt.txt").unlink()
         # Wrong branch.
         _git(self.root, "checkout", "-b", "other")
-        self.assertFalse(
+        self.assertEqual(
             git_ops.advance_user_checkout_allowed(self.root, "main", base),
+            (False, "checkout on other"),
+        )
+        _git(self.root, "checkout", "main")
+        # Detached HEAD reports specifically as "detached HEAD" rather
+        # than the generic "checkout on HEAD", for operator legibility.
+        _git(self.root, "checkout", "--detach")
+        self.assertEqual(
+            git_ops.advance_user_checkout_allowed(self.root, "main", base),
+            (False, "detached HEAD"),
         )
         _git(self.root, "checkout", "main")
         # Wrong base_sha_before.
-        self.assertFalse(
+        self.assertEqual(
             git_ops.advance_user_checkout_allowed(
                 self.root, "main", "0" * 40,
             ),
+            (False, "HEAD diverged from pre-merge base"),
         )
+
+
+class TestAdvanceUserCheckoutNoteSurfacing(unittest.TestCase):
+    """Every MERGED transition carries a visible suffix recording the
+    checkout-advance outcome so operators can grep history for the skip
+    cause. Gate-off stays silent (matches main's pre-surfacing behavior
+    for opt-outs)."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / ".gitignore").write_text(".agentor/\n")
+        (self.root / "backlog.md").write_text(
+            "- [ ] Touch a file\n  details\n"
+        )
+        _git(self.root, "add", ".gitignore", "backlog.md")
+        _git(self.root, "commit", "-q", "-m", "seed backlog")
+        self.cfg = _mk_config(self.root)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        scan_once(self.cfg, self.store)
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _claim_and_stub(self):
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(self.cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        StubRunner(self.cfg, self.store).run(claimed)
+        return self.store.get(claimed.id)
+
+    def _last_note(self, item_id: str) -> str:
+        return self.store.transitions_for(item_id)[-1].note or ""
+
+    def test_happy_path_note_records_advance(self):
+        item = self._claim_and_stub()
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        self.assertIn(", checkout advanced", self._last_note(item.id))
+
+    def test_dirty_worktree_note_records_skip_reason(self):
+        (self.root / "scratch.txt").write_text("wip\n")
+        item = self._claim_and_stub()
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        self.assertIn(", checkout skipped: dirty worktree",
+                      self._last_note(item.id))
+
+    def test_other_branch_note_records_skip_reason(self):
+        _git(self.root, "checkout", "-b", "sidecar")
+        item = self._claim_and_stub()
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        self.assertIn(", checkout skipped: checkout on sidecar",
+                      self._last_note(item.id))
+
+    def test_detached_head_note_records_skip_reason(self):
+        _git(self.root, "checkout", "--detach", _main_sha(self.root))
+        item = self._claim_and_stub()
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        self.assertIn(", checkout skipped: detached HEAD",
+                      self._last_note(item.id))
+
+    def test_diverged_head_note_records_skip_reason(self):
+        """The "HEAD diverged" branch is unreachable end-to-end (the
+        committer captures base_sha_before inside _INTEGRATION_LOCK, so
+        any concurrent user commit on base would have to race with
+        microsecond-level precision). Exercise the committer's wiring by
+        monkeypatching the guard to return the diverged reason, then
+        verify the suffix lands on the MERGED note."""
+        from agentor import git_ops as _git_ops
+
+        original = _git_ops.advance_user_checkout_allowed
+
+        def stub(*_a, **_kw):
+            return (False, "HEAD diverged from pre-merge base")
+
+        _git_ops.advance_user_checkout_allowed = stub
+        try:
+            item = self._claim_and_stub()
+            approve_and_commit(self.cfg, self.store, item, "stub note")
+        finally:
+            _git_ops.advance_user_checkout_allowed = original
+
+        self.assertIn(
+            ", checkout skipped: HEAD diverged from pre-merge base",
+            self._last_note(item.id),
+        )
+
+    def test_gate_off_note_is_silent(self):
+        """Gate off → no suffix at all. Matches main's pre-surfacing
+        behavior when the operator explicitly opts out."""
+        self.cfg.git.advance_user_checkout = False
+        item = self._claim_and_stub()
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        note = self._last_note(item.id)
+        self.assertNotIn("checkout advanced", note)
+        self.assertNotIn("checkout skipped", note)
+
+    def test_retry_merge_note_records_advance(self):
+        """retry_merge's MERGED transition also carries the suffix so
+        post-retry history shows whether the checkout caught up."""
+        # Drive to CONFLICTED via a README clash, then resolve.
+        item = self._claim_and_stub()
+        wt = Path(item.worktree_path)
+        (wt / "README.md").write_text("# project\n\nFEAT\n")
+        _git(wt, "add", "README.md")
+        _git(wt, "commit", "-q", "-m", "feat readme")
+        (self.root / "README.md").write_text("# project\n\nMAIN\n")
+        _git(self.root, "add", "README.md")
+        _git(self.root, "commit", "-q", "-m", "main readme")
+        approve_and_commit(self.cfg, self.store, item, "stub commit")
+        conflicted = self.store.get(item.id)
+        self.assertEqual(conflicted.status, ItemStatus.CONFLICTED)
+        (wt / "README.md").write_text("# project\n\nMAIN\n")
+
+        ok, _msg = retry_merge(self.cfg, self.store, conflicted)
+
+        self.assertTrue(ok)
+        self.assertIn(", checkout advanced", self._last_note(item.id))
 
 
 if __name__ == "__main__":

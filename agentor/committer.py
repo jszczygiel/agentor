@@ -50,6 +50,34 @@ _AUTO_RESOLVE_NOTE = (
 )
 
 
+def _plan_checkout_advance(
+    config: Config, repo: Path, base_sha_before: str, p: ProgressCb,
+) -> tuple[bool, str]:
+    """Decide whether the user's primary checkout should fast-forward
+    after a clean merge, and return the MERGED-note suffix capturing the
+    outcome. Called BEFORE `merge_feature_into_base` runs its CAS so the
+    guards read a meaningful pre-CAS state.
+
+    Returns `(will_advance, suffix)`:
+      - gate off             → (False, "")                    — silent
+      - gate on, allowed     → (True,  ", checkout advanced")
+      - gate on, skip reason → (False, ", checkout skipped: <reason>")
+
+    Also emits a progress message so the curses progress dialog surfaces
+    the decision live during the merge."""
+    if not config.git.advance_user_checkout:
+        return False, ""
+    allowed, reason = git_ops.advance_user_checkout_allowed(
+        repo, config.git.base_branch, base_sha_before,
+    )
+    if allowed:
+        p(f"user checkout will advance to new {config.git.base_branch} tip")
+        return True, ", checkout advanced"
+    assert reason is not None  # allowed=False always carries a reason
+    p(f"checkout will not advance — {reason}")
+    return False, f", checkout skipped: {reason}"
+
+
 def _build_conflict_summary(
     item: StoredItem, mode: str, base: str, raw: str, *, retry: bool = False,
 ) -> str:
@@ -126,11 +154,8 @@ def approve_and_commit(
         base_sha_before = git_ops.run(
             repo, "rev-parse", f"refs/heads/{config.git.base_branch}",
         ).stdout.strip()
-        will_advance_checkout = (
-            config.git.advance_user_checkout
-            and git_ops.advance_user_checkout_allowed(
-                repo, config.git.base_branch, base_sha_before,
-            )
+        will_advance_checkout, checkout_suffix = _plan_checkout_advance(
+            config, repo, base_sha_before, p,
         )
         p(f"{verb} {config.git.base_branch}")
         merge_sha, conflict = git_ops.merge_feature_into_base(
@@ -171,7 +196,7 @@ def approve_and_commit(
         store.transition(
             item.id, ItemStatus.MERGED,
             note=f"{note_prefix} {sha[:8]}, {mode}d {merge_sha[:8]} into "
-                 f"{config.git.base_branch}",
+                 f"{config.git.base_branch}{checkout_suffix}",
         )
         return sha
 
@@ -211,11 +236,8 @@ def retry_merge(
         base_sha_before = git_ops.run(
             repo, "rev-parse", f"refs/heads/{config.git.base_branch}",
         ).stdout.strip()
-        will_advance_checkout = (
-            config.git.advance_user_checkout
-            and git_ops.advance_user_checkout_allowed(
-                repo, config.git.base_branch, base_sha_before,
-            )
+        will_advance_checkout, checkout_suffix = _plan_checkout_advance(
+            config, repo, base_sha_before, p,
         )
         p(f"{verb} {config.git.base_branch} (retry)")
         merge_sha, conflict = git_ops.merge_feature_into_base(
@@ -244,7 +266,8 @@ def retry_merge(
         store.transition(
             item.id, ItemStatus.MERGED,
             last_error=None,
-            note=f"resolved — {mode}d {merge_sha[:8]} into {config.git.base_branch}",
+            note=f"resolved — {mode}d {merge_sha[:8]} into "
+                 f"{config.git.base_branch}{checkout_suffix}",
         )
         return True, f"{mode}d {merge_sha[:8]} into {config.git.base_branch}"
 
