@@ -90,86 +90,6 @@ class TestInspectDispatch(unittest.TestCase):
             self.store.get("plan1").status, ItemStatus.AWAITING_PLAN_REVIEW,
         )
 
-    def test_queued_feedback_seeds_item_without_status_change(self):
-        self._seed("q1", ItemStatus.QUEUED)
-        with patch(
-            "agentor.dashboard.modes._prompt_multiline",
-            return_value="please use X",
-        ):
-            acted, msg = _inspect_dispatch(
-                None, None, self.store, self.daemon,
-                self._fresh("q1"), "f",
-            )
-        self.assertTrue(acted)
-        self.assertEqual(msg, "feedback seeded")
-        got = self.store.get("q1")
-        self.assertEqual(got.status, ItemStatus.QUEUED)
-        self.assertEqual(got.feedback, "please use X")
-        notes = [
-            t.note for t in self.store.transitions_for("q1")
-            if t.from_status == ItemStatus.QUEUED
-            and t.to_status == ItemStatus.QUEUED
-        ]
-        self.assertIn("feedback seeded for next run", notes)
-
-    def test_queued_feedback_empty_is_noop(self):
-        self._seed("q1", ItemStatus.QUEUED)
-        with patch(
-            "agentor.dashboard.modes._prompt_multiline", return_value="",
-        ):
-            acted, msg = _inspect_dispatch(
-                None, None, self.store, self.daemon,
-                self._fresh("q1"), "f",
-            )
-        self.assertFalse(acted)
-        self.assertEqual(msg, "")
-        got = self.store.get("q1")
-        self.assertEqual(got.status, ItemStatus.QUEUED)
-        self.assertIsNone(got.feedback)
-
-    def test_queued_reject_with_feedback_transitions_to_rejected(self):
-        self._seed("q1", ItemStatus.QUEUED)
-        with patch(
-            "agentor.dashboard.modes._prompt_multiline",
-            return_value="no thanks",
-        ):
-            acted, msg = _inspect_dispatch(
-                None, None, self.store, self.daemon,
-                self._fresh("q1"), "r",
-            )
-        self.assertTrue(acted)
-        self.assertEqual(msg, "rejected")
-        got = self.store.get("q1")
-        self.assertEqual(got.status, ItemStatus.REJECTED)
-        self.assertEqual(got.feedback, "no thanks")
-
-    def test_queued_reject_empty_feedback_is_noop(self):
-        self._seed("q1", ItemStatus.QUEUED)
-        with patch(
-            "agentor.dashboard.modes._prompt_multiline", return_value="",
-        ):
-            acted, msg = _inspect_dispatch(
-                None, None, self.store, self.daemon,
-                self._fresh("q1"), "r",
-            )
-        self.assertFalse(acted)
-        self.assertEqual(msg, "")
-        self.assertEqual(
-            self.store.get("q1").status, ItemStatus.QUEUED,
-        )
-
-    def test_queued_defer_transitions_to_deferred(self):
-        self._seed("q1", ItemStatus.QUEUED)
-        acted, msg = _inspect_dispatch(
-            None, None, self.store, self.daemon,
-            self._fresh("q1"), "s",
-        )
-        self.assertTrue(acted)
-        self.assertEqual(msg, "deferred")
-        self.assertEqual(
-            self.store.get("q1").status, ItemStatus.DEFERRED,
-        )
-
     def test_plan_review_approve_transitions_to_queued(self):
         self._seed("plan1", ItemStatus.QUEUED)
         self.store.transition("plan1", ItemStatus.WORKING, note="t")
@@ -681,26 +601,6 @@ class TestInspectPriorityKeys(unittest.TestCase):
         self._drive(curses.KEY_SF)
         self.assertEqual(self.store.get("pri1").priority, 2)
 
-    def test_plus_bumps_priority_up(self):
-        self._drive(ord("+"))
-        self.assertEqual(self.store.get("pri1").priority, 1)
-
-    def test_minus_clamps_priority_at_zero(self):
-        self._drive(ord("-"))
-        self.assertEqual(self.store.get("pri1").priority, 0)
-
-    def test_minus_decrements_non_zero_priority(self):
-        self.store.bump_priority("pri1", 3)
-        self._drive(ord("-"))
-        self.assertEqual(self.store.get("pri1").priority, 2)
-
-    def test_repeated_plus_accumulates_without_status_change(self):
-        status_before = self.store.get("pri1").status
-        self._drive(ord("+"), ord("+"), ord("+"))
-        got = self.store.get("pri1")
-        self.assertEqual(got.priority, 3)
-        self.assertEqual(got.status, status_before)
-
     def test_repeated_bumps_accumulate_without_status_change(self):
         status_before = self.store.get("pri1").status
         self._drive(ord("P"), ord("P"), ord("P"))
@@ -710,17 +610,17 @@ class TestInspectPriorityKeys(unittest.TestCase):
 
 
 class TestInspectFooterPriorityHint(unittest.TestCase):
-    """The inspect footer must advertise the priority bindings regardless
-    of whether the current status has any action keys, so the binding stays
+    """The inspect footer must advertise `[P/O]priority` regardless of
+    whether the current status has any action keys, so the binding stays
     discoverable on view-only screens (WORKING, QUEUED, MERGED)."""
 
     def test_priority_hint_present_on_view_only_status(self):
         footer = _inspect_footer(ItemStatus.WORKING, cycle=False)
-        self.assertIn("[+/-/P/O]priority", footer)
+        self.assertIn("[P/O]priority", footer)
 
     def test_priority_hint_present_alongside_actions(self):
         footer = _inspect_footer(ItemStatus.AWAITING_PLAN_REVIEW, cycle=False)
-        self.assertIn("[+/-/P/O]priority", footer)
+        self.assertIn("[P/O]priority", footer)
         self.assertIn("[a]approve→execute", footer)
 
 
