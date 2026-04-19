@@ -73,10 +73,6 @@ _ACTION_KEYS_BY_STATUS: dict[ItemStatus, list[tuple[str, str]]] = {
         ("a", "[a]restore"),
         ("x", "[x]delete"),
     ],
-    ItemStatus.BACKLOG: [
-        ("a", "[a]approve→queued"),
-        ("x", "[x]delete"),
-    ],
 }
 
 
@@ -378,32 +374,10 @@ def _inspect_dispatch(
 
     if status == ItemStatus.DEFERRED:
         if key == "a":
-            restored = restore_deferred(store, item)
-            if restored == ItemStatus.BACKLOG:
-                # Legacy rows whose history leads back to BACKLOG — the
-                # gate no longer exists, so skip it straight to QUEUED.
-                store.transition(
-                    item.id, ItemStatus.QUEUED,
-                    note="approved by user (legacy backlog → queued)",
-                )
+            restore_deferred(store, item)
             if daemon is not None:
                 daemon.try_fill_pool()
             return True, "restored"
-        if key == "x":
-            if not _prompt_yn(stdscr, "delete this idea?"):
-                return False, ""
-            delete_idea(store, item)
-            return True, "deleted"
-
-    if status == ItemStatus.BACKLOG:
-        if key == "a":
-            store.transition(
-                item.id, ItemStatus.QUEUED,
-                note="approved by user (backlog → queued)",
-            )
-            if daemon is not None:
-                daemon.try_fill_pool()
-            return True, "queued"
         if key == "x":
             if not _prompt_yn(stdscr, "delete this idea?"):
                 return False, ""

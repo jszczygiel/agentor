@@ -185,15 +185,9 @@ class TestStatusRoundTrip(unittest.TestCase):
         # Walk every status in declaration order. from_status on row N is the
         # to_status of row N-1, so both columns see every value that can ever
         # appear in them.
-        # Seed BACKLOG explicitly: upsert lands at QUEUED now, and we want
-        # every status — including legacy BACKLOG — to round-trip through
-        # the DB at least once.
-        self.store.transition(item_id, ItemStatus.BACKLOG, note="legacy seed")
         for status in ItemStatus:
             if status == ItemStatus.QUEUED:
                 continue  # seeded by upsert_discovered
-            if status == ItemStatus.BACKLOG:
-                continue  # already seeded above
             self.store.transition(item_id, status, note=status.value)
         history = self.store.transitions_for(item_id)
         seen_to = {t.to_status for t in history}
@@ -465,6 +459,53 @@ class TestMigratePriority(unittest.TestCase):
                 [it.id for it in store.list_by_status(ItemStatus.QUEUED)],
                 ["pre"],
             )
+        finally:
+            store.close()
+
+
+class TestMigrateLegacyBacklog(unittest.TestCase):
+    """BACKLOG was dropped from the enum; `_migrate` heals any lingering
+    `'backlog'` strings in both items.status and transitions.from_status /
+    to_status so `_decode_status` doesn't raise on the next open."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.db_path = Path(self.td.name) / "state.db"
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def test_legacy_backlog_row_heals_to_queued_on_open(self):
+        store = Store(self.db_path)
+        store.upsert_discovered(_mk_item(id="legacy"))
+        store.close()
+
+        raw = sqlite3.connect(self.db_path)
+        raw.execute("UPDATE items SET status = 'backlog' WHERE id = 'legacy'")
+        raw.execute(
+            "INSERT INTO transitions (item_id, from_status, to_status, note, at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("legacy", "queued", "backlog", "legacy seed", time.time()),
+        )
+        raw.execute(
+            "INSERT INTO transitions (item_id, from_status, to_status, note, at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("legacy", "backlog", "queued", "approved", time.time()),
+        )
+        raw.commit()
+        raw.close()
+
+        store = Store(self.db_path)
+        try:
+            stored = store.get("legacy")
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.status, ItemStatus.QUEUED)
+            # transitions_for must not raise on decode.
+            history = store.transitions_for("legacy")
+            for t in history:
+                self.assertIsInstance(t.to_status, ItemStatus)
+                if t.from_status is not None:
+                    self.assertIsInstance(t.from_status, ItemStatus)
         finally:
             store.close()
 

@@ -798,11 +798,10 @@ class TestDaemonAutoDispatch(unittest.TestCase):
 
     def test_scan_lands_items_at_queued(self):
         """No operator gate — one scan pass, every new item lands directly
-        at QUEUED with zero BACKLOG rows produced."""
+        at QUEUED."""
         cfg = self._cfg()
         scan_once(cfg, self.store)
         self.assertEqual(len(self.store.list_by_status(ItemStatus.QUEUED)), 2)
-        self.assertEqual(len(self.store.list_by_status(ItemStatus.BACKLOG)), 0)
 
     def test_daemon_dispatches_queued_discovery(self):
         from agentor.daemon import Daemon
@@ -894,9 +893,9 @@ class TestRecovery(unittest.TestCase):
 
     def test_recovery_uses_previous_settled_state(self):
         """An item that had reached AWAITING_PLAN_REVIEW and was re-queued
-        for execute, then crashed mid-work, should revert to QUEUED (the
-        execute-phase wait) — not be sent back to BACKLOG. Verifies the
-        recovery hook to previous_settled_status."""
+        for execute, then crashed mid-work, should revert to QUEUED — the
+        execute-phase wait. Verifies the recovery hook to
+        previous_settled_status."""
         item = self.store.list_by_status(ItemStatus.QUEUED)[0]
         wt, br = plan_worktree(self.cfg, item)
         claimed = self.store.claim_next_queued(str(wt), br)
@@ -905,8 +904,8 @@ class TestRecovery(unittest.TestCase):
         # claim again, then "crash" without session_id
         self.store.claim_next_queued(str(wt), br)
         rec = recover_on_startup(self.cfg, self.store)
-        # restored to QUEUED (the execute-phase resting state), not back
-        # to BACKLOG, and worktree fields cleared.
+        # restored to QUEUED (the execute-phase resting state), worktree
+        # fields cleared.
         item_after = self.store.get(claimed.id)
         self.assertEqual(item_after.status, ItemStatus.QUEUED)
         self.assertIsNone(item_after.worktree_path)
