@@ -109,6 +109,22 @@ class TestStubRunner(unittest.TestCase):
         retry(self.store, self.store.get(claimed.id))
         self.assertEqual(self.store.get(claimed.id).status, ItemStatus.QUEUED)
 
+    def test_stub_runner_writes_agent_log_with_outcome_header(self):
+        """Execute-flow smoke: StubRunner emits a compliance-passing
+        `docs/agent-logs/*.md` containing the `## Outcome` header so
+        the fold + agentor-review pipelines can aggregate structured
+        recurring-followup data."""
+        claimed = self._claim_first()
+        StubRunner(self.cfg, self.store).run(claimed)
+        item = self.store.get(claimed.id)
+        wt = Path(item.worktree_path)
+        logs = list((wt / "docs" / "agent-logs").glob("*.md"))
+        self.assertEqual(len(logs), 1,
+                         "StubRunner must write exactly one agent-log")
+        text = logs[0].read_text()
+        self.assertIn("## Outcome", text)
+        self.assertIn("Files touched:", text)
+
 
 class TestFrontmatterMarkDone(unittest.TestCase):
     def setUp(self):
