@@ -137,12 +137,23 @@ class AgentConfig:
         "    - out-of-scope items also logged to docs/IMPROVEMENTS.md\n\n"
         "    ## Stop if\n"
         "    - symptoms that should halt a future similar attempt\n\n"
+        "    ## Outcome\n"
+        "    - Files touched: relative paths, cap 6 (list the most "
+        "significant if more than 6).\n"
+        "    - Tests added/adjusted: new or modified test cases (name "
+        "+ module).\n"
+        "    - Follow-ups: out-of-scope items worth a future backlog "
+        "entry (also mirrored into docs/IMPROVEMENTS.md).\n\n"
         "   Skip sections with nothing to say — an empty run produces no "
-        "file. Include this file in your commit. When `docs/agent-logs/` "
-        "accumulates ≥ `agent.fold_threshold` files (default 10), the "
-        "daemon auto-queues a fold item whose agent clusters durable "
-        "lessons into CLAUDE.md / skills and deletes the consumed logs "
-        "in the same commit.\n\n"
+        "file. Include this file in your commit. The committer checks "
+        "the feature branch against `git.base_branch` and records "
+        "`, no agent-log written` on the MERGED transition when the "
+        "log is absent; `agent.require_agent_log = true` upgrades this "
+        "to a CONFLICTED block. When `docs/agent-logs/` accumulates ≥ "
+        "`agent.fold_threshold` files (default 10), the daemon "
+        "auto-queues a fold item whose agent clusters durable lessons "
+        "into CLAUDE.md / skills and deletes the consumed logs in the "
+        "same commit.\n\n"
         "9. Commit on this branch. Do NOT push, do NOT merge — a human "
         "reviewer and agentor's committer handle integration. Use a "
         "concise conventional-commit-style message summarizing the "
@@ -211,6 +222,13 @@ class AgentConfig:
     # 5h and weekly quotas.
     session_token_budget: int = 0
     weekly_token_budget: int = 0
+    # When true, `committer.approve_and_commit` blocks the integration if
+    # the feature branch did not add any `docs/agent-logs/*.md` file:
+    # transitions the item to CONFLICTED with `last_error = "agent-log
+    # missing"`. Default false — a miss only appends `, no agent-log
+    # written` to the MERGED transition note so operators can grep
+    # history for the skip rate.
+    require_agent_log: bool = False
     # Seconds of silence on a WORKING item's transcript before the daemon
     # surfaces a sticky dashboard alert flagging the session as possibly
     # stuck. Informational only — `timeout_seconds` still owns the kill

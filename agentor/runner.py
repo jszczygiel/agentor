@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import random
@@ -581,8 +582,9 @@ class Runner:
 
 
 class StubRunner(Runner):
-    """Test runner that writes a trivial AGENT_NOTE.md. Proves the pipeline
-    end-to-end without spawning Claude."""
+    """Test runner that writes a trivial AGENT_NOTE.md plus a
+    compliance-passing per-run findings log under `docs/agent-logs/`.
+    Proves the pipeline end-to-end without spawning Claude."""
 
     def do_work(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
         note_path = worktree / f".agentor-note-{item.id[:8]}.md"
@@ -592,8 +594,25 @@ class StubRunner(Runner):
             f"Body:\n{item.body}\n\n"
             f"(This is a stub runner. Replace with real agent.)\n"
         )
+        note_rel = str(note_path.relative_to(worktree))
+
+        today = datetime.date.today().isoformat()
+        log_dir = worktree / "docs" / "agent-logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{today}-stub-{item.id[:8]}.md"
+        log_path.write_text(
+            f"# {item.title} — {today}\n\n"
+            f"## Surprises\n"
+            f"- none (stub runner)\n\n"
+            f"## Outcome\n"
+            f"- Files touched: {note_rel}\n"
+            f"- Tests added/adjusted: none (stub runner)\n"
+            f"- Follow-ups: none\n"
+        )
+        log_rel = str(log_path.relative_to(worktree))
+
         summary = f"stub: added note for '{item.title}'"
-        return summary, [str(note_path.relative_to(worktree))]
+        return summary, [note_rel, log_rel]
 
 
 def _run_stream_json_subprocess(
