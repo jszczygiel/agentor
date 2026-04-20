@@ -592,14 +592,14 @@ class TestStaleSessionWatchdog(unittest.TestCase):
         return Daemon(cfg, self.store, factory,
                       install_signals=False, log=self.logs.append)
 
-    def _seed_working(self, id: str = "a", session_id: str = "sess-x") -> None:
+    def _seed_working(self, id: str = "a", agent_ref: str = "sess-x") -> None:
         self.store.upsert_discovered(_mk_item(id))
         self.store.transition(id, ItemStatus.QUEUED)
         self.store.transition(
             id, ItemStatus.WORKING,
             worktree_path=str(self.root / "wt"),
             branch="agent/test",
-            session_id=session_id,
+            agent_ref=agent_ref,
         )
 
     def _write_transcript(self, id: str, phase: str, age_seconds: float) -> int:
@@ -646,8 +646,8 @@ class TestStaleSessionWatchdog(unittest.TestCase):
         d._check_stale_sessions(time.time_ns())
         self.assertEqual(d.stale_session_alerts, {})
 
-    def test_no_session_id_skipped(self):
-        """WORKING items without a live session_id are not yet dispatched
+    def test_no_agent_ref_skipped(self):
+        """WORKING items without a live agent_ref are not yet dispatched
         through a claude/codex session — skip them so we don't alert on
         stub-runner fixtures or pre-session setup."""
         self.store.upsert_discovered(_mk_item("a"))
@@ -687,7 +687,7 @@ class TestStaleSessionWatchdog(unittest.TestCase):
     def test_plan_transcript_used_when_only_plan_exists(self):
         """Watchdog checks both phases; if only plan.log exists, it picks
         plan's mtime rather than silently no-op'ing."""
-        self._seed_working("a", session_id="sess-plan")
+        self._seed_working("a", agent_ref="sess-plan")
         self._write_transcript("a", "plan", age_seconds=400)
         d = self._mk_daemon(threshold=300)
         d._check_stale_sessions(time.time_ns())

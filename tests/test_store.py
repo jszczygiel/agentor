@@ -430,7 +430,7 @@ class TestMigratePriority(unittest.TestCase):
                 last_error    TEXT,
                 feedback      TEXT,
                 result_json   TEXT,
-                session_id    TEXT,
+                agent_ref     TEXT,
                 agentor_version TEXT,
                 created_at    REAL NOT NULL,
                 updated_at    REAL NOT NULL
@@ -438,7 +438,7 @@ class TestMigratePriority(unittest.TestCase):
             INSERT INTO items_new
                 SELECT id, title, body, source_file, source_line, tags_json,
                        status, worktree_path, branch, attempts, last_error,
-                       feedback, result_json, session_id, agentor_version,
+                       feedback, result_json, agent_ref, agentor_version,
                        created_at, updated_at FROM items;
             DROP TABLE items;
             ALTER TABLE items_new RENAME TO items;
@@ -506,6 +506,123 @@ class TestMigrateLegacyBacklog(unittest.TestCase):
                 self.assertIsInstance(t.to_status, ItemStatus)
                 if t.from_status is not None:
                     self.assertIsInstance(t.from_status, ItemStatus)
+        finally:
+            store.close()
+
+
+class TestLegacySessionIdMigration(unittest.TestCase):
+    """`items.session_id` was renamed to `agent_ref` for provider neutrality.
+    `_migrate` must rename the column on a DB opened against the legacy
+    schema and preserve any persisted resume tokens."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.db_path = Path(self.td.name) / "state.db"
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _build_legacy_schema_with_session_id(self) -> None:
+        """Rebuild the `items` table with the pre-rename schema (column
+        named `session_id`) and seed one row carrying a value, so the
+        _migrate rename path has something to preserve."""
+        raw = sqlite3.connect(self.db_path)
+        raw.executescript("""
+            BEGIN;
+            CREATE TABLE items_old (
+                id            TEXT PRIMARY KEY,
+                title         TEXT NOT NULL,
+                body          TEXT NOT NULL,
+                source_file   TEXT NOT NULL,
+                source_line   INTEGER NOT NULL,
+                tags_json     TEXT NOT NULL DEFAULT '{}',
+                status        TEXT NOT NULL,
+                worktree_path TEXT,
+                branch        TEXT,
+                attempts      INTEGER NOT NULL DEFAULT 0,
+                last_error    TEXT,
+                feedback      TEXT,
+                result_json   TEXT,
+                session_id    TEXT,
+                agentor_version TEXT,
+                priority      INTEGER NOT NULL DEFAULT 0,
+                created_at    REAL NOT NULL,
+                updated_at    REAL NOT NULL
+            );
+            INSERT INTO items_old
+                SELECT id, title, body, source_file, source_line, tags_json,
+                       status, worktree_path, branch, attempts, last_error,
+                       feedback, result_json, agent_ref, agentor_version,
+                       priority, created_at, updated_at FROM items;
+            DROP TABLE items;
+            ALTER TABLE items_old RENAME TO items;
+            COMMIT;
+        """)
+        raw.execute(
+            "UPDATE items SET session_id = ? WHERE id = ?",
+            ("claude-sess-xyz", "legacy"),
+        )
+        raw.commit()
+        raw.close()
+
+    def test_legacy_session_id_column_renames_and_preserves_value(self):
+        store = Store(self.db_path)
+        store.upsert_discovered(_mk_item(id="legacy"))
+        store.close()
+        self._build_legacy_schema_with_session_id()
+
+        check = sqlite3.connect(self.db_path)
+        check.row_factory = sqlite3.Row
+        cols = {r["name"] for r in check.execute("PRAGMA table_info(items)")}
+        self.assertIn("session_id", cols)
+        self.assertNotIn("agent_ref", cols)
+        check.close()
+
+        store = Store(self.db_path)
+        try:
+            cols = {
+                r["name"]
+                for r in store.conn.execute("PRAGMA table_info(items)")
+            }
+            self.assertIn("agent_ref", cols)
+            self.assertNotIn("session_id", cols)
+            stored = store.get("legacy")
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.agent_ref, "claude-sess-xyz")
+        finally:
+            store.close()
+
+    def test_agent_ref_round_trip_via_transition(self):
+        store = Store(self.db_path)
+        try:
+            store.upsert_discovered(_mk_item(id="rt"))
+            store.claim_next_queued("/wt/rt", "agent/rt")
+            store.transition(
+                "rt", ItemStatus.WORKING, agent_ref="abc",
+                note="agent_ref assigned",
+            )
+            stored = store.get("rt")
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.agent_ref, "abc")
+
+            store.transition(
+                "rt", ItemStatus.QUEUED, agent_ref=None,
+                note="session dropped",
+            )
+            stored = store.get("rt")
+            self.assertIsNone(stored.agent_ref)
+        finally:
+            store.close()
+
+    def test_rejects_legacy_session_id_kwarg(self):
+        store = Store(self.db_path)
+        try:
+            store.upsert_discovered(_mk_item(id="bad"))
+            store.claim_next_queued("/wt/bad", "agent/bad")
+            with self.assertRaises(ValueError):
+                store.transition(
+                    "bad", ItemStatus.WORKING, session_id="nope",
+                )
         finally:
             store.close()
 

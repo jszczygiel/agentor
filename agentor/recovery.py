@@ -63,12 +63,12 @@ def _is_auto_recoverable_error(msg: str | None) -> bool:
 @dataclass
 class RecoveryResult:
     requeued: list[str]   # items reset to QUEUED — must start fresh
-    resumable: list[StoredItem]  # WORKING items with session_id + live worktree
+    resumable: list[StoredItem]  # WORKING items with agent_ref + live worktree
     auto_recovered: list[str] = field(default_factory=list)  # errors cleared
-    # WORKING items whose persisted session_id is presumed dead (age over
+    # WORKING items whose persisted agent_ref is presumed dead (age over
     # the active provider's `session_max_age_hours`, or a prior failure
     # row matching the provider's dead-session signature). Demoted to
-    # QUEUED with session_id cleared so the next dispatch starts a fresh
+    # QUEUED with agent_ref cleared so the next dispatch starts a fresh
     # plan run instead of paying for a doomed `--resume` round-trip.
     stale_sessions: list[str] = field(default_factory=list)
 
@@ -93,7 +93,7 @@ def _has_dead_session_failure(
 def _session_age_seconds(store: Store, item: StoredItem, now: float) -> float:
     """Age of the WORKING claim, used as a proxy for session age. Falls
     back to `items.updated_at` when no WORKING transition row exists
-    (shouldn't happen for items that hold a session_id, but the fallback
+    (shouldn't happen for items that hold an agent_ref, but the fallback
     keeps the sweep robust against partial DB state)."""
     at = store.latest_transition_at(item.id, ItemStatus.WORKING)
     if at is None:
@@ -104,11 +104,11 @@ def _session_age_seconds(store: Store, item: StoredItem, now: float) -> float:
 def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
     """Handle items left in WORKING from a prior run.
 
-    If the item has a persisted session_id AND its worktree still exists on
-    disk, demote it to QUEUED while preserving `session_id`, `worktree_path`,
+    If the item has a persisted agent_ref AND its worktree still exists on
+    disk, demote it to QUEUED while preserving `agent_ref`, `worktree_path`,
     `branch`, and `result_json` — the normal dispatch loop will claim it
     when a pool slot opens, and the runner detects the resumable state via
-    `session_id + worktree exists` and calls claude with `--resume`.
+    `agent_ref + worktree exists` and calls claude with `--resume`.
     Resetting attempts to 0 keeps the operator-driven resume from eating
     the item's retry budget.
 
@@ -140,11 +140,11 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
     for item in stuck:
         wt = Path(item.worktree_path) if item.worktree_path else None
         # Stale-session check runs before the resumable check. An item with
-        # a session_id whose age exceeds the provider's threshold, or whose
+        # an agent_ref whose age exceeds the provider's threshold, or whose
         # last failure was a dead-session error per the provider, is demoted
         # to a fresh plan run — `--resume` against an expired session
         # always exits 1 and burns tokens per attempt.
-        if item.session_id:
+        if item.agent_ref:
             age = _session_age_seconds(store, item, now)
             stale = (max_age_seconds > 0 and age > max_age_seconds)
             stale = stale or _has_dead_session_failure(store, item.id, provider)
@@ -156,13 +156,13 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
                 store.transition(
                     item.id, ItemStatus.QUEUED,
                     attempts=0,
-                    session_id=None, worktree_path=None, branch=None,
+                    agent_ref=None, worktree_path=None, branch=None,
                     last_error=_STALE_SESSION_MARKER,
                     note="stale session demoted; restarting plan",
                 )
                 stale_sessions.append(item.id)
                 continue
-        can_resume = bool(item.session_id and wt and wt.exists())
+        can_resume = bool(item.agent_ref and wt and wt.exists())
         if can_resume:
             store.transition(
                 item.id, ItemStatus.QUEUED,
@@ -182,7 +182,7 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
         prev = store.previous_settled_status(item.id) or ItemStatus.QUEUED
         store.transition(
             item.id, prev,
-            worktree_path=None, branch=None, session_id=None,
+            worktree_path=None, branch=None, agent_ref=None,
             note=f"recovered from crashed run → {prev.value} (no resumable session)",
         )
         requeued.append(item.id)

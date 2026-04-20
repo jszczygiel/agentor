@@ -292,7 +292,7 @@ def _table_row(tier: str, item, st, elapsed_s: str, ctx_s: str,
     if st == ItemStatus.WORKING:
         phase = _phase_for(item)
         if not phase:
-            phase = "execute" if item.session_id else "plan"
+            phase = "execute" if item.agent_ref else "plan"
         state_label = f"{state_label}·{'plan' if phase == 'plan' else 'exec'}"
     elif auto_resolve:
         state_label = f"{state_label}·auto"

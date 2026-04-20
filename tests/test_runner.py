@@ -15,8 +15,8 @@ from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
                             ReviewConfig, SourcesConfig)
 from agentor.models import ItemStatus
 from agentor.recovery import recover_on_startup
+from agentor.providers import ClaudeProvider
 from agentor.runner import (ClaudeRunner, CodexRunner, StubRunner,
-                            _default_claude_command,
                             _extract_plan_questions,
                             _mark_done_instruction,
                             _parse_execute_tier,
@@ -438,8 +438,8 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"here is the plan",
         data = json.loads(refreshed.result_json)
         self.assertEqual(data["phase"], "plan")
         self.assertTrue(data.get("plan"))
-        # session_id must be set so the execute phase can --resume
-        self.assertIsNotNone(refreshed.session_id)
+        # agent_ref must be set so the execute phase can --resume
+        self.assertIsNotNone(refreshed.agent_ref)
 
     def test_claude_runner_fails_on_nonzero_exit(self):
         script = "echo oops >&2\nexit 2\n"
@@ -668,12 +668,12 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"here is the plan",
         # (mirrors the post-conflict state: worktree + branch + session live).
         git_ops.worktree_add(self.root, wt, br, "main")
         # Simulate the state produced by
-        # `resubmit_conflicted(..., force_execute=True)`: session_id live,
+        # `resubmit_conflicted(..., force_execute=True)`: agent_ref live,
         # result_json rewritten to phase=plan so the two-phase dispatch
         # picks the _do_execute branch.
         self.store.transition(
             item.id, ItemStatus.QUEUED,
-            session_id="sess-force",
+            agent_ref="sess-force",
             result_json='{"phase":"plan","plan":"resolve the merge conflict"}',
         )
         claimed = self.store.claim_next_queued(str(wt), br)
@@ -815,7 +815,7 @@ fi
         self.assertIsNone(result.error, msg=result.error)
         refreshed = self.store.get(claimed.id)
         self.assertEqual(refreshed.status, ItemStatus.AWAITING_PLAN_REVIEW)
-        self.assertEqual(refreshed.session_id, "thread-123")
+        self.assertEqual(refreshed.agent_ref, "thread-123")
         data = json.loads(refreshed.result_json)
         self.assertEqual(data["phase"], "plan")
         self.assertEqual(data["plan"], "codex plan text")
@@ -1003,8 +1003,8 @@ class TestRecovery(unittest.TestCase):
         self.assertIsNone(self.store.get(claimed.id).worktree_path)
 
     def test_recovery_demotes_resumable_to_queued(self):
-        """Item with session_id + live worktree → demoted to QUEUED while
-        preserving session_id/worktree/branch so the normal dispatch loop
+        """Item with agent_ref + live worktree → demoted to QUEUED while
+        preserving agent_ref/worktree/branch so the normal dispatch loop
         picks it up (and the runner detects the resumable state)."""
         item = self.store.list_by_status(ItemStatus.QUEUED)[0]
         wt, br = plan_worktree(self.cfg, item)
@@ -1012,7 +1012,7 @@ class TestRecovery(unittest.TestCase):
         wt.mkdir(parents=True, exist_ok=True)
         self.store.transition(
             claimed.id, ItemStatus.WORKING,
-            session_id="abcd-1234", note="session assigned",
+            agent_ref="abcd-1234", note="session assigned",
         )
         rec = recover_on_startup(self.cfg, self.store)
         self.assertEqual(rec.requeued, [])
@@ -1020,7 +1020,7 @@ class TestRecovery(unittest.TestCase):
         self.assertEqual(rec.resumable[0].id, claimed.id)
         final = self.store.get(claimed.id)
         self.assertEqual(final.status, ItemStatus.QUEUED)
-        self.assertEqual(final.session_id, "abcd-1234")
+        self.assertEqual(final.agent_ref, "abcd-1234")
         self.assertEqual(final.worktree_path, str(wt))
         self.assertEqual(final.branch, br)
         self.assertEqual(final.attempts, 0)
@@ -1036,7 +1036,7 @@ class TestRecovery(unittest.TestCase):
         claimed = self.store.claim_next_queued(str(wt), br)
         self.store.transition(claimed.id, ItemStatus.AWAITING_PLAN_REVIEW)
         self.store.transition(claimed.id, ItemStatus.QUEUED, note="approved")
-        # claim again, then "crash" without session_id
+        # claim again, then "crash" without agent_ref
         self.store.claim_next_queued(str(wt), br)
         rec = recover_on_startup(self.cfg, self.store)
         # restored to QUEUED (the execute-phase resting state), worktree
@@ -1044,7 +1044,7 @@ class TestRecovery(unittest.TestCase):
         item_after = self.store.get(claimed.id)
         self.assertEqual(item_after.status, ItemStatus.QUEUED)
         self.assertIsNone(item_after.worktree_path)
-        self.assertIsNone(item_after.session_id)
+        self.assertIsNone(item_after.agent_ref)
         self.assertEqual(rec.requeued, [claimed.id])
 
 
@@ -1716,7 +1716,7 @@ class TestResumePoolGate(unittest.TestCase):
         )
 
     def _seed_resumable(self, cfg: Config, n: int) -> list[str]:
-        """Create n WORKING items with session_id + live worktree dir so the
+        """Create n WORKING items with agent_ref + live worktree dir so the
         recovery sweep returns them as resumable."""
         scan_once(cfg, self.store)
         ids: list[str] = []
@@ -1726,7 +1726,7 @@ class TestResumePoolGate(unittest.TestCase):
             wt.mkdir(parents=True, exist_ok=True)
             self.store.transition(
                 claimed.id, ItemStatus.WORKING,
-                session_id=f"sess-{claimed.id[:6]}",
+                agent_ref=f"sess-{claimed.id[:6]}",
                 note="test: resumable session",
             )
             ids.append(claimed.id)
@@ -1751,7 +1751,7 @@ class TestResumePoolGate(unittest.TestCase):
     def test_pool_zero_skips_all_resumes(self):
         """With pool_size=0 the daemon can't claim anything, so resumable
         items sit in QUEUED waiting for the pool to open. Nothing is
-        dispatched; session_id + worktree are preserved for later pickup."""
+        dispatched; agent_ref + worktree are preserved for later pickup."""
         from agentor.daemon import Daemon
         cfg = self._cfg(pool_size=0)
         ids = self._seed_resumable(cfg, 2)
@@ -1768,7 +1768,7 @@ class TestResumePoolGate(unittest.TestCase):
         for i in ids:
             it = self.store.get(i)
             self.assertEqual(it.status, ItemStatus.QUEUED)
-            self.assertTrue(it.session_id)
+            self.assertTrue(it.agent_ref)
             self.assertTrue(it.worktree_path)
 
     def test_pool_one_resumes_resumable_items(self):
@@ -2487,7 +2487,7 @@ class TestClaudeSettingsHookWiring(unittest.TestCase):
         self.assertEqual(set(by_matcher), {"Read", "Grep"})
 
     def test_default_claude_command_contains_settings_placeholder(self):
-        cmd = _default_claude_command()
+        cmd = ClaudeProvider.default_command()
         self.assertIn("--settings", cmd)
         self.assertIn("{settings_path}", cmd)
 
@@ -2496,7 +2496,7 @@ class TestClaudeSettingsHookWiring(unittest.TestCase):
         settings = write_claude_settings(cfg, "item-xyz")
         args = [
             a.format(prompt="hi", model="claude", settings_path=str(settings))
-            for a in _default_claude_command()
+            for a in ClaudeProvider.default_command()
         ]
         self.assertIn(str(settings), args)
 
@@ -2743,7 +2743,7 @@ class TestClaudeRunnerStreamJsonIntegration(unittest.TestCase):
         data = json.loads(refreshed.result_json)
         self.assertEqual(data["phase"], "plan")
         self.assertEqual(data["plan"], "plan body")
-        self.assertIsNotNone(refreshed.session_id)
+        self.assertIsNotNone(refreshed.agent_ref)
         transcript = (
             self.root / ".agentor" / "transcripts" / f"{claimed.id}.plan.log"
         ).read_text()
@@ -2764,7 +2764,7 @@ class TestClaudeRunnerStreamJsonIntegration(unittest.TestCase):
         data = json.loads(refreshed.result_json)
         self.assertEqual(data["phase"], "plan")
         self.assertEqual(data["plan"], "plan body")
-        self.assertIsNotNone(refreshed.session_id)
+        self.assertIsNotNone(refreshed.agent_ref)
         transcript = (
             self.root / ".agentor" / "transcripts" / f"{claimed.id}.plan.log"
         ).read_text()
@@ -3119,7 +3119,7 @@ class TestPrependPlanAnswers(unittest.TestCase):
             source_line=1, tags={}, status=ItemStatus.QUEUED,
             worktree_path=None, branch=None, attempts=0,
             last_error=None, feedback=None,
-            result_json=json.dumps(payload), session_id=None,
+            result_json=json.dumps(payload), agent_ref=None,
             agentor_version=None, priority=0,
             created_at=0.0, updated_at=0.0,
         )
@@ -3273,7 +3273,7 @@ class TestResolveExecuteTier(unittest.TestCase):
             source_line=1, tags=tags or {}, status=ItemStatus.QUEUED,
             worktree_path=None, branch=None, attempts=0,
             last_error=None, feedback=None,
-            result_json=None, session_id=None,
+            result_json=None, agent_ref=None,
             agentor_version=None, priority=0,
             created_at=0.0, updated_at=0.0,
         )
@@ -3492,6 +3492,46 @@ class TestResultJsonRecordsExecuteModel(unittest.TestCase):
         data = json.loads(refreshed.result_json)
         self.assertNotIn("execute_model", data)
         self.assertNotIn("execute_model_source", data)
+
+    def test_execute_records_plan_suggestion_even_when_ignored(self):
+        # Plan nominated a tier but operator didn't enable
+        # auto_execute_model; the resolved source is "default" yet we
+        # still want the raw nomination persisted so cost analysis can
+        # compare counterfactual picks against actual spend.
+        class ExecStub(StubRunner):
+            def do_work(self, item, worktree):
+                self._last_phase = "execute"
+                self._last_execute_model = "opus"
+                self._last_execute_model_source = "default"
+                self._last_plan_suggestion = "haiku"
+                return super().do_work(item, worktree)
+
+        cfg = _mk_config(self.root)
+        claimed = self._claim_one(cfg)
+        ExecStub(cfg, self.store).run(claimed)
+        refreshed = self.store.get(claimed.id)
+        data = json.loads(refreshed.result_json)
+        self.assertEqual(data["execute_model"], "opus")
+        self.assertEqual(data["execute_model_source"], "default")
+        self.assertEqual(data["plan_suggested_execute_model"], "haiku")
+
+    def test_plan_suggestion_absent_when_plan_omits_trailer(self):
+        # No nomination from plan → field stays out of result_json (no
+        # null noise).
+        class ExecStub(StubRunner):
+            def do_work(self, item, worktree):
+                self._last_phase = "execute"
+                self._last_execute_model = "opus"
+                self._last_execute_model_source = "default"
+                self._last_plan_suggestion = None
+                return super().do_work(item, worktree)
+
+        cfg = _mk_config(self.root)
+        claimed = self._claim_one(cfg)
+        ExecStub(cfg, self.store).run(claimed)
+        refreshed = self.store.get(claimed.id)
+        data = json.loads(refreshed.result_json)
+        self.assertNotIn("plan_suggested_execute_model", data)
 
 
 class TestDaemonProviderOverrideThreading(unittest.TestCase):

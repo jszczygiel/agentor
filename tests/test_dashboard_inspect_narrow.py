@@ -27,7 +27,7 @@ def _mk_item(
         id="abc12345", title="t", body="", source_file="s.md",
         source_line=1, tags={}, status=status,
         worktree_path=None, branch=None, attempts=0, last_error=last_error,
-        feedback=None, result_json=json.dumps(result), session_id=None,
+        feedback=None, result_json=json.dumps(result), agent_ref=None,
         agentor_version=None, priority=0, created_at=0.0,
         updated_at=float(_mk_item_counter),
     )
@@ -38,6 +38,7 @@ class _Agent:
     runner = "claude"
     pool_size = 1
     context_window = 200_000
+    auto_execute_model = True
 
 
 class _Git:
@@ -203,6 +204,83 @@ class TestApproveModeStripsRunMechanics(unittest.TestCase):
         lines = _build_detail_lines(self.cfg, self.store, item, width=120)
         self.assertTrue(any("── agent run ──" in ln for ln in lines))
         self.assertTrue(any("── per-model tokens ──" in ln for ln in lines))
+
+
+_PLAN_WITH_TIER = "## Execute tier\nsuggested_model: haiku\nreason: trivial"
+_PLAN_WITHOUT_TIER = "## Implementation\nDo the thing."
+
+
+class TestExecuteModelInspectLine(unittest.TestCase):
+    def setUp(self) -> None:
+        self.td = TemporaryDirectory()
+        self.cfg = _Cfg()
+        self.cfg.project_root = Path(self.td.name)
+        self.store = Store(Path(self.td.name) / "state.db")
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self.td.cleanup()
+
+    def test_plan_review_shows_suggestion_when_trailer_present(self):
+        item = _mk_item(
+            {"plan": _PLAN_WITH_TIER},
+            status=ItemStatus.AWAITING_PLAN_REVIEW,
+        )
+        lines = _build_detail_lines(self.cfg, self.store, item, width=120)
+        self.assertTrue(
+            any(ln.startswith("suggested: haiku") for ln in lines),
+            f"expected 'suggested: haiku' in lines; got: {lines}",
+        )
+
+    def test_plan_review_no_trailer_omits_suggestion(self):
+        item = _mk_item(
+            {"plan": _PLAN_WITHOUT_TIER},
+            status=ItemStatus.AWAITING_PLAN_REVIEW,
+        )
+        lines = _build_detail_lines(self.cfg, self.store, item, width=120)
+        self.assertFalse(any("suggested:" in ln for ln in lines))
+
+    def test_plan_review_advisory_when_auto_execute_model_off(self):
+        cfg = _Cfg()
+        cfg.project_root = Path(self.td.name)
+        cfg.agent = type("A", (), {
+            "max_attempts": 3, "runner": "claude", "pool_size": 1,
+            "context_window": 200_000, "auto_execute_model": False,
+        })()
+        item = _mk_item(
+            {"plan": _PLAN_WITH_TIER},
+            status=ItemStatus.AWAITING_PLAN_REVIEW,
+        )
+        lines = _build_detail_lines(cfg, self.store, item, width=120)
+        self.assertTrue(
+            any("auto_execute_model=false" in ln for ln in lines),
+            f"expected advisory suffix; got: {lines}",
+        )
+
+    def test_post_execute_shows_both_lines(self):
+        item = _mk_item(
+            {
+                "plan": _PLAN_WITH_TIER,
+                "execute_model": "sonnet",
+                "execute_model_source": "tag",
+            },
+            status=ItemStatus.AWAITING_REVIEW,
+        )
+        lines = _build_detail_lines(self.cfg, self.store, item, width=120)
+        self.assertTrue(any(ln.startswith("suggested: haiku") for ln in lines))
+        self.assertTrue(
+            any("execute:   sonnet (source: tag)" in ln for ln in lines),
+            f"expected execute line; got: {lines}",
+        )
+
+    def test_post_execute_without_execute_model_omits_execute_line(self):
+        item = _mk_item(
+            {"plan": _PLAN_WITH_TIER},
+            status=ItemStatus.AWAITING_REVIEW,
+        )
+        lines = _build_detail_lines(self.cfg, self.store, item, width=120)
+        self.assertTrue(any(ln.startswith("suggested: haiku") for ln in lines))
+        self.assertFalse(any(ln.startswith("execute:") for ln in lines))
 
 
 if __name__ == "__main__":

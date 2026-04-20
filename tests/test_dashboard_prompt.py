@@ -313,15 +313,17 @@ class TestNewIssueNoteIsMultiline(unittest.TestCase):
 
     def test_note_prompt_uses_multiline_and_preserves_newlines(self):
         """Whatever `_prompt_multiline` returns (including embedded newlines)
-        must be forwarded verbatim to `_expand_note_via_claude`."""
+        must be forwarded verbatim to `_expand_note`."""
         typed = "first line\n\nsecond paragraph\nthird line"
-        seen_note: dict[str, str] = {}
+        seen_note: dict[str, object] = {}
 
         cfg = SimpleNamespace(
             sources=SimpleNamespace(watch=["docs/backlog/foo.md"]),
             parsing=SimpleNamespace(mode="checkbox"),
             project_root=Path("/tmp/_agentor_test_root"),
+            agent=SimpleNamespace(runner="claude"),
         )
+        daemon = SimpleNamespace(provider_override=None)
 
         def fake_target(_cfg):
             return Path("/tmp/_agentor_test_root/docs/backlog/foo.md"), "file"
@@ -332,8 +334,9 @@ class TestNewIssueNoteIsMultiline(unittest.TestCase):
         def fake_run_with_progress(_stdscr, _title, work, **_kw):
             return work(lambda _msg: None)
 
-        def fake_expand(note, _cfg, _kind, timeout):  # noqa: ARG001
+        def fake_expand(note, provider, _kind, **_kw):
             seen_note["note"] = note
+            seen_note["provider"] = provider
             return "- [ ] expanded\n  body"
 
         def fake_append(_path, _block):
@@ -342,27 +345,33 @@ class TestNewIssueNoteIsMultiline(unittest.TestCase):
         def fake_scan_once(_cfg, _store):
             return SimpleNamespace(new_items=0)
 
+        fake_provider = object()
         with patch.object(modes, "_new_issue_target", fake_target), \
              patch.object(modes, "_prompt_multiline", fake_multiline), \
              patch.object(modes, "_run_with_progress", fake_run_with_progress), \
-             patch.object(modes, "_expand_note_via_claude", fake_expand), \
+             patch.object(modes, "_expand_note", fake_expand), \
+             patch.object(modes, "make_provider",
+                          lambda _cfg: fake_provider), \
              patch.object(modes, "_append_checkbox_block", fake_append), \
              patch.object(modes, "scan_once", fake_scan_once), \
              patch.object(modes, "_flash", lambda *_a, **_kw: None):
-            modes._new_issue_mode(_FakeStdscr(), cfg, store=None, daemon=None)
+            modes._new_issue_mode(_FakeStdscr(), cfg, store=None, daemon=daemon)
 
         self.assertEqual(seen_note.get("note"), typed)
+        self.assertIs(seen_note.get("provider"), fake_provider)
 
-    def test_note_prompt_empty_cancel_skips_claude(self):
+    def test_note_prompt_empty_cancel_skips_expand(self):
         """Empty return from the overlay must short-circuit before any
-        Claude call — same contract as the prior `_prompt_text` path."""
+        provider call — same contract as the prior `_prompt_text` path."""
         called = {"expand": False}
 
         cfg = SimpleNamespace(
             sources=SimpleNamespace(watch=["docs/backlog/foo.md"]),
             parsing=SimpleNamespace(mode="checkbox"),
             project_root=Path("/tmp/_agentor_test_root"),
+            agent=SimpleNamespace(runner="claude"),
         )
+        daemon = SimpleNamespace(provider_override=None)
 
         def fake_target(_cfg):
             return Path("/tmp/_agentor_test_root/docs/backlog/foo.md"), "file"
@@ -373,11 +382,98 @@ class TestNewIssueNoteIsMultiline(unittest.TestCase):
 
         with patch.object(modes, "_new_issue_target", fake_target), \
              patch.object(modes, "_prompt_multiline", lambda *_a, **_kw: ""), \
-             patch.object(modes, "_expand_note_via_claude", fake_expand), \
+             patch.object(modes, "_expand_note", fake_expand), \
              patch.object(modes, "_flash", lambda *_a, **_kw: None):
-            modes._new_issue_mode(_FakeStdscr(), cfg, store=None, daemon=None)
+            modes._new_issue_mode(_FakeStdscr(), cfg, store=None, daemon=daemon)
 
         self.assertFalse(called["expand"])
+
+    def test_new_issue_mode_routes_through_configured_provider(self):
+        """`agent.runner = "codex"` → `_new_issue_mode` must build a
+        Codex provider, not a Claude one. Prior behaviour shelled to
+        `claude` verbatim regardless of the configured runner."""
+        from agentor.providers import CodexProvider
+
+        cfg = SimpleNamespace(
+            sources=SimpleNamespace(watch=["docs/backlog/foo.md"]),
+            parsing=SimpleNamespace(mode="checkbox"),
+            project_root=Path("/tmp/_agentor_test_root"),
+            agent=SimpleNamespace(runner="codex"),
+        )
+        daemon = SimpleNamespace(provider_override=None)
+        got_providers: list[object] = []
+
+        def fake_target(_cfg):
+            return Path("/tmp/_agentor_test_root/docs/backlog/foo.md"), "file"
+
+        def fake_expand(_note, provider, _kind, **_kw):
+            got_providers.append(provider)
+            return "- [ ] ok\n  body"
+
+        def fake_run_with_progress(_stdscr, _title, work, **_kw):
+            return work(lambda _msg: None)
+
+        with patch.object(modes, "_new_issue_target", fake_target), \
+             patch.object(modes, "_prompt_multiline",
+                          lambda *_a, **_kw: "note"), \
+             patch.object(modes, "_run_with_progress", fake_run_with_progress), \
+             patch.object(modes, "_expand_note", fake_expand), \
+             patch.object(modes, "_append_checkbox_block",
+                          lambda *_a, **_kw: None), \
+             patch.object(modes, "scan_once",
+                          lambda *_a, **_kw: SimpleNamespace(new_items=0)), \
+             patch.object(modes, "_flash", lambda *_a, **_kw: None):
+            modes._new_issue_mode(_FakeStdscr(), cfg, store=None, daemon=daemon)
+
+        self.assertEqual(len(got_providers), 1)
+        self.assertIsInstance(got_providers[0], CodexProvider)
+
+    def test_new_issue_mode_honours_provider_override(self):
+        """`daemon.provider_override` must shadow `agent.runner` when
+        picking the one-shot provider — mirrors `daemon._make_runner`."""
+        from agentor.config import (AgentConfig, Config, GitConfig,
+                                    ParsingConfig, ReviewConfig,
+                                    SourcesConfig)
+        from agentor.providers import CodexProvider
+
+        cfg = Config(
+            project_name="p",
+            project_root=Path("/tmp/_agentor_test_root"),
+            sources=SourcesConfig(watch=["docs/backlog/foo.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(runner="claude"),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        daemon = SimpleNamespace(provider_override="codex")
+        got_providers: list[object] = []
+
+        def fake_expand(_note, provider, _kind, **_kw):
+            got_providers.append(provider)
+            return "- [ ] ok\n  body"
+
+        def fake_run_with_progress(_stdscr, _title, work, **_kw):
+            return work(lambda _msg: None)
+
+        with patch.object(
+                modes, "_new_issue_target",
+                lambda _cfg: (
+                    Path("/tmp/_agentor_test_root/docs/backlog/foo.md"),
+                    "file",
+                ),
+             ), \
+             patch.object(modes, "_prompt_multiline",
+                          lambda *_a, **_kw: "note"), \
+             patch.object(modes, "_run_with_progress", fake_run_with_progress), \
+             patch.object(modes, "_expand_note", fake_expand), \
+             patch.object(modes, "_append_checkbox_block",
+                          lambda *_a, **_kw: None), \
+             patch.object(modes, "scan_once",
+                          lambda *_a, **_kw: SimpleNamespace(new_items=0)), \
+             patch.object(modes, "_flash", lambda *_a, **_kw: None):
+            modes._new_issue_mode(_FakeStdscr(), cfg, store=None, daemon=daemon)
+
+        self.assertIsInstance(got_providers[0], CodexProvider)
 
 
 class _ResizingStdscr(_FakeStdscr):

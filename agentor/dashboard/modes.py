@@ -1,6 +1,6 @@
 import curses
-import subprocess
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -8,6 +8,7 @@ from ..config import Config
 from ..daemon import Daemon
 from ..git_ops import diff_vs_base
 from ..models import ItemStatus
+from ..providers import Provider, make_provider
 from ..slug import slugify
 from ..store import Store, StoredItem
 from ..watcher import scan_once
@@ -418,15 +419,32 @@ def _inspect_dispatch(
                 except AttributeError:
                     term_w = 80
                 overlay_inner = max(10, min(80, term_w - 4) - 2)
-                seed = _answers_scaffold(questions, width=overlay_inner)
-                reply = _prompt_multiline(
-                    stdscr,
-                    "answer open questions (empty=cancel approve)",
-                    initial=seed,
-                )
-                if not reply:
+                n = len(questions)
+                collected: list[str] = []
+                aborted = False
+                for i, q in enumerate(questions, start=1):
+                    seed = _answers_scaffold([q], width=overlay_inner)
+                    reply = _prompt_multiline(
+                        stdscr,
+                        f"question {i}/{n} (empty=skip \u00b7 Ctrl-C=abort)",
+                        initial=seed,
+                    )
+                    # Empty reply means Ctrl-C/Esc cancel. Non-empty (even
+                    # when operator just left the A1: line blank) means
+                    # submit — _parse_answers extracts "" for a blank answer.
+                    # This distinguishes "skip this Q" from "abort all".
+                    if not reply:
+                        aborted = True
+                        break
+                    collected.append(_parse_answers(reply, 1)[0])
+                # Pad unanswered trailing questions with empty strings.
+                while len(collected) < n:
+                    collected.append("")
+                # Cancel approve only when operator aborted before entering
+                # any real content — matches pre-existing empty-reply semantics.
+                if aborted and not any(a.strip() for a in collected):
                     return False, ""
-                answers = _parse_answers(reply, len(questions))
+                answers = collected
             approve_plan(store, item, answers=answers)
             if daemon is not None:
                 daemon.try_fill_pool()
@@ -524,6 +542,30 @@ def _inspect_dispatch(
     return False, ""
 
 
+def _execute_model_lines(cfg: Config, item: StoredItem, data: dict) -> list[str]:
+    """Return 0-2 metadata lines for the plan-nominated and resolved execute
+    model tier. Lazy-imports `_parse_execute_tier` to avoid pulling `runner`
+    at module load (mirrors the committer lazy-import convention)."""
+    from ..runner import _parse_execute_tier
+
+    out: list[str] = []
+    plan_text = data.get("plan") or ""
+    if plan_text:
+        alias = _parse_execute_tier(plan_text, whitelist=None)
+        if alias:
+            if not getattr(cfg.agent, "auto_execute_model", False):
+                out.append(
+                    f"suggested: {alias} (advisory — auto_execute_model=false)"
+                )
+            else:
+                out.append(f"suggested: {alias}")
+    execute_alias = data.get("execute_model")
+    execute_source = data.get("execute_model_source")
+    if execute_alias and execute_source:
+        out.append(f"execute:   {execute_alias} (source: {execute_source})")
+    return out
+
+
 def _is_auto_resolve_chain(store: Store, item: StoredItem) -> bool:
     """True when the item most recently entered QUEUED via the auto-resolve
     chain from `approve_and_commit` — i.e. the last CONFLICTED → QUEUED
@@ -561,9 +603,10 @@ def _build_detail_lines(
     out.append(f"source:   {item.source_file}:{item.source_line}")
     out.append(f"branch:   {item.branch or '—'}")
     out.append(f"worktree: {item.worktree_path or '—'}")
-    out.append(f"session:  {item.session_id or '—'}")
+    out.append(f"agent:    {item.agent_ref or '—'}")
     out.append(f"attempts: {item.attempts} / {cfg.agent.max_attempts}")
     out.append(f"agentor:  {item.agentor_version or '—'}")
+    out.extend(_execute_model_lines(cfg, item, data or {}))
     if item.status in (ItemStatus.QUEUED, ItemStatus.WORKING,
                        ItemStatus.CONFLICTED) \
             and _is_auto_resolve_chain(store, item):
@@ -865,32 +908,20 @@ def _new_issue_target(cfg: Config) -> tuple[Path, str] | None:
     return full, "file"
 
 
-def _expand_note_via_claude(
-    note: str, cfg: Config, kind: str, timeout: float,
+def _expand_note(
+    note: str, provider: Provider, kind: str, timeout: float,
 ) -> str:
-    """One-shot claude call. `kind` is 'frontmatter' or 'checkbox' and
-    selects the output-format prompt. Runs with `cwd=project_root` so
-    the model can Read/Grep the repo for grounding. Returns the raw
-    text; raises RuntimeError on any failure."""
+    """One-shot provider call. `kind` is 'frontmatter' or 'checkbox' and
+    selects the output-format prompt. The provider's `invoke_one_shot`
+    runs with `cwd=project_root` so the model can Read/Grep the repo
+    for grounding. Returns the raw text; raises RuntimeError on any
+    failure."""
     tmpl = (_NEW_ISSUE_PROMPT_FRONTMATTER if kind == "frontmatter"
             else _NEW_ISSUE_PROMPT_CHECKBOX)
     prompt = tmpl.format(note=note)
-    cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
-    try:
-        cp = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            cwd=str(cfg.project_root),
-        )
-    except FileNotFoundError:
-        raise RuntimeError("claude CLI not found on PATH")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"claude timed out after {timeout:.0f}s")
-    if cp.returncode != 0:
-        err = (cp.stderr or cp.stdout).strip() or "claude exited nonzero"
-        raise RuntimeError(err.splitlines()[-1][:200])
-    out = (cp.stdout or "").strip()
+    out = provider.invoke_one_shot(prompt, timeout=timeout).strip()
     if not out:
-        raise RuntimeError("claude returned empty output")
+        raise RuntimeError("provider returned empty output")
     if out.startswith("```"):
         lines = out.splitlines()
         if lines[0].lstrip("`").strip() in ("", "markdown", "md"):
@@ -967,15 +998,27 @@ def _new_issue_mode(
     note = _prompt_multiline(stdscr, "bug/idea note")
     if not note:
         return
+    # Snapshot `daemon.provider_override` now so a mid-capture flip via
+    # [M] doesn't swap providers partway through the one-shot call. Same
+    # `replace` pattern as `daemon._make_runner` — shadow `agent.runner`
+    # without mutating the shared Config.
+    effective_cfg = cfg
+    override = getattr(daemon, "provider_override", None)
+    if override and override != cfg.agent.runner:
+        effective_cfg = replace(
+            cfg, agent=replace(cfg.agent, runner=override)
+        )
+    provider = make_provider(effective_cfg)
+    provider_name = effective_cfg.agent.runner
     def _expand_work(p: Callable[[str], None]) -> str:
-        p("calling claude to expand note")
-        return _expand_note_via_claude(
-            note, cfg, expand_kind, timeout=180.0)
+        p(f"calling {provider_name} to expand note")
+        return _expand_note(
+            note, provider, expand_kind, timeout=180.0)
     try:
         content = _run_with_progress(
             stdscr, f"  expanding note → {dest.name}…",
             _expand_work,
-            hint="one-shot claude call; may take 10-60s.",
+            hint=f"one-shot {provider_name} call; may take 10-60s.",
         )
     except Exception as e:
         _flash(stdscr, f"expand failed: {e}")

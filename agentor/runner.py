@@ -23,7 +23,7 @@ from .capabilities import (
 from .checkpoint import CheckpointConfig, CheckpointEmitter
 from .config import AgentConfig, Config
 from .models import ItemStatus
-from .providers import Provider, make_provider
+from .providers import ClaudeProvider, CodexProvider, Provider, make_provider
 from .slug import slugify
 from .store import Store, StoredItem
 
@@ -460,10 +460,10 @@ class Runner:
         branch = item.branch
         repo = self.config.project_root
 
-        # Resume path: session_id persisted + worktree still on disk → skip
+        # Resume path: agent_ref persisted + worktree still on disk → skip
         # teardown/recreate so the agent picks up where it left off. Otherwise
         # do the normal pre-flight nuke so stale state doesn't leak.
-        resume = bool(item.session_id) and wt_path.exists()
+        resume = bool(item.agent_ref) and wt_path.exists()
         try:
             if (self.stop_event is not None
                     and self.stop_event.is_set()):
@@ -524,7 +524,7 @@ class Runner:
                     raise InfrastructureError(err)
                 self.store.transition(
                     item.id, ItemStatus.ERRORED,
-                    worktree_path=None, branch=None, session_id=None,
+                    worktree_path=None, branch=None, agent_ref=None,
                     last_error=f"worktree_add: {err}",
                     note="worktree_add failed → errored",
                 )
@@ -548,17 +548,17 @@ class Runner:
                     # state alone, refund the attempt, surface to user.
                     self.store.note_infra_failure(item.id, last_error)
                     raise InfrastructureError(last_error)
-                if self.provider.is_dead_session_error(last_error) and item.session_id:
-                    # The provider lost the session. Resuming with the same id
-                    # will keep failing on every attempt until rejection —
-                    # drop the session_id, refund the attempt, and bounce
-                    # back to QUEUED so the next dispatch starts a fresh
-                    # session. result_json (with the approved plan) is
+                if self.provider.is_dead_session_error(last_error) and item.agent_ref:
+                    # The provider lost the session. Resuming with the same
+                    # agent_ref will keep failing on every attempt until
+                    # rejection — drop the agent_ref, refund the attempt, and
+                    # bounce back to QUEUED so the next dispatch starts a
+                    # fresh session. result_json (with the approved plan) is
                     # kept so we don't make the user re-approve.
                     git_ops.worktree_remove(repo, wt_path, force=True)
                     self.store.transition(
                         item.id, ItemStatus.QUEUED,
-                        worktree_path=None, branch=None, session_id=None,
+                        worktree_path=None, branch=None, agent_ref=None,
                         attempts=max(0, item.attempts - 1),
                         last_error=last_error,
                         note="agent session lost; restart with fresh session",
@@ -572,7 +572,7 @@ class Runner:
                 # fixed — no auto-retry loop.
                 self.store.transition(
                     item.id, ItemStatus.ERRORED,
-                    worktree_path=None, branch=None, session_id=None,
+                    worktree_path=None, branch=None, agent_ref=None,
                     last_error=last_error,
                     note="do_work failed → errored",
                 )
@@ -623,6 +623,12 @@ class Runner:
                 if alias and source:
                     result["execute_model"] = alias
                     result["execute_model_source"] = source
+                # Plan's raw tier nomination, recorded whether or not it
+                # was applied (gate off, whitelist miss, tag override).
+                # Lets operators measure counterfactual tier picks.
+                suggestion = getattr(self, "_last_plan_suggestion", None)
+                if suggestion:
+                    result["plan_suggested_execute_model"] = suggestion
             envelope = getattr(self, "_last_usage", None)
             if envelope:
                 # Surface turn/timing/usage fields at the top level of
@@ -856,7 +862,8 @@ def _write_checkpoint_marker(
 
 class ClaudeRunner(Runner):
     """Spawns a headless `claude -p` subprocess inside the worktree. Runs in
-    two phases tied together by session_id:
+    two phases tied together by the persisted agent_ref (Claude's wire-format
+    session_id, stored provider-neutrally on the item):
 
     1) plan — agent writes a development plan (no code changes), item stops at
        AWAITING_PLAN_REVIEW for human approval.
@@ -895,6 +902,7 @@ class ClaudeRunner(Runner):
         prompt = self._prepend_feedback(item, prompt, phase="plan")
         self._last_execute_model = None
         self._last_execute_model_source = None
+        self._last_plan_suggestion = None
         _, stdout = self._invoke_claude(
             item, worktree, prompt,
         )
@@ -940,6 +948,10 @@ class ClaudeRunner(Runner):
         )
         self._last_execute_model = alias
         self._last_execute_model_source = source
+        # Record plan's raw nomination independent of resolution so we
+        # can measure "would the plan have picked a smaller tier?" even
+        # when `agent.auto_execute_model=false` ignores it.
+        self._last_plan_suggestion = _parse_execute_tier(plan, whitelist=None)
         model_override = self.provider.model_aliases.get(alias)
         summary, stdout = self._invoke_claude(
             item, worktree, prompt, model_override=model_override,
@@ -1006,7 +1018,7 @@ class ClaudeRunner(Runner):
         Custom `agent.command` templates that drop the `{model}`
         placeholder silently skip the override — matches the existing
         `{settings_path}` opt-out pattern."""
-        template = self.config.agent.command or _default_claude_command()
+        template = self.config.agent.command or ClaudeProvider.default_command()
         legacy_prompt_arg = _command_has_prompt_placeholder(template)
         guardrails = self.write_tool_guardrails(self.config, item.id)
         model = model_override or self.config.agent.model
@@ -1018,11 +1030,13 @@ class ClaudeRunner(Runner):
         # Session id: pre-generated + persisted before the child starts so a
         # mid-run crash can be recovered via `claude --resume <id>` on the
         # next agentor startup. Reuse a previously-persisted one if present.
-        session_id = item.session_id or str(uuid.uuid4())
-        had_session = bool(item.session_id)
+        # `session_id` is Claude-CLI wire vocabulary; we store it
+        # provider-neutrally as agent_ref on the item.
+        session_id = item.agent_ref or str(uuid.uuid4())
+        had_session = bool(item.agent_ref)
         if not had_session:
             self.store.transition(
-                item.id, ItemStatus.WORKING, session_id=session_id,
+                item.id, ItemStatus.WORKING, agent_ref=session_id,
                 note="session id assigned",
             )
         if had_session:
@@ -1291,6 +1305,7 @@ class CodexRunner(Runner):
         prompt = self._prepend_feedback(item, prompt, phase="plan")
         self._last_execute_model = None
         self._last_execute_model_source = None
+        self._last_plan_suggestion = None
         output_path = self._last_message_path(item, "plan")
         _, stdout = self._invoke_codex(
             item, worktree, prompt, output_path,
@@ -1319,6 +1334,7 @@ class CodexRunner(Runner):
         )
         self._last_execute_model = alias
         self._last_execute_model_source = source
+        self._last_plan_suggestion = _parse_execute_tier(plan, whitelist=None)
         model_override = self.provider.model_aliases.get(alias)
         output_path = self._last_message_path(item, "execute")
         summary, stdout = self._invoke_codex(
@@ -1365,7 +1381,7 @@ class CodexRunner(Runner):
         self, item: StoredItem, worktree: Path, prompt: str, output_path: Path,
         model_override: str | None = None,
     ) -> tuple[str, str]:
-        phase_tag = "execute" if item.session_id else "plan"
+        phase_tag = "execute" if item.agent_ref else "plan"
         transcript_path = (
             self.config.project_root / ".agentor" / "transcripts"
             / f"{item.id}.{phase_tag}.log"
@@ -1403,16 +1419,19 @@ class CodexRunner(Runner):
         values = {
             "prompt": prompt,
             "model": model_override or self.config.agent.model,
-            "session_id": item.session_id or "",
+            # Placeholder key stays `session_id` to match the operator-facing
+            # `{session_id}` token in `agent.command` / `agent.resume_command`;
+            # value comes from the provider-neutral agent_ref column.
+            "session_id": item.agent_ref or "",
             "output_path": str(output_path),
         }
-        if item.session_id:
+        if item.agent_ref:
             tmpl = (
                 self.config.agent.resume_command
-                or _default_codex_resume_command()
+                or CodexProvider.default_resume_command()
             )
         else:
-            tmpl = self.config.agent.command or _default_codex_command()
+            tmpl = self.config.agent.command or CodexProvider.default_command()
         return [a.format(**values) for a in tmpl]
 
     def _invoke_codex_jsonl(
@@ -1444,10 +1463,10 @@ class CodexRunner(Runner):
         def on_event(ev: dict) -> str | None:
             state.ingest(ev)
             cur = item_ref[0]
-            if state.session_id and state.session_id != cur.session_id:
+            if state.session_id and state.session_id != cur.agent_ref:
                 self.store.transition(
                     cur.id, ItemStatus.WORKING,
-                    session_id=state.session_id,
+                    agent_ref=state.session_id,
                     note="session id assigned",
                 )
                 refreshed = self.store.get(cur.id)
@@ -1916,9 +1935,11 @@ def _parse_usage(stdout: str) -> dict | None:
     # Flatten fields the dashboard cares about. `usage` stays as a nested
     # dict because existing readers (_tokens_used variants) pick from it.
     out: dict = {}
+    # `session_id` kept for back-compat with result_json blobs written before
+    # the agent_ref rename; new writes use `agent_ref`.
     for k in ("usage", "modelUsage", "num_turns",
-              "duration_ms", "duration_api_ms", "stop_reason", "session_id",
-              "result"):
+              "duration_ms", "duration_api_ms", "stop_reason",
+              "agent_ref", "session_id", "result"):
         if k in obj and obj[k] is not None:
             out[k] = obj[k]
     return out or None
@@ -1930,44 +1951,6 @@ def _read_output_message(path: Path) -> str | None:
     except FileNotFoundError:
         return None
     return text or None
-
-
-def _default_codex_command() -> list[str]:
-    return [
-        "codex", "exec", "--json",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "-m", "{model}",
-        "-o", "{output_path}",
-        "{prompt}",
-    ]
-
-
-def _default_claude_command() -> list[str]:
-    # The `-p` without a prompt argument + `--input-format stream-json` puts
-    # claude into a session where user messages are fed via stdin as JSONL
-    # lines. The runner streams the initial prompt in on start, then can
-    # inject mid-run checkpoint nudges on the same channel. Legacy configs
-    # that still set `agent.command = [..., "-p", "{prompt}", ...]` keep
-    # working — the runner detects the placeholder and falls back to the
-    # single-shot invocation (no mid-run injection).
-    #
-    # `--settings {settings_path}` points Claude at a per-run JSON that
-    # registers a PreToolUse hook blocking whole-file `Read` calls on
-    # files above `agent.large_file_line_threshold`. Custom overrides that
-    # drop this placeholder silently disable enforcement.
-    #
-    # `--model {model}` pins the invocation to `agent.model` (or the
-    # per-run override the execute phase passes when
-    # `agent.auto_execute_model=true`). Custom `agent.command` overrides
-    # that drop the placeholder silently fall back to whatever the claude
-    # CLI defaults to — same opt-out pattern as `{settings_path}`.
-    return [
-        "claude", "-p", "--dangerously-skip-permissions",
-        "--settings", "{settings_path}",
-        "--model", "{model}",
-        "--input-format", "stream-json",
-        "--output-format", "stream-json", "--verbose",
-    ]
 
 
 def _claude_initial_stdin_payload(prompt: str) -> str:
@@ -2033,16 +2016,6 @@ def write_claude_settings(
     settings: dict = {"hooks": {"PreToolUse": pretool} if pretool else {}}
     settings_path.write_text(json.dumps(settings, indent=2))
     return settings_path
-
-
-def _default_codex_resume_command() -> list[str]:
-    return [
-        "codex", "exec", "resume", "{session_id}", "--json",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "-m", "{model}",
-        "-o", "{output_path}",
-        "{prompt}",
-    ]
 
 
 def _mark_done_instruction(config: Config, source_file: str) -> str:

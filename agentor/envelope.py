@@ -51,6 +51,18 @@ def _opt_int(v: Any) -> int | None:
         return None
 
 
+def _first_str(data: dict, keys: tuple[str, ...]) -> str | None:
+    """Return the first value under `keys` that is a non-empty str, or
+    None. Used to read `agent_ref` with a `session_id` fallback so
+    legacy `result_json` blobs written before the rename still
+    populate the provider-neutral field."""
+    for k in keys:
+        v = data.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
 @dataclass
 class TokenCounters:
     """Flat per-phase / per-iteration token counts. Every counter is
@@ -247,7 +259,7 @@ class Envelope:
     iterations: list[IterationUsage] | None = None
     model_usage: dict[str, ModelUsage] = field(default_factory=dict)
     progress: Progress = field(default_factory=Progress)
-    session_id: str | None = None
+    agent_ref: str | None = None
     result_text: str | None = None
     stop_reason: str | None = None
     duration_ms: int | None = None
@@ -314,7 +326,7 @@ class Envelope:
             iterations=iterations,
             model_usage=model_usage,
             progress=progress,
-            session_id=state.session_id,
+            agent_ref=state.session_id,
             result_text=state.result_text,
             stop_reason=state.stop_reason,
             duration_ms=state.duration_ms,
@@ -326,7 +338,8 @@ class Envelope:
     def from_codex(
         cls, state: "_CodexStreamState", *, result_text: str | None = None,
     ) -> "Envelope":
-        """Codex reports only `num_turns`, `session_id`, a final
+        """Codex reports only `num_turns`, `agent_ref` (codex's
+        `thread_id` wire key, stored provider-neutrally), a final
         message, and progress. Every token counter stays None;
         `iterations` stays None (codex has no per-turn usage — the
         envelope encodes that explicitly rather than emitting an
@@ -348,7 +361,7 @@ class Envelope:
             iterations=None,
             model_usage={},
             progress=progress,
-            session_id=state.session_id,
+            agent_ref=state.session_id,
             result_text=result_text or state.result_text,
             stop_reason=state.last_error,
         )
@@ -410,8 +423,7 @@ class Envelope:
             iterations=iterations,
             model_usage=model_usage,
             progress=Progress.from_legacy_dict(data.get("progress")),
-            session_id=(data.get("session_id")
-                        if isinstance(data.get("session_id"), str) else None),
+            agent_ref=_first_str(data, ("agent_ref", "session_id")),
             result_text=(data.get("result")
                          if isinstance(data.get("result"), str) else None),
             stop_reason=(data.get("stop_reason")
@@ -440,7 +452,7 @@ class Envelope:
           * `iterations is list` → claude shape: `usage` flat ints,
             `iterations` list of dicts, `modelUsage` dict.
           * Optional keys (`stop_reason`, `duration_ms`,
-            `duration_api_ms`, `session_id`, `result`, `rate_limits`)
+            `duration_api_ms`, `agent_ref`, `result`, `rate_limits`)
             appear only when their underlying value is truthy — same
             gating both state classes used before.
         """
@@ -469,8 +481,8 @@ class Envelope:
             out["duration_ms"] = int(self.duration_ms)
         if self.duration_api_ms is not None:
             out["duration_api_ms"] = int(self.duration_api_ms)
-        if self.session_id:
-            out["session_id"] = self.session_id
+        if self.agent_ref:
+            out["agent_ref"] = self.agent_ref
         if self.result_text:
             out["result"] = self.result_text
         if self.rate_limits:

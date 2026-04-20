@@ -88,7 +88,7 @@ class TestEnvelopeFromClaude(unittest.TestCase):
         self.assertEqual(env.iterations[0].model, "claude-opus-4-7")
         self.assertEqual(env.model_usage["claude-opus-4-7"].context_window,
                          200_000)
-        self.assertEqual(env.session_id, "sess-abc")
+        self.assertEqual(env.agent_ref, "sess-abc")
         self.assertEqual(env.result_text, "work done")
         self.assertEqual(env.stop_reason, "end_turn")
         self.assertEqual(env.duration_ms, 1234)
@@ -107,7 +107,7 @@ class TestEnvelopeFromClaude(unittest.TestCase):
         self.assertEqual(rehydrated.usage, original.usage)
         self.assertEqual(rehydrated.model_usage, original.model_usage)
         self.assertEqual(rehydrated.iterations, original.iterations)
-        self.assertEqual(rehydrated.session_id, original.session_id)
+        self.assertEqual(rehydrated.agent_ref, original.agent_ref)
         self.assertEqual(rehydrated.result_text, original.result_text)
         self.assertEqual(rehydrated.stop_reason, original.stop_reason)
         self.assertEqual(rehydrated.duration_ms, original.duration_ms)
@@ -139,7 +139,7 @@ class TestEnvelopeFromCodex(unittest.TestCase):
         self.assertEqual(env.model_usage, {})
         # Provider-specific fields that codex does report:
         self.assertEqual(env.num_turns, 1)
-        self.assertEqual(env.session_id, "thr-xyz")
+        self.assertEqual(env.agent_ref, "thr-xyz")
         self.assertEqual(env.result_text, "codex finished")
 
     def test_codex_roundtrips_through_legacy_dict(self):
@@ -160,7 +160,7 @@ class TestEnvelopeFromCodex(unittest.TestCase):
         self.assertIn(rehydrated.iterations, ([], None))
         self.assertEqual(rehydrated.model_usage, {})
         self.assertEqual(rehydrated.num_turns, original.num_turns)
-        self.assertEqual(rehydrated.session_id, original.session_id)
+        self.assertEqual(rehydrated.agent_ref, original.agent_ref)
         self.assertEqual(rehydrated.result_text, original.result_text)
 
 
@@ -262,6 +262,33 @@ class TestFromLegacyDictSemantics(unittest.TestCase):
         self.assertEqual(Envelope.from_legacy_dict("nonsense").usage,  # type: ignore[arg-type]
                          TokenCounters())
 
+    def test_legacy_session_id_blob_falls_back_to_agent_ref(self):
+        """`result_json` blobs written before the session_id → agent_ref
+        rename carry the old key name. `from_legacy_dict` must still
+        surface them under `agent_ref` so stale rows keep rendering
+        correctly in the dashboard."""
+        env = Envelope.from_legacy_dict({
+            "usage": {},
+            "iterations": [],
+            "modelUsage": {},
+            "num_turns": 0,
+            "session_id": "legacy-sess",
+        })
+        self.assertEqual(env.agent_ref, "legacy-sess")
+
+    def test_new_agent_ref_blob_preferred_over_legacy_session_id(self):
+        """If both keys happen to be present (unexpected, but cheap to
+        pin), the new `agent_ref` wins."""
+        env = Envelope.from_legacy_dict({
+            "usage": {},
+            "iterations": [],
+            "modelUsage": {},
+            "num_turns": 0,
+            "agent_ref": "new-ref",
+            "session_id": "legacy-sess",
+        })
+        self.assertEqual(env.agent_ref, "new-ref")
+
     def test_model_usage_entries_round_trip(self):
         original = {
             "usage": {"input_tokens": 5, "output_tokens": 5,
@@ -289,7 +316,7 @@ class TestFromLegacyDictSemantics(unittest.TestCase):
 
 
 class TestProgressAndAncillary(unittest.TestCase):
-    """Progress / session_id / stop_reason handling. Preserves the
+    """Progress / agent_ref / stop_reason handling. Preserves the
     existing legacy envelope's optional-key gating (progress dict is
     omitted entirely when empty; stop_reason / durations only appear
     when set)."""
@@ -314,7 +341,7 @@ class TestProgressAndAncillary(unittest.TestCase):
         env = Envelope()
         out = env.to_legacy_dict()
         for optional in ("stop_reason", "duration_ms", "duration_api_ms",
-                          "session_id", "result", "rate_limits"):
+                          "agent_ref", "result", "rate_limits"):
             self.assertNotIn(optional, out)
 
 

@@ -10,7 +10,7 @@ from .formatters import _phase_for
 def _transcript_path_for(cfg: Config, item: StoredItem) -> Path:
     phase = _phase_for(item)
     if not phase:
-        phase = "execute" if item.session_id else "plan"
+        phase = "execute" if item.agent_ref else "plan"
     return (
         cfg.project_root / ".agentor" / "transcripts" / f"{item.id}.{phase}.log"
     )

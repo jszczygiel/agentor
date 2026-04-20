@@ -314,7 +314,7 @@ class TestRetryMerge(unittest.TestCase):
         item = self._to_conflicted()
         self.store.transition(
             item.id, ItemStatus.CONFLICTED,
-            session_id="sess-abc", result_json='{"phase":"plan","plan":"p"}',
+            agent_ref="sess-abc", result_json='{"phase":"plan","plan":"p"}',
         )
         item = self.store.get(item.id)
         original_wt = item.worktree_path
@@ -329,7 +329,7 @@ class TestRetryMerge(unittest.TestCase):
         # Worktree + branch + session preserved so the runner can resume.
         self.assertEqual(final.worktree_path, original_wt)
         self.assertEqual(final.branch, original_branch)
-        self.assertEqual(final.session_id, "sess-abc")
+        self.assertEqual(final.agent_ref, "sess-abc")
         self.assertEqual(final.result_json, '{"phase":"plan","plan":"p"}')
         self.assertTrue(Path(original_wt).exists())
         self.assertTrue(_branch_exists(self.root, original_branch))
@@ -600,9 +600,9 @@ class TestAutoResolveConflicts(unittest.TestCase):
         claimed = self.store.claim_next_queued(str(wt), br)
         StubRunner(cfg, self.store).run(claimed)
         item = self.store.get(claimed.id)
-        # Seed a fake session_id so we can verify the runner-resume state
+        # Seed a fake agent_ref so we can verify the runner-resume state
         # survives the chained resubmit.
-        self.store.transition(item.id, item.status, session_id="sess-auto")
+        self.store.transition(item.id, item.status, agent_ref="sess-auto")
         item = self.store.get(item.id)
         wt = Path(item.worktree_path)
         (wt / "README.md").write_text("# project\n\nFEAT\n")
@@ -624,7 +624,7 @@ class TestAutoResolveConflicts(unittest.TestCase):
         # Worktree, branch, session all preserved so the runner resumes.
         self.assertTrue(Path(final.worktree_path).exists())
         self.assertTrue(_branch_exists(self.root, final.branch))
-        self.assertEqual(final.session_id, "sess-auto")
+        self.assertEqual(final.agent_ref, "sess-auto")
         # Feedback carries the conflict summary + base branch guidance.
         fb = final.feedback or ""
         self.assertIn("conflict", fb.lower())

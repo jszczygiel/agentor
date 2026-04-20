@@ -105,11 +105,9 @@ class TestInspectDispatch(unittest.TestCase):
         self.assertEqual(self.daemon.filled, 1)
 
     def test_plan_review_approve_with_questions_prompts_for_answers(self):
-        """When the agent's plan contained `## Open Questions`, pressing `a`
-        on AWAITING_PLAN_REVIEW must open the multiline overlay seeded with
-        the Q/A scaffold, then persist the parsed answers into
-        `result_json["answers"]` so the runner can inject them during the
-        resumed execute phase."""
+        """Sequential Q&A: `_prompt_multiline` called once per question.
+        Each call receives a single-question scaffold; answers are collected
+        and persisted into `result_json["answers"]`."""
         import json
         self._seed("plan1", ItemStatus.QUEUED)
         self.store.transition("plan1", ItemStatus.WORKING, note="t")
@@ -125,17 +123,15 @@ class TestInspectDispatch(unittest.TestCase):
             }),
             note="t",
         )
-        captured: dict = {}
+        calls: list[dict] = []
+        replies = [
+            "Q1: Should we keep the legacy flag?\nA1: yes, keep for one release",
+            "Q1: Where does the lock file live?\nA1: under .agentor/merge.lock",
+        ]
 
-        def fake_multiline(_stdscr, _label, **kwargs):
-            captured["initial"] = kwargs.get("initial", "")
-            return (
-                "Q1: Should we keep the legacy flag?\n"
-                "A1: yes, keep for one release\n"
-                "\n"
-                "Q2: Where does the lock file live?\n"
-                "A2: under .agentor/merge.lock\n"
-            )
+        def fake_multiline(_stdscr, label, **kwargs):
+            calls.append({"label": label, "initial": kwargs.get("initial", "")})
+            return replies[len(calls) - 1]
 
         with patch(
             "agentor.dashboard.modes._prompt_multiline", fake_multiline,
@@ -146,9 +142,15 @@ class TestInspectDispatch(unittest.TestCase):
             )
         self.assertTrue(acted)
         self.assertIn("answers", msg)
-        self.assertIn("Q1:", captured["initial"])
-        self.assertIn("A1: ", captured["initial"])
-        self.assertIn("Q2:", captured["initial"])
+        # Two calls — one per question.
+        self.assertEqual(len(calls), 2)
+        # Each scaffold contains only one Q/A pair.
+        self.assertIn("Q1:", calls[0]["initial"])
+        self.assertNotIn("Q2:", calls[0]["initial"])
+        self.assertIn("Q1:", calls[1]["initial"])
+        # Labels carry progress indicator.
+        self.assertIn("1/2", calls[0]["label"])
+        self.assertIn("2/2", calls[1]["label"])
         got = self.store.get("plan1")
         self.assertEqual(got.status, ItemStatus.QUEUED)
         data = json.loads(got.result_json)
@@ -157,10 +159,9 @@ class TestInspectDispatch(unittest.TestCase):
             ["yes, keep for one release", "under .agentor/merge.lock"],
         )
 
-    def test_plan_review_approve_with_questions_empty_reply_cancels(self):
-        """Empty reply from the answers overlay must cancel the approve —
-        no transition, item stays in AWAITING_PLAN_REVIEW so the operator
-        can try again or switch to `r`-reject."""
+    def test_plan_review_approve_with_questions_empty_reply_on_first_cancels(self):
+        """Ctrl-C (empty reply) on the very first question, with no prior
+        answers, cancels the approve — item stays in AWAITING_PLAN_REVIEW."""
         import json
         self._seed("plan1", ItemStatus.QUEUED)
         self.store.transition("plan1", ItemStatus.WORKING, note="t")
@@ -185,6 +186,78 @@ class TestInspectDispatch(unittest.TestCase):
         self.assertEqual(
             self.store.get("plan1").status, ItemStatus.AWAITING_PLAN_REVIEW,
         )
+
+    def test_plan_review_approve_abort_mid_sequence_preserves_answers(self):
+        """Ctrl-C on Q2 after answering Q1 — partial answers still approved."""
+        import json
+        self._seed("plan1", ItemStatus.QUEUED)
+        self.store.transition("plan1", ItemStatus.WORKING, note="t")
+        self.store.transition(
+            "plan1", ItemStatus.AWAITING_PLAN_REVIEW,
+            result_json=json.dumps({
+                "phase": "plan", "plan": "draft",
+                "questions": ["keep flag?", "lock file location?"],
+            }),
+            note="t",
+        )
+        call_count = {"n": 0}
+
+        def fake_multiline(_stdscr, _label, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return "Q1: keep flag?\nA1: yes"
+            return ""  # abort on second question
+
+        with patch(
+            "agentor.dashboard.modes._prompt_multiline", fake_multiline,
+        ):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("plan1"), "a",
+            )
+        self.assertTrue(acted)
+        self.assertIn("answers", msg)
+        got = self.store.get("plan1")
+        self.assertEqual(got.status, ItemStatus.QUEUED)
+        data = json.loads(got.result_json)
+        self.assertEqual(data["answers"], ["yes", ""])
+
+    def test_plan_review_approve_skip_question_records_blank(self):
+        """Empty-submit (operator leaves A1: blank but submits) records an
+        empty answer and advances; approve still proceeds."""
+        import json
+        self._seed("plan1", ItemStatus.QUEUED)
+        self.store.transition("plan1", ItemStatus.WORKING, note="t")
+        self.store.transition(
+            "plan1", ItemStatus.AWAITING_PLAN_REVIEW,
+            result_json=json.dumps({
+                "phase": "plan", "plan": "draft",
+                "questions": ["optional clarification?"],
+            }),
+            note="t",
+        )
+        captured_label = {"v": ""}
+
+        def fake_multiline(_stdscr, label, **kwargs):
+            captured_label["v"] = label
+            # Return the scaffold unchanged — A1: line is blank (skip).
+            return kwargs.get("initial", "")
+
+        with patch(
+            "agentor.dashboard.modes._prompt_multiline", fake_multiline,
+        ):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("plan1"), "a",
+            )
+        self.assertTrue(acted)
+        self.assertIn("1/1", captured_label["v"])
+        got = self.store.get("plan1")
+        self.assertEqual(got.status, ItemStatus.QUEUED)
+        data = json.loads(got.result_json)
+        # Blank answer — approve_plan filters out all-blank lists
+        # (sees no real answers), so "answers" key won't be set.
+        self.assertNotIn("answers", data)
 
     def test_plan_review_approve_without_questions_skips_overlay(self):
         """No questions → no overlay. Flow identical to pre-feature — a
@@ -542,7 +615,7 @@ class TestInspectDispatch(unittest.TestCase):
         self.store.transition(
             "live1", ItemStatus.WORKING,
             worktree_path="/tmp/nope", branch="agent/live1",
-            session_id="sess-abc", note="t",
+            agent_ref="sess-abc", note="t",
         )
         with patch(
             "agentor.dashboard.modes._prompt_yn", return_value=True,

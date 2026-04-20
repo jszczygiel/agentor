@@ -95,12 +95,18 @@ class AgentConfig:
         "A human reviews this plan before execution runs. Keep it tight.\n\n"
         "After Open Questions (or after the numbered list if there are "
         "none), ALWAYS emit a final `## Execute tier` section nominating "
-        "the model tier the execute phase should run on. Cheap mechanical "
-        "edits (renames, typo fixes, deleting an obsolete file, adding a "
-        "one-line test) → `haiku`. Mid-complexity refactors touching "
-        "several files with clear intent → `sonnet`. Subtle bugs, "
-        "cross-cutting redesigns, anything requiring sustained reasoning "
-        "across many files → `opus`. Exact format (literal):\n\n"
+        "the model tier the execute phase should run on. Default to "
+        "`sonnet` unless the task clearly fits an extreme:\n"
+        "- `haiku` — genuinely trivial: single-line typo, a literal "
+        "rename across ≤3 files, deleting an obsolete file. If in any "
+        "doubt, prefer sonnet.\n"
+        "- `sonnet` — DEFAULT. Bounded multi-file work with a clear "
+        "plan: refactors, adding a feature across 2-5 files, wiring a "
+        "new knob. Most items land here.\n"
+        "- `opus` — complex: subtle bugs, cross-cutting redesigns, "
+        "anything needing sustained reasoning across many files or "
+        "where the plan itself carries risk.\n\n"
+        "Exact format (literal):\n\n"
         "## Execute tier\n\n"
         "suggested_model: haiku | sonnet | opus\n"
         "reason: <one sentence>\n"
@@ -327,6 +333,23 @@ class Config:
     git: GitConfig
     review: ReviewConfig
 
+    def __post_init__(self) -> None:
+        # Validate `agent.command` / `agent.resume_command` placeholders
+        # against the active provider's schema. Hard errors (unknown or
+        # foreign placeholder, missing required token, or a template set
+        # on a provider that doesn't consume it) raise ValueError here so
+        # they surface at Config construction — before dispatch wastes a
+        # worktree on a silently-broken invocation. Soft-warnings about
+        # missing optional placeholders are returned and only printed by
+        # `load()`; direct `Config(...)` construction (unit tests) stays
+        # silent so per-test stderr noise doesn't leak into expectations.
+        # Import locally — `providers` imports `config` for type
+        # annotations, so a top-level import cycles.
+        from .providers import validate_agent_command
+        self._command_warnings = validate_agent_command(
+            self.agent.runner, self.agent.command, self.agent.resume_command,
+        )
+
 
 def _filter_known(cls, data: dict, section: str) -> dict:
     """Drop unknown keys before constructing a dataclass, with a warning
@@ -357,7 +380,7 @@ def load(config_path: Path) -> Config:
     if not root.is_absolute():
         root = (config_path.parent / root).resolve()
 
-    return Config(
+    cfg = Config(
         project_name=name,
         project_root=root,
         sources=SourcesConfig(**_filter_known(
@@ -371,3 +394,9 @@ def load(config_path: Path) -> Config:
         review=ReviewConfig(**_filter_known(
             ReviewConfig, raw.get("review", {}), "review")),
     )
+    # Emit the soft-warnings captured by `Config.__post_init__` now that
+    # we're on the TOML-loader path — direct `Config(...)` construction
+    # in unit tests keeps them buffered on `_command_warnings` silently.
+    from .providers import emit_agent_command_warnings
+    emit_agent_command_warnings(getattr(cfg, "_command_warnings", []))
+    return cfg

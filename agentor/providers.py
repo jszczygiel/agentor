@@ -38,7 +38,12 @@ top without a cycle.
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -57,6 +62,58 @@ if TYPE_CHECKING:
     from .config import Config
 
 
+# Universe of template placeholders the runner code knows how to substitute.
+# Every provider's `command_placeholders` / `resume_command_placeholders` must
+# be a subset of this set. Adding a new placeholder to the vocabulary is a
+# two-step change: add it here AND in at least one provider's schema.
+_KNOWN_PLACEHOLDERS: frozenset[str] = frozenset(
+    {"prompt", "model", "settings_path", "output_path", "session_id"}
+)
+
+
+# Which provider is the canonical owner of each placeholder, used to render
+# a helpful error message ("{settings_path} is claude-only"). Placeholders
+# accepted by more than one provider don't appear here.
+_PLACEHOLDER_OWNER: dict[str, str] = {
+    "settings_path": "claude",
+    "output_path": "codex",
+    "session_id": "codex resume_command",
+}
+
+
+_PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+
+
+def _extract_placeholders(template: list[str]) -> set[str]:
+    """Names of `{placeholder}` tokens that appear in any argv entry."""
+    found: set[str] = set()
+    for arg in template:
+        for m in _PLACEHOLDER_RE.finditer(arg):
+            found.add(m.group(1))
+    return found
+
+
+@dataclass(frozen=True)
+class PlaceholderSchema:
+    """Declared placeholder contract for one `agent.command` template.
+
+    `required` — tokens the runner needs to produce a working invocation;
+    absence is a hard configuration error.
+
+    `optional` — tokens the runner will substitute when present but can
+    live without (e.g. `{model}` falls through to the CLI default, the
+    per-run override is silently disabled). Missing optionals produce a
+    stderr soft-warning, never an exception.
+    """
+
+    required: frozenset[str] = field(default_factory=frozenset)
+    optional: frozenset[str] = field(default_factory=frozenset)
+
+    @property
+    def allowed(self) -> frozenset[str]:
+        return self.required | self.optional
+
+
 class Provider:
     """Base class. Subclasses override per-CLI methods; defaults cover
     providers that don't implement every hook (Codex has no primer, Stub
@@ -68,6 +125,16 @@ class Provider:
     # honest by populating the map on every concrete subclass. Empty maps
     # disable the `@model:` tag / plan-nomination channel for that provider.
     model_aliases: ClassVar[dict[str, str]] = {}
+
+    # Per-template placeholder contracts. `command_placeholders` governs
+    # `agent.command`; `resume_command_placeholders` governs
+    # `agent.resume_command`. A `None` schema means the provider does not
+    # consume that template at all — setting the knob raises a clear error
+    # pointing the operator at the correct runner. Defaults here are
+    # deliberately empty so a subclass that forgets to populate is caught
+    # by the validator ("runner=new: {prompt} is foreign").
+    command_placeholders: ClassVar[PlaceholderSchema] = PlaceholderSchema()
+    resume_command_placeholders: ClassVar[PlaceholderSchema | None] = None
 
     def is_dead_session_error(self, msg: str) -> bool:
         """True when the error message means the persisted session id /
@@ -98,6 +165,12 @@ class Provider:
                 return alias
         return None
 
+    def invoke_one_shot(self, prompt: str, timeout: float) -> str:
+        """Run provider, return final message. No session, no worktree,
+        no transcript — used for ephemeral tasks like note expansion
+        from the dashboard. Raises RuntimeError on any failure."""
+        raise NotImplementedError
+
     def build_primer(self, transcript_path: Path) -> str | None:
         """Return a markdown "don't re-fetch these files" primer for a
         kill-resumed run, or None when the prior transcript carries no
@@ -112,6 +185,21 @@ class Provider:
         an empty list — providers override to parse their transcript
         vocabulary into feed lines the dashboard concatenates verbatim."""
         return []
+
+    @staticmethod
+    def default_command() -> list[str]:
+        """Argv template used when `agent.command` is empty. Subclasses
+        override; base raises so a new provider that forgets wiring
+        surfaces at dispatch rather than silently spawning a shell."""
+        raise NotImplementedError
+
+    @staticmethod
+    def default_resume_command() -> list[str]:
+        """Argv template used when `agent.resume_command` is empty.
+        Providers that don't consume this template (Claude appends
+        `--resume <id>` at runtime) keep the base `NotImplementedError`
+        and declare `resume_command_placeholders = None`."""
+        raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +430,23 @@ class ClaudeProvider(Provider):
 
     _ALIAS_PREFIX_RE = re.compile(r"^claude-(haiku|sonnet|opus)\b")
 
+    # Claude's `agent.command` has no *required* placeholders — the prompt
+    # reaches the CLI via stream-json stdin (new path) or `-p {prompt}`
+    # (legacy), and `--resume <id>` is appended at runtime by the runner.
+    # Missing `{model}`/`{settings_path}` silently disables per-invocation
+    # tier selection / PreToolUse hooks (the existing opt-out pattern).
+    # `{output_path}` and `{session_id}` are codex-only — they'd expand to
+    # empty strings here and silently break the override.
+    command_placeholders: ClassVar[PlaceholderSchema] = PlaceholderSchema(
+        required=frozenset(),
+        optional=frozenset({"prompt", "model", "settings_path"}),
+    )
+    # Claude does not consume `agent.resume_command`: the runner appends
+    # `--resume <session_id>` to the same `agent.command` template instead.
+    # Declaring `None` makes the validator reject any override with a
+    # pointer to that fact.
+    resume_command_placeholders: ClassVar[PlaceholderSchema | None] = None
+
     def __init__(self, config: "Config") -> None:
         self._config = config
 
@@ -357,6 +462,37 @@ class ClaudeProvider(Provider):
         hours = float(self._config.agent.session_max_age_hours)
         return hours if hours > 0 else None
 
+    @staticmethod
+    def default_command() -> list[str]:
+        # The `-p` without a prompt argument + `--input-format stream-json`
+        # puts claude into a session where user messages are fed via stdin
+        # as JSONL lines. The runner streams the initial prompt in on
+        # start, then can inject mid-run checkpoint nudges on the same
+        # channel. Legacy configs that still set
+        # `agent.command = [..., "-p", "{prompt}", ...]` keep working —
+        # the runner detects the placeholder and falls back to the
+        # single-shot invocation (no mid-run injection).
+        #
+        # `--settings {settings_path}` points Claude at a per-run JSON
+        # that registers a PreToolUse hook blocking whole-file `Read`
+        # calls on files above `agent.large_file_line_threshold`. Custom
+        # overrides that drop this placeholder silently disable
+        # enforcement.
+        #
+        # `--model {model}` pins the invocation to `agent.model` (or the
+        # per-run override the execute phase passes when
+        # `agent.auto_execute_model=true`). Custom `agent.command`
+        # overrides that drop the placeholder silently fall back to
+        # whatever the claude CLI defaults to — same opt-out pattern as
+        # `{settings_path}`.
+        return [
+            "claude", "-p", "--dangerously-skip-permissions",
+            "--settings", "{settings_path}",
+            "--model", "{model}",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json", "--verbose",
+        ]
+
     def model_to_alias(self, model_id: str) -> str | None:
         # Prefix fallback so e.g. `claude-opus-4-6` still resolves to
         # `opus` when `model_aliases["opus"]` has rotated to a newer id.
@@ -365,6 +501,27 @@ class ClaudeProvider(Provider):
             return exact
         m = self._ALIAS_PREFIX_RE.match(model_id or "")
         return m.group(1) if m else None
+
+    def invoke_one_shot(self, prompt: str, timeout: float) -> str:
+        cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
+        try:
+            cp = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+                cwd=str(self._config.project_root),
+            )
+        except FileNotFoundError as e:
+            raise RuntimeError("claude CLI not found on PATH") from e
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"claude timed out after {timeout:.0f}s"
+            ) from e
+        if cp.returncode != 0:
+            err = (cp.stderr or cp.stdout).strip() or "claude exited nonzero"
+            raise RuntimeError(err.splitlines()[-1][:200])
+        out = (cp.stdout or "").strip()
+        if not out:
+            raise RuntimeError("claude returned empty output")
+        return out
 
     def build_primer(
         self, transcript_path: Path, *, min_turns: int = 3,
@@ -483,6 +640,25 @@ class CodexProvider(Provider):
         "full": "gpt-5",
     }
 
+    # Codex takes the prompt via argv (no stream-json stdin), so `{prompt}`
+    # is mandatory. `{settings_path}` is claude-only and would expand to
+    # an empty string here; `{session_id}` only makes sense on the resume
+    # template below. `{output_path}` is strongly recommended but
+    # technically optional — without `-o`, the runner falls back to
+    # scraping the final message out of stdout JSONL.
+    command_placeholders: ClassVar[PlaceholderSchema] = PlaceholderSchema(
+        required=frozenset({"prompt"}),
+        optional=frozenset({"model", "output_path"}),
+    )
+    # Resume template REQUIRES `{session_id}` (the whole point of the
+    # separate template) plus `{prompt}` (codex has no stream-json stdin).
+    resume_command_placeholders: ClassVar[PlaceholderSchema | None] = (
+        PlaceholderSchema(
+            required=frozenset({"session_id", "prompt"}),
+            optional=frozenset({"model", "output_path"}),
+        )
+    )
+
     def __init__(self, config: "Config") -> None:
         self._config = config
 
@@ -497,6 +673,72 @@ class CodexProvider(Provider):
     def session_max_age_hours(self) -> float | None:
         hours = float(self._config.agent.session_max_age_hours)
         return hours if hours > 0 else None
+
+    @staticmethod
+    def default_command() -> list[str]:
+        return [
+            "codex", "exec", "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-m", "{model}",
+            "-o", "{output_path}",
+            "{prompt}",
+        ]
+
+    @staticmethod
+    def default_resume_command() -> list[str]:
+        return [
+            "codex", "exec", "resume", "{session_id}", "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-m", "{model}",
+            "-o", "{output_path}",
+            "{prompt}",
+        ]
+
+    def invoke_one_shot(self, prompt: str, timeout: float) -> str:
+        # Codex has no stdout "final message" channel for non-JSON runs —
+        # route the result through `-o <path>` and read the file. Parsing
+        # `--json` JSONL for a one-shot call is overkill (dashboard note
+        # expansion), and omitting `-m` lets the CLI default pick.
+        tmp_root = self._config.project_root / ".agentor" / "tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        fd, raw_path = tempfile.mkstemp(
+            prefix="one-shot-", suffix=".txt", dir=str(tmp_root),
+        )
+        output_path = Path(raw_path)
+        # mkstemp creates the file; unlink it so codex doesn't see a
+        # stale empty file and refuse to overwrite.
+        os.close(fd)
+        output_path.unlink(missing_ok=True)
+        cmd = [
+            "codex", "exec", "--dangerously-bypass-approvals-and-sandbox",
+            "-o", str(output_path), prompt,
+        ]
+        try:
+            try:
+                cp = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout,
+                    cwd=str(self._config.project_root),
+                )
+            except FileNotFoundError as e:
+                raise RuntimeError("codex CLI not found on PATH") from e
+            except subprocess.TimeoutExpired as e:
+                raise RuntimeError(
+                    f"codex timed out after {timeout:.0f}s"
+                ) from e
+            if cp.returncode != 0:
+                err = (cp.stderr or cp.stdout).strip() or "codex exited nonzero"
+                raise RuntimeError(err.splitlines()[-1][:200])
+            try:
+                out = output_path.read_text().strip()
+            except FileNotFoundError as e:
+                raise RuntimeError(
+                    "codex produced no output file"
+                ) from e
+            if not out:
+                raise RuntimeError("codex returned empty output")
+            return out
+        finally:
+            output_path.unlink(missing_ok=True)
 
     # Codex has no Read/Grep granularity in its transcript yet — the
     # primer would have no meaningful content to emit, and fabricating
@@ -552,6 +794,23 @@ class StubProvider(Provider):
     # without needing to pin `runner="claude"`.
     model_aliases: ClassVar[dict[str, str]] = dict(ClaudeProvider.model_aliases)
 
+    # Permissive placeholder schema: tests routinely set
+    # `command=[..., "-p", "{prompt}"]` (claude-shaped), and a future
+    # fake-codex fixture may want `{output_path}` — the stub runner
+    # doesn't care which tokens appear in argv, so accept the whole
+    # known vocabulary as optional. No required placeholders keeps the
+    # default `AgentConfig()` (empty `command`/`resume_command`) valid.
+    command_placeholders: ClassVar[PlaceholderSchema] = PlaceholderSchema(
+        required=frozenset(),
+        optional=_KNOWN_PLACEHOLDERS,
+    )
+    resume_command_placeholders: ClassVar[PlaceholderSchema | None] = (
+        PlaceholderSchema(
+            required=frozenset(),
+            optional=_KNOWN_PLACEHOLDERS,
+        )
+    )
+
     def __init__(self, config: "Config") -> None:
         self._config = config
 
@@ -561,16 +820,127 @@ class StubProvider(Provider):
     def session_max_age_hours(self) -> float | None:
         return None
 
+    def invoke_one_shot(self, prompt: str, timeout: float) -> str:
+        raise NotImplementedError("stub provider has no one-shot")
+
+
+_PROVIDER_CLASSES: dict[str, type[Provider]] = {
+    "stub": StubProvider,
+    "claude": ClaudeProvider,
+    "codex": CodexProvider,
+}
+
 
 def make_provider(config: "Config") -> Provider:
     kind = config.agent.runner.lower()
-    if kind == "stub":
-        return StubProvider(config)
-    if kind == "claude":
-        return ClaudeProvider(config)
-    if kind == "codex":
-        return CodexProvider(config)
-    raise ValueError(f"unknown agent.runner: {kind!r}")
+    cls = _PROVIDER_CLASSES.get(kind)
+    if cls is None:
+        raise ValueError(f"unknown agent.runner: {kind!r}")
+    return cls(config)
+
+
+def _render_foreign_message(token: str, runner_kind: str, label: str) -> str:
+    owner = _PLACEHOLDER_OWNER.get(token)
+    if owner:
+        return (
+            f"agent.{label} uses {{{token}}} which is {owner}-only; "
+            f"runner={runner_kind!r} does not accept it."
+        )
+    return (
+        f"agent.{label} uses {{{token}}} which runner={runner_kind!r} "
+        f"does not accept."
+    )
+
+
+def validate_agent_command(
+    runner_kind: str,
+    command: list[str],
+    resume_command: list[str],
+) -> list[str]:
+    """Check `agent.command` / `agent.resume_command` against the active
+    provider's placeholder schema.
+
+    Raises `ValueError` on hard errors (unknown placeholder, foreign
+    placeholder, missing required placeholder, or a template set on a
+    provider that doesn't consume it). Returns a list of soft-warning
+    strings for missing optional placeholders — callers choose whether
+    to print them (TOML `load()` does, direct `Config(...)` construction
+    stays silent to keep unit tests clean).
+    """
+    kind = (runner_kind or "").lower()
+    cls = _PROVIDER_CLASSES.get(kind)
+    if cls is None:
+        # Unknown runner — `make_provider` will surface this separately.
+        # Don't crash Config construction just because the runner string
+        # is off; the dispatch-time error is clearer.
+        return []
+    warnings: list[str] = []
+    warnings.extend(
+        _validate_template(
+            "command", command, cls.command_placeholders, kind,
+        )
+    )
+    resume_schema = cls.resume_command_placeholders
+    if resume_schema is None:
+        if resume_command:
+            raise ValueError(
+                f"agent.resume_command is set but runner={kind!r} does "
+                f"not consume it (Claude resumes via `--resume <id>` "
+                f"appended to agent.command at runtime). Remove the "
+                f"override or switch to a runner that uses resume_command."
+            )
+    else:
+        warnings.extend(
+            _validate_template(
+                "resume_command", resume_command, resume_schema, kind,
+            )
+        )
+    return warnings
+
+
+def _validate_template(
+    label: str,
+    template: list[str],
+    schema: PlaceholderSchema,
+    runner_kind: str,
+) -> list[str]:
+    if not template:
+        return []
+    found = _extract_placeholders(template)
+    unknown = found - _KNOWN_PLACEHOLDERS
+    if unknown:
+        token = sorted(unknown)[0]
+        raise ValueError(
+            f"agent.{label} has unknown placeholder {{{token}}}. "
+            f"Supported: {{{', '.join(sorted(_KNOWN_PLACEHOLDERS))}}}."
+        )
+    foreign = found - schema.allowed
+    if foreign:
+        token = sorted(foreign)[0]
+        raise ValueError(_render_foreign_message(token, runner_kind, label))
+    missing_required = schema.required - found
+    if missing_required:
+        token = sorted(missing_required)[0]
+        raise ValueError(
+            f"agent.{label} is missing required placeholder {{{token}}} "
+            f"for runner={runner_kind!r}."
+        )
+    warnings: list[str] = []
+    for missing in sorted(schema.optional - found):
+        warnings.append(
+            f"[config] agent.{label} override omits {{{missing}}} — "
+            f"per-invocation value will not reach the CLI "
+            f"(runner={runner_kind!r})."
+        )
+    return warnings
+
+
+def emit_agent_command_warnings(warnings: list[str]) -> None:
+    """Print soft warnings to stderr in a predictable format. Broken out
+    so `Config.load()` can call it while direct `Config(...)` construction
+    (tests) stays silent."""
+    for w in warnings:
+        print(w, file=sys.stderr)
 
 
 def detect_provider(config: "Config", transcript_path: Path) -> Provider:

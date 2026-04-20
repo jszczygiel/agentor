@@ -10,6 +10,11 @@ pool_size = 0   # meta project — manual gating: bump with [+] to dispatch
 context_window = 1_000_000
 single_phase = false
 test_cmd = "python3 -m unittest discover tests"
+# Execute-phase model tier nominated by the plan's `## Execute tier`
+# trailer wins over `agent.model` above (still gated by
+# `execute_model_whitelist` when set). Plan phase always uses
+# `agent.model` — nomination only drives execute.
+auto_execute_model = true
 
 [git]
 base_branch = "main"
