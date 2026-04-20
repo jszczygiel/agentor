@@ -213,13 +213,18 @@ class AgentConfig:
     # a future agent clusters the Surprises/Gotchas into CLAUDE.md and
     # deletes the consumed logs in a single commit. 0 disables.
     fold_threshold: int = 10
-    # Operator-configured token budgets for the dashboard status line's
-    # rate-limit percentage readout. 0 disables the `(NN%)` suffix and the
-    # line reverts to raw totals. Claude's stream-json feed strips the
-    # `anthropic-ratelimit-*` response headers, so there is no live quota
-    # signal to scrape; this is a soft budget against the daemon's session
-    # and rolling-7d aggregates. Pick values matching your Claude plan's
-    # 5h and weekly quotas.
+    # Operator-configured token budgets for the dashboard usage panel.
+    # The panel mirrors the two cells claude.ai/settings/usage headlines:
+    # rolling 5-hour and rolling weekly windows. When set, each cell leads
+    # with `NN%` against its budget (matching the Anthropic page's headline
+    # number); when 0, the cell falls back to raw token totals so operators
+    # without a configured cap still see activity. Claude's stream-json
+    # feed strips the `anthropic-ratelimit-*` response headers, so the % is
+    # budget-derived rather than scraped from a live quota.
+    #
+    # `session_token_budget` caps the rolling 5-hour window (the column
+    # name is preserved for back-compat with existing `agentor.toml`
+    # files); `weekly_token_budget` caps the rolling 7-day window.
     session_token_budget: int = 0
     weekly_token_budget: int = 0
     # When true, `committer.approve_and_commit` blocks the integration if
