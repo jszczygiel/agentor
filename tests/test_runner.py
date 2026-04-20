@@ -2299,6 +2299,74 @@ class TestClaudeRunnerCheckpointInjection(unittest.TestCase):
         ).read_text()
         self.assertIn("checkpoint-observed-dry-run", transcript)
 
+    def test_capability_flag_gates_injection(self):
+        """The checkpoint emitter's marker tag and stdin-write behaviour
+        are sourced from `runner.capabilities.supports_mid_run_injection`,
+        not from the bare `stdin_prompt is not None` signal. A subclass
+        that flips the capability flag to False must:
+
+        - still get the dry-run observation marker on the transcript,
+        - not write the initial stream-json payload to stdin, and
+        - not open a stdin holder (no user-role nudge writes).
+
+        Regression: if a future provider declares False for injection but
+        the code kept using `stdin_prompt is not None`, the next
+        threshold crossing would silently write to a real CLI stdin that
+        can't accept mid-run messages."""
+        from dataclasses import replace
+
+        from agentor import runner as runner_mod
+        from agentor.capabilities import CLAUDE_CAPS
+        from agentor.runner import ClaudeRunner
+
+        cfg = self._mk_claude_cfg()
+
+        class NoInjectClaudeRunner(ClaudeRunner):
+            capabilities = replace(
+                CLAUDE_CAPS, supports_mid_run_injection=False,
+            )
+
+        runner = NoInjectClaudeRunner(cfg, self.store)
+
+        scan_once(cfg, self.store)
+        item_id = self.store.list_by_status(ItemStatus.QUEUED)[0].id
+        wt = self.root / "wt"
+        wt.mkdir()
+        claimed = self.store.claim_next_queued(str(wt), "agent/big-refactor")
+
+        events = [self._assistant_event() for _ in range(5)]
+        captured_writes: list[str] = []
+        captured_stdin_payload: list[str] = []
+        stub = self._stub_helper(events, captured_writes, captured_stdin_payload)
+
+        original = runner_mod._run_stream_json_subprocess
+        runner_mod._run_stream_json_subprocess = stub
+        try:
+            runner._invoke_claude_streaming(
+                claimed,
+                ["claude", "-p", "--input-format", "stream-json",
+                 "--output-format", "stream-json", "--verbose"],
+                wt,
+                self.root / ".agentor" / "transcripts" / f"{item_id}.plan.log",
+                "plan",
+                stdin_prompt="THE-PROMPT",
+            )
+        finally:
+            runner_mod._run_stream_json_subprocess = original
+
+        # Capability gate blocks BOTH the initial stdin payload (no holder
+        # opened) AND the mid-run nudge injection.
+        self.assertEqual(captured_stdin_payload, [])
+        self.assertEqual(captured_writes, [])
+
+        transcript = (
+            self.root / ".agentor" / "transcripts" / f"{item_id}.plan.log"
+        ).read_text()
+        # Marker tag tracks the capability: False → `observed-dry-run`,
+        # never `injected`.
+        self.assertIn("checkpoint-observed-dry-run", transcript)
+        self.assertNotIn("checkpoint-injected", transcript)
+
 
 class TestClaudeSettingsHookWiring(unittest.TestCase):
     """The Claude runner must write a per-run settings JSON that registers

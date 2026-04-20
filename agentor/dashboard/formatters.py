@@ -1,6 +1,7 @@
 import json
 import time
 
+from ..capabilities import CLAUDE_CAPS, ProviderCapabilities
 from ..models import ItemStatus
 from ..store import Store, StoredItem
 
@@ -111,7 +112,10 @@ def _tokens_total(item: StoredItem) -> str:
     return _fmt_tokens(total)
 
 
-def _ctx_fill_pct(item: StoredItem, fallback_window: int) -> str:
+def _ctx_fill_pct(
+    item: StoredItem, fallback_window: int,
+    caps: ProviderCapabilities = CLAUDE_CAPS,
+) -> str:
     """Approximate how full the main agent's context was on its last turn,
     as a percent of its context window.
 
@@ -122,7 +126,15 @@ def _ctx_fill_pct(item: StoredItem, fallback_window: int) -> str:
 
     Window is read from the largest `contextWindow` in `modelUsage` (which
     claude reports — 1M for the opus-4-6 1M variant, 200k for standard
-    opus) to avoid a stale config default. Falls back to `fallback_window`."""
+    opus) to avoid a stale config default. Falls back to `fallback_window`.
+
+    `caps.reports_context_window` short-circuits to `—` when the provider
+    doesn't emit `modelUsage[m].contextWindow` (codex) — the existing
+    logic would fall through to the same answer via the empty-modelUsage
+    path, but declaring the gate keeps the intent explicit and avoids the
+    iteration scan entirely."""
+    if not caps.reports_context_window:
+        return "—"
     data = _result_data(item)
     if not data:
         return "—"
