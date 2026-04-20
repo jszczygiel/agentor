@@ -63,6 +63,13 @@ class Daemon:
         # until its transcript actually advances.
         self.stale_session_alerts: dict[str, int] = {}
         self._stale_session_seen: dict[str, int] = {}
+        # Runtime-only model override set from the dashboard [M] picker.
+        # Applies to FRESH dispatches of newly-claimed QUEUED items (both
+        # plan-phase starts and single_phase executes). Resumed executes
+        # keep their original tier — the execute-tier resolution flow
+        # already honours @model tags and plan nominations there. Cleared
+        # on daemon restart; never written to `agentor.toml`.
+        self.model_override: str | None = None
         self._heartbeat_last: float = 0.0
         self._heartbeat_dispatched: int = 0
         # Epoch set when run() starts; used as the "since-daemon-start" cutoff
@@ -107,6 +114,10 @@ class Daemon:
         r = self.runner_factory(self.config, self.store)
         r.proc_registry = self.proc_registry
         r.stop_event = self.stop_event
+        # Snapshot the override at dispatch time so a mid-flight flip via
+        # the dashboard [M] picker only affects the NEXT dispatch, not a
+        # runner that's already been handed off to its worker thread.
+        r._model_override_fresh = self.model_override
         return r
 
     def dispatch_specific(self, item_id: str) -> bool:

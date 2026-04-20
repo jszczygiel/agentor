@@ -29,6 +29,23 @@ _ALIAS_TO_MODEL: dict[str, str] = {
 }
 
 
+# Models the dashboard [M] switcher offers at runtime, keyed by
+# `agent.runner`. The switcher never flips the runner type — it only
+# overrides `agent.model` for newly-dispatched items. `stub` gets no
+# entries (the stub runner ignores model id). `codex` is intentionally
+# empty here until we add a known-model list for it; an empty list makes
+# the overlay a no-op with a friendly message.
+KNOWN_MODELS: dict[str, list[tuple[str, str]]] = {
+    "stub": [],
+    "claude": [
+        ("haiku", _ALIAS_TO_MODEL["haiku"]),
+        ("sonnet", _ALIAS_TO_MODEL["sonnet"]),
+        ("opus", _ALIAS_TO_MODEL["opus"]),
+    ],
+    "codex": [],
+}
+
+
 @dataclass
 class AgentConfig:
     model: str = "claude-opus-4-6"

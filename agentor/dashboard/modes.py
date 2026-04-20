@@ -23,9 +23,11 @@ from .formatters import (
     _token_breakdown,
 )
 from .render import (
+    _MODEL_OVERRIDE_CLEAR,
     REFRESH_MS,
     _flash,
     _handle_resize,
+    _prompt_model_switcher,
     _prompt_multiline,
     _prompt_text,
     _prompt_yn,
@@ -212,6 +214,26 @@ def _deferred_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
                 return
     finally:
         stdscr.nodelay(True)
+
+
+def _model_switcher_mode(stdscr, cfg: Config, daemon: Daemon) -> None:
+    """Open the model-picker overlay and apply the operator's choice to
+    `daemon.model_override`. The choice is in-memory only — it's read at
+    FRESH dispatch time (plan-phase start, single_phase first execute),
+    cleared on daemon restart, and never written back to `agentor.toml`.
+    Resumed executes keep their original tier via `_resolve_execute_tier`."""
+    from ..config import KNOWN_MODELS
+    rows = KNOWN_MODELS.get(cfg.agent.runner, [])
+    current = daemon.model_override
+    result = _prompt_model_switcher(stdscr, rows, current, cfg.agent.runner)
+    if result is None:
+        return
+    if result is _MODEL_OVERRIDE_CLEAR:
+        daemon.model_override = None
+        _flash(stdscr, "model override cleared — using agent.model")
+        return
+    daemon.model_override = result
+    _flash(stdscr, f"model override set: {result} (newly-dispatched items)")
 
 
 def _inspect_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:

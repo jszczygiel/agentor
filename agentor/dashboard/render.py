@@ -24,9 +24,9 @@ from .formatters import (
 
 
 ACTIONS_WIDE = ("[↑/↓/j/k]nav  [enter]open  [n]ew  [r]eview  "
-                "[d]eferred  [i]nspect  [tab]filter  [+/-]pool  [⇧↑/⇧↓]pri  "
-                "[q]uit")
-ACTIONS_MID = "[↑↓][⏎][n][r][d][i][tab][+/-][?]help [q]uit"
+                "[d]eferred  [i]nspect  [M]odel  [tab]filter  [+/-]pool  "
+                "[⇧↑/⇧↓]pri  [q]uit")
+ACTIONS_MID = "[↑↓][⏎][n][r][d][i][M][tab][+/-][?]help [q]uit"
 ACTIONS_NARROW = "↑↓ ⏎ tab q  [?]help"
 
 # Back-compat alias — existing tests import ACTIONS and assert tokens in it.
@@ -202,6 +202,12 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     token_row = " " + _fmt_token_row(token_windows, cfg.agent, tier)
     _safe_addstr(stdscr, row, 0, token_row.ljust(w), w, curses.A_DIM)
     row += 1
+    override = getattr(daemon, "model_override", None)
+    if override:
+        strip = f" model override: {cfg.agent.runner}/{override} (session-only) "
+        _safe_addstr(stdscr, row, 0, strip[:w].ljust(w), w,
+                     curses.color_pair(5) | curses.A_BOLD)
+        row += 1
     _safe_addstr(stdscr, row, 0, "─" * w, w, curses.A_DIM)
     row += 1
 
@@ -919,6 +925,112 @@ def _prompt_multiline(
     if cancelled["flag"]:
         return ""
     return text.rstrip()
+
+
+def _prompt_model_switcher(
+    stdscr, rows: list[tuple[str, str]], current: str | None,
+    runner: str,
+) -> str | None | object:
+    """Centered overlay for picking the active model. `rows` is a list of
+    `(alias, model_id)` pairs offered by the current runner. `current` is
+    the model id that should land selected (matches a row's model_id, or
+    None when no override is active). `runner` is shown in the header so
+    operators know the picker only affects the already-configured runner.
+
+    Returns the chosen model id, `None` on cancel (esc/q), or the sentinel
+    `_MODEL_OVERRIDE_CLEAR` when the operator picks the "clear override
+    (use agentor.toml)" row. Falls back to a flash message and returns
+    None when the runner has no selectable models (e.g. stub).
+
+    Note: `curses.color_pair` is invoked while rendering — headless tests
+    must patch `agentor.dashboard.render.curses.color_pair` (not the
+    caller's module)."""
+    if not rows:
+        _flash(stdscr, f"no runtime model switching for runner={runner!r}")
+        return None
+
+    # Prepend the clear-override row so operators can revert to the
+    # config default without restarting the daemon.
+    entries: list[tuple[str, str, str]] = [
+        ("default", "", f"(clear override — use agentor.toml agent.model)"),
+    ] + [(alias, mid, f"{alias:<8} {mid}") for alias, mid in rows]
+
+    # Land the cursor on the row that matches `current`. When no override
+    # is active, that's the first (clear) row.
+    sel = 0
+    if current:
+        for i, (_, mid, _label) in enumerate(entries):
+            if mid == current:
+                sel = i
+                break
+
+    stdscr.nodelay(False)
+    try:
+        while True:
+            h, w = stdscr.getmaxyx()
+            box_h = min(len(entries) + 6, h - 2)
+            box_w = min(60, max(30, w - 4))
+            top = max(0, (h - box_h) // 2)
+            left = max(0, (w - box_w) // 2)
+
+            stdscr.erase()
+            # Backdrop repaint — prevents leftover main-table glyphs
+            # from bleeding through around the overlay.
+            for y in range(h):
+                _safe_addstr(stdscr, y, 0, " " * w, w, curses.A_DIM)
+
+            header = f" model switcher · runner={runner} "[: box_w]
+            _safe_addstr(stdscr, top, left, header.ljust(box_w), box_w,
+                         curses.A_BOLD | curses.A_REVERSE)
+            _safe_addstr(stdscr, top + 1, left,
+                         " choose a model for newly-dispatched items "
+                         .ljust(box_w)[:box_w],
+                         box_w, curses.A_DIM)
+            for i, (_, _mid, label) in enumerate(entries):
+                y = top + 3 + i
+                if y >= top + box_h - 2:
+                    break
+                attr = 0
+                if i == sel:
+                    attr = curses.A_REVERSE | curses.A_BOLD
+                line = f" {'▸' if i == sel else ' '} {label}".ljust(box_w)
+                _safe_addstr(stdscr, y, left, line[:box_w], box_w, attr)
+
+            footer = (" ↑/↓ navigate · enter pick · esc/q cancel "
+                      .ljust(box_w)[:box_w])
+            _safe_addstr(stdscr, top + box_h - 1, left, footer, box_w,
+                         curses.A_DIM)
+            scope = (" applies only to newly-dispatched items; already-"
+                     "working items keep their original model ")
+            _safe_addstr(stdscr, top + box_h, left, scope[:box_w], box_w,
+                         curses.A_DIM)
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+            if _handle_resize(stdscr, ch):
+                continue
+            if ch in (curses.KEY_DOWN, ord("j")):
+                sel = min(len(entries) - 1, sel + 1)
+                continue
+            if ch in (curses.KEY_UP, ord("k")):
+                sel = max(0, sel - 1)
+                continue
+            if ch in (10, 13, curses.KEY_ENTER):
+                alias, mid, _label = entries[sel]
+                if alias == "default":
+                    return _MODEL_OVERRIDE_CLEAR
+                return mid
+            k = chr(ch).lower() if 0 < ch < 256 else ""
+            if k == "q" or ch == 27:
+                return None
+    finally:
+        stdscr.nodelay(True)
+
+
+# Sentinel returned by `_prompt_model_switcher` when the operator picks
+# "clear override" — distinguishes from None (cancel) so the caller can
+# unset the daemon override rather than leaving it unchanged.
+_MODEL_OVERRIDE_CLEAR = object()
 
 
 def _wrap(text: str, width: int) -> list[str]:
