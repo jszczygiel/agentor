@@ -335,6 +335,28 @@ def retry_merge(
         p("committing conflict resolution")
         git_ops.commit_all(wt, "resolve merge conflicts")
 
+    # Per-run findings log compliance gate (mirrors approve_and_commit).
+    # Runs before the integration lock so a hard block short-circuits
+    # without touching the merge machinery. Miss under
+    # `agent.require_agent_log` → CONFLICTED with `last_error =
+    # "agent-log missing"`; soft miss under the default knob appends
+    # ", no agent-log written" to the MERGED note.
+    logs_added = git_ops.added_agent_logs(
+        repo, item.branch, config.git.base_branch,
+    )
+    if not logs_added:
+        if config.agent.require_agent_log:
+            p("retry blocked: no agent-log added on feature branch")
+            store.transition(
+                item.id, ItemStatus.CONFLICTED,
+                last_error="agent-log missing",
+                note="retry blocked: agent-log missing",
+            )
+            return False, "agent-log missing"
+        log_suffix = ", no agent-log written"
+    else:
+        log_suffix = ""
+
     tmp_root = repo / ".agentor" / "merge-tmp"
     mode = config.git.merge_mode
     verb = "rebasing onto" if mode == "rebase" else "merging into"
@@ -383,7 +405,7 @@ def retry_merge(
             item.id, ItemStatus.MERGED,
             last_error=None,
             note=f"resolved — {mode}d {merge_sha[:8]} into "
-                 f"{config.git.base_branch}{checkout_suffix}",
+                 f"{config.git.base_branch}{checkout_suffix}{log_suffix}",
         )
         return True, f"{mode}d {merge_sha[:8]} into {config.git.base_branch}"
 

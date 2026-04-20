@@ -1289,6 +1289,7 @@ class TestAgentLogCompliance(unittest.TestCase):
     transitioning CONFLICTED with `last_error="agent-log missing"`."""
 
     def setUp(self):
+        _suppress_auto_chain(self)
         self.td = TemporaryDirectory()
         self.root = Path(self.td.name)
         _init_project(self.root)
@@ -1309,6 +1310,24 @@ class TestAgentLogCompliance(unittest.TestCase):
         claimed = self.store.claim_next_queued(str(wt), br)
         runner_cls(self.cfg, self.store).run(claimed)
         return self.store.get(claimed.id)
+
+    def _drive_conflicted_no_log(self):
+        """Claim with `_NoLogStubRunner`, create a README.md clash against
+        main, then run `approve_and_commit` (default knob) so the merge
+        conflict trips CONFLICTED — the feature branch carries no
+        `docs/agent-logs/*.md` file for the retry gate to find."""
+        item = self._claim(_NoLogStubRunner)
+        wt = Path(item.worktree_path)
+        (wt / "README.md").write_text("# project\n\nFEAT\n")
+        _git(wt, "add", "README.md")
+        _git(wt, "commit", "-q", "-m", "feat readme")
+        (self.root / "README.md").write_text("# project\n\nMAIN\n")
+        _git(self.root, "add", "README.md")
+        _git(self.root, "commit", "-q", "-m", "main readme")
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+        conflicted = self.store.get(item.id)
+        assert conflicted.status == ItemStatus.CONFLICTED
+        return conflicted
 
     def _last_note(self, item_id):
         return self.store.transitions_for(item_id)[-1].note or ""
@@ -1364,6 +1383,81 @@ class TestAgentLogCompliance(unittest.TestCase):
         item = self._claim()
         approve_and_commit(self.cfg, self.store, item, "stub note")
 
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.MERGED)
+        self.assertNotIn("no agent-log written", self._last_note(item.id))
+
+    def test_retry_missing_log_appends_suffix(self):
+        """Default knob + README clash CONFLICTED + no agent-log on the
+        feature branch → `retry_merge` MERGED note carries the
+        `, no agent-log written` suffix."""
+        item = self._drive_conflicted_no_log()
+        wt = Path(item.worktree_path)
+        # Operator resolves by taking main's README; no log added.
+        (wt / "README.md").write_text("# project\n\nMAIN\n")
+
+        ok, _msg = retry_merge(self.cfg, self.store, item)
+
+        self.assertTrue(ok)
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.MERGED)
+        self.assertIn(", no agent-log written", self._last_note(item.id))
+
+    def test_retry_require_agent_log_blocks_when_missing(self):
+        """`require_agent_log=True` + no log → `retry_merge` keeps the
+        item CONFLICTED with `last_error="agent-log missing"`, returns
+        `(False, "agent-log missing")`, and leaves the feature branch,
+        worktree, and base branch untouched."""
+        self.cfg.agent.require_agent_log = True
+        item = self._claim(_NoLogStubRunner)
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+        blocked = self.store.get(item.id)
+        self.assertEqual(blocked.status, ItemStatus.CONFLICTED)
+        self.assertEqual(blocked.last_error, "agent-log missing")
+
+        branch = blocked.branch
+        wt = Path(blocked.worktree_path)
+        base_before = _main_sha(self.root)
+
+        ok, msg = retry_merge(self.cfg, self.store, blocked)
+
+        self.assertFalse(ok)
+        self.assertEqual(msg, "agent-log missing")
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.CONFLICTED)
+        self.assertEqual(final.last_error, "agent-log missing")
+        self.assertTrue(wt.exists(),
+                        "worktree must be kept for the agent to add the log")
+        self.assertTrue(_branch_exists(self.root, branch),
+                        "feature branch must be preserved when the gate blocks")
+        self.assertEqual(_main_sha(self.root), base_before,
+                         "base must not advance when the retry gate blocks")
+        self.assertIn("retry blocked: agent-log missing",
+                      self._last_note(item.id))
+
+    def test_retry_require_agent_log_allows_when_log_added(self):
+        """`require_agent_log=True`: operator adds the missing
+        `docs/agent-logs/*.md` in the feature worktree + commits, then
+        `[m]` retries → MERGED with no `no agent-log written` marker."""
+        self.cfg.agent.require_agent_log = True
+        item = self._claim(_NoLogStubRunner)
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+        blocked = self.store.get(item.id)
+        self.assertEqual(blocked.status, ItemStatus.CONFLICTED)
+        self.assertEqual(blocked.last_error, "agent-log missing")
+
+        wt = Path(blocked.worktree_path)
+        log_dir = wt / "docs" / "agent-logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "2026-04-20-retry-adds-log.md").write_text(
+            "# retry adds log\n\n## Outcome\n- added manually\n"
+        )
+        _git(wt, "add", "docs/agent-logs/2026-04-20-retry-adds-log.md")
+        _git(wt, "commit", "-q", "-m", "add agent-log")
+
+        ok, _msg = retry_merge(self.cfg, self.store, blocked)
+
+        self.assertTrue(ok)
         final = self.store.get(item.id)
         self.assertEqual(final.status, ItemStatus.MERGED)
         self.assertNotIn("no agent-log written", self._last_note(item.id))
