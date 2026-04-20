@@ -387,8 +387,8 @@ class TestRenderFitsWidth(unittest.TestCase):
 class TestRenderTokenRow(unittest.TestCase):
     """The token panel was collapsed to a single dim row emitted directly
     under the status line. Verify the renderer produces exactly one row
-    carrying all three windows (session/today/7d) at each width tier, and
-    that no residual `_render_token_panel` rows (header + 3 window lines)
+    carrying both windows (5h / week, mirroring claude.ai/settings/usage)
+    at each width tier, and that no residual `_render_token_panel` rows
     remain."""
 
     def setUp(self):
@@ -434,41 +434,39 @@ class TestRenderTokenRow(unittest.TestCase):
 
     def test_wide_emits_single_token_row(self):
         lines = self._render_at(120)
-        token_lines = [s for _, s in lines if "tokens" in s and "7d" in s]
+        token_lines = [s for _, s in lines if "usage" in s and "wk" in s]
         self.assertEqual(len(token_lines), 1)
         row = token_lines[0]
-        self.assertIn("session", row)
-        self.assertIn("today", row)
-        self.assertIn("7d", row)
-        # daemon not started → session mirrors today; totals are 79.3k.
+        self.assertIn("5h", row)
+        self.assertIn("wk", row)
+        # Both rolling windows include the only seeded item → totals 79.3k.
         self.assertIn("79.3k", row)
 
     def test_mid_emits_single_token_row(self):
         lines = self._render_at(70)
-        token_lines = [s for _, s in lines if "tokens" in s and "7d" in s]
+        token_lines = [s for _, s in lines if "usage" in s and "wk" in s]
         self.assertEqual(len(token_lines), 1)
 
     def test_narrow_uses_short_token_labels(self):
         lines = self._render_at(50)
-        # Narrow drops `tokens` prefix for `tok` and uses s=/t=/w= shorts.
-        token_lines = [s for _, s in lines if "tok " in s and "w=" in s]
+        # Narrow drops `usage` prefix for `tok` and uses 5h=/wk= shorts.
+        token_lines = [s for _, s in lines if "tok " in s and "wk=" in s]
         self.assertEqual(len(token_lines), 1)
-        self.assertIn("s=", token_lines[0])
-        self.assertIn("t=", token_lines[0])
+        self.assertIn("5h=", token_lines[0])
 
     def test_no_residual_panel_header(self):
-        # Old panel emitted a bare " tokens" header row above the window
-        # lines. The new one-liner has `tokens` + `session`/`today`/`7d`
-        # all on the same row, so a lone ` tokens` header must not appear.
+        # The one-liner combines the `usage` label with `5h`/`wk` cells on
+        # the same row, so a lone ` usage` header must not appear.
         lines = self._render_at(120)
         stripped = [s.strip() for _, s in lines]
-        self.assertNotIn("tokens", stripped)
+        self.assertNotIn("usage", stripped)
 
 
 class TestRenderStatusLineTokenIndicator(unittest.TestCase):
-    """The compact `tok sess=… wk=…` indicator is appended to the main status
-    line so cumulative session + weekly spend is readable at a glance without
-    scanning the full token panel."""
+    """The compact `tok 5h=… wk=…` indicator is appended to the main status
+    line so rolling 5-hour and weekly spend is readable at a glance without
+    scanning the full token panel — same windows surfaced by the headline
+    cells on claude.ai/settings/usage."""
 
     def setUp(self):
         self.td = TemporaryDirectory()
@@ -516,19 +514,18 @@ class TestRenderStatusLineTokenIndicator(unittest.TestCase):
     def test_status_line_contains_compact_indicator(self):
         lines = self._render_once()
         joined = "\n".join(s for _, s in lines)
-        # Session (daemon not started → mirrors today) and 7d windows
-        # both include the only seeded item → totals match.
-        self.assertIn("tok sess=79.3k", joined)
+        # Both rolling windows include the only seeded item → totals match.
+        self.assertIn("tok 5h=79.3k", joined)
         self.assertIn("wk=79.3k", joined)
 
     def test_indicator_lives_on_status_line_not_panel(self):
-        # The panel row for "session" starts with " session" (leading space
-        # from _render_token_panel). The compact indicator must be on the
-        # *preceding* status line — i.e. the line with `pool=`.
+        # The panel row starts with " usage" (leading space from the
+        # renderer). The compact indicator must be on the *preceding*
+        # status line — i.e. the line with `pool=`.
         lines = self._render_once()
         status_lines = [s for _, s in lines if "pool=" in s]
         self.assertEqual(len(status_lines), 1)
-        self.assertIn("tok sess=", status_lines[0])
+        self.assertIn("tok 5h=", status_lines[0])
         self.assertIn("wk=", status_lines[0])
 
 

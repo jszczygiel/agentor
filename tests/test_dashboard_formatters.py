@@ -186,79 +186,67 @@ class _FakeAgentCfg:
 
 
 class TestFmtTokenRow(unittest.TestCase):
-    """The new one-line token readout replaces the old 4-row panel. Must
-    show session/today/7d totals in a single line, append `(NN%)` suffixes
-    when budgets set (session + 7d only; today has no budget knob), and
-    stay under 50 cols at the narrow tier."""
+    """The token readout mirrors claude.ai/settings/usage's two cells —
+    rolling 5-hour and rolling weekly windows — and leads with `NN%` when
+    the matching budget is configured."""
 
-    def test_wide_line_contains_three_windows_and_totals(self):
+    def test_wide_line_contains_5h_and_weekly_totals_no_budget(self):
         windows = {
-            "session": {"total": 0},
-            "today": {"total": 11_700_000},
-            "7d": {"total": 174_100_000},
+            "5h": {"total": 11_700_000},
+            "week": {"total": 174_100_000},
         }
         line = _fmt_token_row(windows)
-        self.assertIn("tokens", line)
-        self.assertIn("session 0", line)
-        self.assertIn("today 11.7M", line)
-        self.assertIn("7d 174.1M", line)
+        self.assertIn("usage", line)
+        self.assertIn("5h 11.7M", line)
+        self.assertIn("wk 174.1M", line)
+        self.assertNotIn("%", line)
 
     def test_missing_windows_render_zero(self):
         self.assertEqual(
             _fmt_token_row({}),
-            "tokens  session 0  today 0  7d 0",
+            "usage  5h 0  wk 0",
         )
 
     def test_wide_no_suffix_when_budgets_zero(self):
-        windows = {"session": {"total": 500_000},
-                   "today": {"total": 100_000},
-                   "7d": {"total": 5_000_000}}
+        windows = {"5h": {"total": 500_000},
+                   "week": {"total": 5_000_000}}
         cfg = _FakeAgentCfg()
         line = _fmt_token_row(windows, cfg)
         self.assertNotIn("%", line)
 
-    def test_wide_pct_suffix_when_budgets_set(self):
-        windows = {"session": {"total": 500_000},
-                   "today": {"total": 100_000},
-                   "7d": {"total": 5_000_000}}
+    def test_wide_pct_leads_when_budgets_set(self):
+        windows = {"5h": {"total": 500_000},
+                   "week": {"total": 5_000_000}}
         cfg = _FakeAgentCfg(
             session_token_budget=1_000_000,
             weekly_token_budget=10_000_000,
         )
         line = _fmt_token_row(windows, cfg)
-        self.assertIn("session 500.0k (50%)", line)
-        self.assertIn("7d 5.0M (50%)", line)
-        # today has no budget knob — never carries a suffix.
-        self.assertIn("today 100.0k  ", line)
+        # Percent leads each cell, raw counts follow in parens.
+        self.assertIn("5h 50% (500.0k / 1.0M)", line)
+        self.assertIn("wk 50% (5.0M / 10.0M)", line)
 
     def test_agent_cfg_none_behaves_like_unconfigured(self):
-        windows = {"session": {"total": 1500},
-                   "today": {"total": 900},
-                   "7d": {"total": 2_300_000}}
+        windows = {"5h": {"total": 1500},
+                   "week": {"total": 2_300_000}}
         line = _fmt_token_row(windows, None)
-        self.assertEqual(
-            line,
-            "tokens  session 1.5k  today 900  7d 2.3M",
-        )
+        self.assertEqual(line, "usage  5h 1.5k  wk 2.3M")
 
-    def test_narrow_uses_short_labels(self):
-        windows = {"session": {"total": 1500},
-                   "today": {"total": 900},
-                   "7d": {"total": 2_300_000}}
+    def test_narrow_uses_compact_pct_only(self):
+        windows = {"5h": {"total": 1500},
+                   "week": {"total": 2_300_000}}
         line = _fmt_token_row(windows, None, tier="narrow")
         self.assertIn("tok", line)
-        self.assertIn("s=1.5k", line)
-        self.assertIn("t=900", line)
-        self.assertIn("w=2.3M", line)
-        self.assertNotIn("session", line)
+        self.assertIn("5h=1.5k", line)
+        self.assertIn("wk=2.3M", line)
+        self.assertNotIn("usage", line)
 
     def test_narrow_fits_50_cols_with_m_scale_totals(self):
-        # M-scale everywhere plus session + weekly pct suffixes (the
-        # widest shape the formatter emits) must still fit a 50-col
-        # terminal with the leading space the renderer prepends.
-        windows = {"session": {"total": 174_100_000},
-                   "today": {"total": 11_700_000},
-                   "7d": {"total": 174_100_000}}
+        # M-scale totals plus 5h + weekly pct suffixes (the widest shape
+        # the narrow formatter emits) must still fit a 50-col terminal
+        # with the leading space the renderer prepends.
+        windows = {"5h": {"total": 174_100_000},
+                   "week": {"total": 174_100_000}}
         cfg = _FakeAgentCfg(
             session_token_budget=200_000_000,
             weekly_token_budget=200_000_000,
@@ -268,45 +256,44 @@ class TestFmtTokenRow(unittest.TestCase):
 
 
 class TestFmtTokenCompact(unittest.TestCase):
-    def test_session_and_weekly_totals(self):
+    def test_5h_and_weekly_totals(self):
         windows = {
-            "session": {"total": 1500},
-            "today": {"total": 900},
-            "7d": {"total": 2_300_000},
+            "5h": {"total": 1500},
+            "week": {"total": 2_300_000},
         }
         self.assertEqual(
             _fmt_token_compact(windows),
-            "tok sess=1.5k  wk=2.3M",
+            "tok 5h=1.5k  wk=2.3M",
         )
 
     def test_missing_windows_render_zero(self):
         self.assertEqual(
             _fmt_token_compact({}),
-            "tok sess=0  wk=0",
+            "tok 5h=0  wk=0",
         )
 
     def test_missing_total_key_renders_zero(self):
         # `total` may be absent if aggregate returned an empty dict for the
         # window; must not raise.
         self.assertEqual(
-            _fmt_token_compact({"session": {}, "7d": {}}),
-            "tok sess=0  wk=0",
+            _fmt_token_compact({"5h": {}, "week": {}}),
+            "tok 5h=0  wk=0",
         )
 
 
 class TestFmtTokenCompactPct(unittest.TestCase):
-    def test_no_suffix_when_budgets_zero(self):
-        windows = {"session": {"total": 1500}, "7d": {"total": 2_300_000}}
+    def test_no_pct_when_budgets_zero(self):
+        windows = {"5h": {"total": 1500}, "week": {"total": 2_300_000}}
         cfg = _FakeAgentCfg()
         self.assertEqual(
             _fmt_token_compact(windows, cfg),
-            "tok sess=1.5k  wk=2.3M",
+            "tok 5h=1.5k  wk=2.3M",
         )
 
-    def test_pct_suffix_when_budgets_set(self):
+    def test_pct_replaces_total_when_budgets_set(self):
         windows = {
-            "session": {"total": 500_000},
-            "7d": {"total": 5_000_000},
+            "5h": {"total": 500_000},
+            "week": {"total": 5_000_000},
         }
         cfg = _FakeAgentCfg(
             session_token_budget=1_000_000,
@@ -314,24 +301,24 @@ class TestFmtTokenCompactPct(unittest.TestCase):
         )
         self.assertEqual(
             _fmt_token_compact(windows, cfg),
-            "tok sess=500.0k (50%)  wk=5.0M (50%)",
+            "tok 5h=50%  wk=50%",
         )
 
     def test_zero_totals_render_zero_pct(self):
-        windows = {"session": {"total": 0}, "7d": {"total": 0}}
+        windows = {"5h": {"total": 0}, "week": {"total": 0}}
         cfg = _FakeAgentCfg(
             session_token_budget=1_000_000,
             weekly_token_budget=10_000_000,
         )
         self.assertEqual(
             _fmt_token_compact(windows, cfg),
-            "tok sess=0 (0%)  wk=0 (0%)",
+            "tok 5h=0%  wk=0%",
         )
 
     def test_overbudget_clamps_to_gt99(self):
         windows = {
-            "session": {"total": 2_000_000},
-            "7d": {"total": 20_000_000},
+            "5h": {"total": 2_000_000},
+            "week": {"total": 20_000_000},
         }
         cfg = _FakeAgentCfg(
             session_token_budget=1_000_000,
@@ -339,24 +326,24 @@ class TestFmtTokenCompactPct(unittest.TestCase):
         )
         self.assertEqual(
             _fmt_token_compact(windows, cfg),
-            "tok sess=2.0M (>99%)  wk=20.0M (>99%)",
+            "tok 5h=>99%  wk=>99%",
         )
 
     def test_only_session_budget_set(self):
         # Partial config: only one budget is honored, the other stays
-        # suffix-less so operators aren't forced to set both.
-        windows = {"session": {"total": 500_000}, "7d": {"total": 5_000_000}}
+        # raw-total so operators aren't forced to set both.
+        windows = {"5h": {"total": 500_000}, "week": {"total": 5_000_000}}
         cfg = _FakeAgentCfg(session_token_budget=1_000_000)
         self.assertEqual(
             _fmt_token_compact(windows, cfg),
-            "tok sess=500.0k (50%)  wk=5.0M",
+            "tok 5h=50%  wk=5.0M",
         )
 
     def test_agent_cfg_none_behaves_like_unconfigured(self):
-        windows = {"session": {"total": 1500}, "7d": {"total": 2_300_000}}
+        windows = {"5h": {"total": 1500}, "week": {"total": 2_300_000}}
         self.assertEqual(
             _fmt_token_compact(windows, None),
-            "tok sess=1.5k  wk=2.3M",
+            "tok 5h=1.5k  wk=2.3M",
         )
 
 
@@ -385,29 +372,35 @@ class TestTokenWindows(unittest.TestCase):
             (updated_at, item_id),
         )
 
-    def test_three_keys_present(self):
+    def test_two_keys_present(self):
         windows = _token_windows(self.store, daemon_started_at=0.0)
-        self.assertEqual(set(windows.keys()), {"session", "today", "7d"})
+        self.assertEqual(set(windows.keys()), {"5h", "week"})
 
-    def test_session_since_daemon_start(self):
+    def test_5h_window_excludes_older_rows(self):
         import time as _time
         now = _time.time()
-        self._seed_item("before", 99, updated_at=now - 60)
-        self._seed_item("after", 7, updated_at=now + 1)
+        # 6h ago is outside the 5h rolling window; 1h ago is inside.
+        self._seed_item("old", 99, updated_at=now - 6 * 3600)
+        self._seed_item("recent", 7, updated_at=now - 3600)
+        windows = _token_windows(self.store, daemon_started_at=0.0)
+        # Only "recent" rolls into the 5h window.
+        self.assertEqual(windows["5h"]["input"], 7)
+        # Both fall inside the 7-day window.
+        self.assertEqual(windows["week"]["input"], 106)
+
+    def test_windows_are_rolling_not_session_anchored(self):
+        # A non-zero daemon_started_at must not gate the 5h window —
+        # both windows are rolling against now() so the dashboard mirrors
+        # claude.ai/settings/usage's rolling-window semantics.
+        import time as _time
+        now = _time.time()
+        self._seed_item("a", 11, updated_at=now - 3600)
+        self._seed_item("b", 22, updated_at=now - 60)
+        # daemon_started_at=now would have hidden "a" under the old
+        # session-anchored windowing; under the new rolling 5h window
+        # both rows count.
         windows = _token_windows(self.store, daemon_started_at=now)
-        # session starts now → only "after" row counts.
-        self.assertEqual(windows["session"]["input"], 7)
-        # 7d spans both.
-        self.assertEqual(windows["7d"]["input"], 106)
-
-    def test_session_falls_back_to_today_when_not_started(self):
-        # daemon_started_at == 0 → session mirrors today so the panel is
-        # populated even when the Daemon.run() loop hasn't fired yet.
-        import time as _time
-        now = _time.time()
-        self._seed_item("a", 11, updated_at=now)
-        windows = _token_windows(self.store, daemon_started_at=0.0)
-        self.assertEqual(windows["session"], windows["today"])
+        self.assertEqual(windows["5h"]["input"], 33)
 
 
 class _FakeStore:
@@ -430,17 +423,17 @@ class TestTokenWindowsCache(unittest.TestCase):
     def tearDown(self):
         _token_windows_invalidate()
 
-    def test_first_call_delegates_three_times(self):
+    def test_first_call_delegates_twice(self):
         store = _FakeStore()
         _token_windows(store, daemon_started_at=0.0)
-        # One aggregate per window (session, today, 7d).
-        self.assertEqual(len(store.calls), 3)
+        # One aggregate per window (5h, week).
+        self.assertEqual(len(store.calls), 2)
 
     def test_second_call_within_ttl_is_cached(self):
         store = _FakeStore()
         first = _token_windows(store, daemon_started_at=0.0)
         second = _token_windows(store, daemon_started_at=0.0)
-        self.assertEqual(len(store.calls), 3)  # still 3, not 6
+        self.assertEqual(len(store.calls), 2)  # still 2, not 4
         # Same dict object returned — confirms the cache hit path.
         self.assertIs(first, second)
 
@@ -449,33 +442,43 @@ class TestTokenWindowsCache(unittest.TestCase):
         _token_windows(store, daemon_started_at=0.0)
         _token_windows_invalidate()
         _token_windows(store, daemon_started_at=0.0)
-        self.assertEqual(len(store.calls), 6)
+        self.assertEqual(len(store.calls), 4)
 
     def test_ttl_expiry_forces_recompute(self):
         store = _FakeStore()
         base = 1_000_000.0
         with mock.patch.object(formatters.time, "time", return_value=base):
             _token_windows(store, daemon_started_at=0.0)
-            self.assertEqual(len(store.calls), 3)
+            self.assertEqual(len(store.calls), 2)
         # Jump past the TTL window (2.0s).
         with mock.patch.object(formatters.time, "time", return_value=base + 5.0):
             _token_windows(store, daemon_started_at=0.0)
-        self.assertEqual(len(store.calls), 6)
+        self.assertEqual(len(store.calls), 4)
 
     def test_different_store_identity_busts_cache(self):
         store_a = _FakeStore()
         store_b = _FakeStore()
         _token_windows(store_a, daemon_started_at=0.0)
         _token_windows(store_b, daemon_started_at=0.0)
-        # Each store computed its own three aggregates.
-        self.assertEqual(len(store_a.calls), 3)
-        self.assertEqual(len(store_b.calls), 3)
+        # Each store computed its own two aggregates.
+        self.assertEqual(len(store_a.calls), 2)
+        self.assertEqual(len(store_b.calls), 2)
 
     def test_different_daemon_start_busts_cache(self):
         store = _FakeStore()
         _token_windows(store, daemon_started_at=0.0)
         _token_windows(store, daemon_started_at=123.0)
-        self.assertEqual(len(store.calls), 6)
+        self.assertEqual(len(store.calls), 4)
+
+    def test_5h_since_threshold_is_rolling(self):
+        store = _FakeStore()
+        base = 1_000_000.0
+        with mock.patch.object(formatters.time, "time", return_value=base):
+            _token_windows(store, daemon_started_at=0.0)
+        # Exactly two calls; first is 5h-since (now - 5*3600), second is
+        # week-since (now - 7*86400).
+        self.assertEqual(store.calls[0], base - 5 * 3600)
+        self.assertEqual(store.calls[1], base - 7 * 86400)
 
 
 if __name__ == "__main__":

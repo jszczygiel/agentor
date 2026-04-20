@@ -1,4 +1,3 @@
-import datetime
 import json
 import time
 
@@ -230,21 +229,14 @@ def _token_breakdown(item: StoredItem) -> list[dict]:
     return rows
 
 
-def _midnight_local_epoch(now: float | None = None) -> float:
-    """Epoch seconds of the most recent local-midnight boundary. Uses the
-    system tz (`astimezone()`), matching the backlog's "today (midnight-
-    local)" framing. Separate helper so tests can freeze the clock."""
-    ref = datetime.datetime.fromtimestamp(now if now is not None else time.time())
-    midnight = ref.replace(hour=0, minute=0, second=0, microsecond=0)
-    return midnight.timestamp()
-
-
 # `aggregate_token_usage` does a full-table scan over `items.result_json` and
-# Python-side JSON-decodes every blob, so calling it three times per 500ms
-# render tick was O(completed_items) per tick — the exact pattern flagged by
-# the dashboard-hang gotcha in CLAUDE.md. A 2s TTL keeps cumulative totals
+# Python-side JSON-decodes every blob, so calling it twice per 500ms render
+# tick was O(completed_items) per tick — the exact pattern flagged by the
+# dashboard-hang gotcha in CLAUDE.md. A 2s TTL keeps cumulative totals
 # imperceptibly stale while dropping repeat ticks to O(1).
 _TOKEN_CACHE_TTL_S = 2.0
+_TOKEN_5H_SECONDS = 5 * 3600
+_TOKEN_WEEK_SECONDS = 7 * 24 * 3600
 _token_cache: dict = {"key": None, "computed_at": 0.0, "value": None}
 
 
@@ -257,15 +249,16 @@ def _token_windows_invalidate() -> None:
 
 
 def _token_windows(store: Store, daemon_started_at: float) -> dict[str, dict]:
-    """Compute session / today / 7d token totals in one pass.
+    """Compute rolling 5-hour and weekly token totals in one pass — the same
+    two windows that `claude.ai/settings/usage` headlines.
 
-    `daemon_started_at == 0` means the daemon has not entered its main loop
-    yet (e.g. tests); the "session" view then mirrors the "today" view so the
-    panel stays populated instead of showing a confusing 0.
+    `daemon_started_at` is retained in the cache key (so swapping daemons
+    busts cached aggregates) but no longer affects the windowing — both
+    windows are rolling against `now()` so the dashboard mirrors what the
+    operator sees on the Anthropic usage page.
 
-    Result is cached for `_TOKEN_CACHE_TTL_S` seconds keyed on
-    `daemon_started_at` so the 500ms render loop doesn't re-aggregate the
-    whole items table every tick.
+    Result is cached for `_TOKEN_CACHE_TTL_S` seconds so the 500ms render
+    loop doesn't re-aggregate the whole items table every tick.
     """
     now = time.time()
     # Key includes id(store) so swapping the backing Store (notably between
@@ -277,13 +270,9 @@ def _token_windows(store: Store, daemon_started_at: float) -> dict[str, dict]:
             and _token_cache["key"] == key
             and now - _token_cache["computed_at"] < _TOKEN_CACHE_TTL_S):
         return cached  # type: ignore[return-value]
-    session_since: float | None = daemon_started_at or None
-    today_since = _midnight_local_epoch(now)
-    week_since = now - 7 * 24 * 3600
     result = {
-        "session": store.aggregate_token_usage(since=session_since),
-        "today": store.aggregate_token_usage(since=today_since),
-        "7d": store.aggregate_token_usage(since=week_since),
+        "5h": store.aggregate_token_usage(since=now - _TOKEN_5H_SECONDS),
+        "week": store.aggregate_token_usage(since=now - _TOKEN_WEEK_SECONDS),
     }
     _token_cache["key"] = key
     _token_cache["computed_at"] = now
@@ -291,62 +280,78 @@ def _token_windows(store: Store, daemon_started_at: float) -> dict[str, dict]:
     return result
 
 
-def _fmt_pct_of_budget(total: int, budget: int) -> str:
-    """Render `(NN%)` suffix for the status-line rate-limit readout.
-    Empty when budget is 0 (operator hasn't configured one). Clamps at
-    `>99%` so a busted budget doesn't spam 4-digit percentages into the
-    status line."""
+def _pct_of_budget(total: int, budget: int) -> int | None:
+    """Integer percent of `total / budget`, clamped at 100. Returns None when
+    no budget configured so callers can switch to a raw-total fallback."""
     if budget <= 0:
-        return ""
+        return None
     pct = int(total * 100 / budget)
+    return min(pct, 100)
+
+
+def _fmt_pct_of_budget(total: int, budget: int) -> str:
+    """`(NN%)` suffix for legacy callers. Empty when budget is 0; clamps at
+    `>99%` so a busted budget doesn't spam 4-digit percentages."""
+    pct = _pct_of_budget(total, budget)
+    if pct is None:
+        return ""
     if pct > 99:
         return " (>99%)"
     return f" ({pct}%)"
 
 
+def _fmt_pct_cell(total: int, budget: int, *, compact: bool = False) -> str:
+    """Render one usage cell in the same idiom as claude.ai/settings/usage:
+    the percentage leads when a budget is configured, with the raw counts in
+    parentheses for context. Falls back to a bare token total when no budget
+    is configured so operators without a configured cap still see activity.
+
+    `compact=True` drops the parenthesised raw counts (used by the status-
+    line glance, where the panel row already carries the full breakdown)."""
+    pct = _pct_of_budget(total, budget)
+    if pct is None:
+        return _fmt_tokens(total)
+    pct_str = ">99%" if pct > 99 else f"{pct}%"
+    if compact:
+        return pct_str
+    return f"{pct_str} ({_fmt_tokens(total)} / {_fmt_tokens(budget)})"
+
+
 def _fmt_token_compact(windows: dict, agent_cfg=None) -> str:
-    """One-glance session + weekly totals for the status line. Full breakdown
-    stays in the token panel; this is the at-a-glance "am I burning tokens
-    faster than last week?" readout. When `agent_cfg` supplies non-zero
-    `session_token_budget` / `weekly_token_budget`, append a `(NN%)` suffix
-    so operators can eyeball their proximity to throttling. Claude's stream-
-    json feed strips the `anthropic-ratelimit-*` response headers today, so
-    the % is budget-derived; if the CLI later surfaces live quotas, the
-    harvester in `_StreamState` already captures them for a future upgrade."""
-    sess = int(windows.get("session", {}).get("total", 0))
-    wk = int(windows.get("7d", {}).get("total", 0))
-    sess_pct = _fmt_pct_of_budget(
-        sess, getattr(agent_cfg, "session_token_budget", 0) or 0)
-    wk_pct = _fmt_pct_of_budget(
-        wk, getattr(agent_cfg, "weekly_token_budget", 0) or 0)
-    return (f"tok sess={_fmt_tokens(sess)}{sess_pct}  "
-            f"wk={_fmt_tokens(wk)}{wk_pct}")
+    """One-glance 5h + weekly readout for the status line. Mirrors the two
+    cells claude.ai/settings/usage headlines: rolling 5-hour and rolling
+    weekly windows, leading with `NN%` when budgets are configured.
+
+    When `agent_cfg` supplies non-zero `session_token_budget` /
+    `weekly_token_budget`, the cells render as percentages (matching the
+    Anthropic usage page); otherwise the cell falls back to the raw token
+    total so operators without a configured cap still see activity."""
+    five_h = int(windows.get("5h", {}).get("total", 0))
+    wk = int(windows.get("week", {}).get("total", 0))
+    five_h_budget = getattr(agent_cfg, "session_token_budget", 0) or 0
+    wk_budget = getattr(agent_cfg, "weekly_token_budget", 0) or 0
+    return (f"tok 5h={_fmt_pct_cell(five_h, five_h_budget, compact=True)}  "
+            f"wk={_fmt_pct_cell(wk, wk_budget, compact=True)}")
 
 
 def _fmt_token_row(windows: dict, agent_cfg=None, tier: str = "wide") -> str:
-    """One-line token readout replacing the old 4-row token panel. Shows
-    cumulative totals for session / today / 7d, with optional `(NN%)`
-    budget suffixes on the session and 7d cells when `agent_cfg` supplies
-    non-zero `session_token_budget` / `weekly_token_budget`. `today` has
-    no budget knob so never carries a suffix.
+    """One-line token readout mirroring claude.ai/settings/usage's two
+    cells: rolling 5-hour and rolling weekly windows. Each cell leads with
+    `NN%` when the matching budget is configured, with `(used / budget)`
+    appended for context. Without a budget the cell falls back to the raw
+    token total so operators without a configured cap still see activity.
 
-    Narrow tier (<60 col) shortens labels to `tok s=… t=… w=…` so three
-    M-scale numbers plus percent suffixes fit under 50 chars.
-    """
-    sess = int(windows.get("session", {}).get("total", 0))
-    today = int(windows.get("today", {}).get("total", 0))
-    wk = int(windows.get("7d", {}).get("total", 0))
-    sess_pct = _fmt_pct_of_budget(
-        sess, getattr(agent_cfg, "session_token_budget", 0) or 0)
-    wk_pct = _fmt_pct_of_budget(
-        wk, getattr(agent_cfg, "weekly_token_budget", 0) or 0)
+    Narrow tier (<60 col) drops the parenthesised raw counts so the row
+    fits under 50 chars even with M-scale totals."""
+    five_h = int(windows.get("5h", {}).get("total", 0))
+    wk = int(windows.get("week", {}).get("total", 0))
+    five_h_budget = getattr(agent_cfg, "session_token_budget", 0) or 0
+    wk_budget = getattr(agent_cfg, "weekly_token_budget", 0) or 0
     if tier == "narrow":
-        return (f"tok s={_fmt_tokens(sess)}{sess_pct}  "
-                f"t={_fmt_tokens(today)}  "
-                f"w={_fmt_tokens(wk)}{wk_pct}")
-    return (f"tokens  session {_fmt_tokens(sess)}{sess_pct}  "
-            f"today {_fmt_tokens(today)}  "
-            f"7d {_fmt_tokens(wk)}{wk_pct}")
+        return (f"tok 5h={_fmt_pct_cell(five_h, five_h_budget, compact=True)}  "
+                f"wk={_fmt_pct_cell(wk, wk_budget, compact=True)}")
+    return (f"usage  5h {_fmt_pct_cell(five_h, five_h_budget)}  "
+            f"wk {_fmt_pct_cell(wk, wk_budget)}")
 
 
 def _build_commit_message(item: StoredItem) -> str:
