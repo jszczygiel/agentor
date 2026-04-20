@@ -5,6 +5,7 @@ import threading
 import time
 from typing import Callable
 
+from ..capabilities import ProviderCapabilities, capabilities_for
 from ..models import ItemStatus
 from ..store import StoredItem
 
@@ -216,9 +217,16 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     body_height = h - body_top - 1  # leave 1 line for log
     _filter_name_cur, filter_statuses = FILTERS[filter_idx]
     statuses = filter_statuses if filter_statuses is not None else list(ItemStatus)
+    # Resolve provider capability once for this render pass so every row
+    # in `_render_table` consults the same value; `capabilities_for` is a
+    # dict lookup but hoisted out of the per-row loop to keep the 500ms
+    # refresh cycle cheap (see CLAUDE.md: "Dashboard hot paths must not
+    # do O(file) or O(history) work per tick").
+    caps = capabilities_for(cfg.agent.runner)
     rendered = _render_table(
         stdscr, store, body_top, body_height, w, statuses,
         cfg.agent.context_window, selected_id,
+        caps=caps,
     )
 
     # log tail
@@ -417,10 +425,16 @@ def _handle_resize(stdscr, ch: int) -> bool:
 def _render_table(
     stdscr, store, top, height, w, statuses, context_window,
     selected_id: str | None = None,
+    caps: ProviderCapabilities | None = None,
 ) -> list[StoredItem]:
     """Draw the main table and return the items in display order so the
     caller can drive arrow-key navigation. The row matching `selected_id`
-    is highlighted; the viewport auto-scrolls to keep it visible."""
+    is highlighted; the viewport auto-scrolls to keep it visible.
+
+    `caps` gates provider-dependent columns (e.g. `_ctx_fill_pct` returns
+    `—` when `reports_context_window` is False). Default None preserves
+    existing callers (tests) who get the claude-like default behaviour
+    via `_ctx_fill_pct`'s own default."""
     if height <= 0:
         return []
     tier = _layout_tier(w)
@@ -470,7 +484,10 @@ def _render_table(
         has_err = bool(it.last_error)
         elapsed = _elapsed_for(store, it.id) if st == ItemStatus.WORKING else None
         elapsed_s = _fmt_elapsed(elapsed) if elapsed is not None else "—"
-        ctx_s = _ctx_fill_pct(it, context_window)
+        ctx_s = (
+            _ctx_fill_pct(it, context_window, caps) if caps is not None
+            else _ctx_fill_pct(it, context_window)
+        )
         # Short-circuit: only QUEUED rows pay the transition-history scan.
         # Lazy import — modes depends on render-less pieces; importing at
         # module top would flip the layering (render → modes is fine;

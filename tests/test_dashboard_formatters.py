@@ -130,6 +130,29 @@ class TestCtxFillPct(unittest.TestCase):
             "—",
         )
 
+    def test_codex_caps_short_circuits_to_emdash(self):
+        """`_ctx_fill_pct` gates on `caps.reports_context_window`. With
+        `CODEX_CAPS` the result is always `—` regardless of iteration
+        data — proves the capability flag is the authoritative gate,
+        not the empty-modelUsage path that happened to give the same
+        answer before. A non-zero `fallback_window` and populated
+        iterations prove no fallback path leaks through."""
+        from agentor.capabilities import CLAUDE_CAPS, CODEX_CAPS
+
+        payload = {
+            "modelUsage": {},
+            "iterations": [
+                {"input_tokens": 50_000, "cache_read_input_tokens": 50_000},
+            ],
+        }
+        item = _item(json.dumps(payload))
+
+        # Codex cap → short-circuit even though iterations would compute.
+        self.assertEqual(_ctx_fill_pct(item, 200_000, CODEX_CAPS), "—")
+        # Claude cap → existing behaviour computes a % from the last
+        # iteration against the fallback window (100k / 200k = 50%).
+        self.assertEqual(_ctx_fill_pct(item, 200_000, CLAUDE_CAPS), "50%")
+
 
 class TestTokenBreakdown(unittest.TestCase):
     def test_empty_when_no_data(self):

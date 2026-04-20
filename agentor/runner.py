@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 from . import git_ops
+from .capabilities import (
+    CLAUDE_CAPS,
+    CODEX_CAPS,
+    STUB_CAPS,
+    ProviderCapabilities,
+)
 from .checkpoint import CheckpointConfig, CheckpointEmitter
 from .config import _ALIAS_TO_MODEL, AgentConfig, Config
 from .models import ItemStatus
@@ -366,6 +372,8 @@ def plan_worktree(
 class Runner:
     """Base runner interface. Subclasses implement `do_work`."""
 
+    capabilities: ProviderCapabilities = STUB_CAPS
+
     def __init__(self, config: Config, store: Store):
         self.config = config
         self.store = store
@@ -638,6 +646,8 @@ class StubRunner(Runner):
     compliance-passing per-run findings log under `docs/agent-logs/`.
     Proves the pipeline end-to-end without spawning Claude."""
 
+    capabilities: ProviderCapabilities = STUB_CAPS
+
     def do_work(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
         note_path = worktree / f".agentor-note-{item.id[:8]}.md"
         note_path.write_text(
@@ -838,6 +848,8 @@ class ClaudeRunner(Runner):
     2) execute — on approval the item returns to QUEUED, gets re-claimed, and
        resumes the same claude session to implement and commit.
     """
+
+    capabilities: ProviderCapabilities = CLAUDE_CAPS
 
     def do_work(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
         prior = _parse_result_json(item.result_json)
@@ -1109,9 +1121,21 @@ class ClaudeRunner(Runner):
         )
         emitter = None if ckpt_cfg.all_disabled() else CheckpointEmitter(ckpt_cfg)
 
+        # Mid-run injection is gated on BOTH the provider capability
+        # declaration AND the environmental preconditions (streaming
+        # stdin available = non-legacy prompt path). The capability
+        # flag is the declarative source of truth per
+        # `ProviderCapabilities.supports_mid_run_injection`; the
+        # `stdin_prompt is not None` check preserves the legacy-prompt
+        # opt-out (`{prompt}` argv placeholder → no stdin pipe to
+        # write into).
+        allow_injection = (
+            self.capabilities.supports_mid_run_injection
+            and stdin_prompt is not None
+        )
         stdin_holder: ChildStdinHolder | None = None
         stdin_payload: str | None = None
-        if stdin_prompt is not None:
+        if allow_injection:
             stdin_holder = ChildStdinHolder()
             stdin_payload = _claude_initial_stdin_payload(stdin_prompt)
 
@@ -1127,7 +1151,7 @@ class ClaudeRunner(Runner):
                     _write_checkpoint_marker(
                         transcript_path, state.num_turns,
                         state.total_output_tokens, nudge,
-                        injected=stdin_holder is not None,
+                        injected=allow_injection,
                     )
                     if stdin_holder is not None:
                         line = json.dumps({
@@ -1198,6 +1222,8 @@ class CodexRunner(Runner):
     """Spawns a headless `codex exec` subprocess inside the worktree. Keeps
     the same two-phase flow as Claude by persisting the `thread_id` emitted
     by Codex and resuming it during execution."""
+
+    capabilities: ProviderCapabilities = CODEX_CAPS
 
     def do_work(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
         prior = _parse_result_json(item.result_json)
@@ -1403,7 +1429,7 @@ class CodexRunner(Runner):
                 for nudge in emitter.observe(state.num_turns, 0):
                     _write_checkpoint_marker(
                         transcript_path, state.num_turns, 0, nudge,
-                        injected=False,
+                        injected=self.capabilities.supports_mid_run_injection,
                     )
             return None
 
