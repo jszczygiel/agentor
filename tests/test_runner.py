@@ -2070,6 +2070,43 @@ sleep 3
         self.assertEqual([e["type"] for e in events], ["first", "second"])
         self.assertEqual(events[1]["line"], "nudge-payload")
 
+    def test_transcript_flushed_before_event_callback(self):
+        # Regression guard: the hot loop holds the transcript open and must
+        # flush each line to disk BEFORE calling on_event, so live-tail
+        # consumers (dashboard/transcript.py::iter_events) see events as they
+        # happen rather than only after the subprocess exits.
+        from agentor.runner import _run_stream_json_subprocess
+
+        cli = self._fake_cli(
+            'printf \'{"type":"first"}\\n\'\n'
+            'sleep 0.2\n'
+            'printf \'{"type":"second"}\\n\'\n'
+        )
+        seen_on_disk: list[str] = []
+
+        def on_event(ev: dict) -> None:
+            seen_on_disk.append(self.transcript.read_text())
+            return None
+
+        _run_stream_json_subprocess(
+            args=[str(cli)],
+            cwd=self.root,
+            timeout_seconds=5,
+            transcript_path=self.transcript,
+            proc_registry=None,
+            item_key="k",
+            fnfe_hint="missing",
+            on_event=on_event,
+        )
+        self.assertEqual(len(seen_on_disk), 2)
+        # When the first event's callback fires, the first JSON line is
+        # already on disk but the second hasn't been emitted yet.
+        self.assertIn('"type":"first"', seen_on_disk[0])
+        self.assertNotIn('"type":"second"', seen_on_disk[0])
+        # By the second callback, both lines are visible on disk.
+        self.assertIn('"type":"first"', seen_on_disk[1])
+        self.assertIn('"type":"second"', seen_on_disk[1])
+
 
 class TestClaudeRunnerCheckpointInjection(unittest.TestCase):
     """Drive `_invoke_claude_streaming` with a stubbed stream-json helper
@@ -3572,6 +3609,140 @@ class TestPlanPromptIncludesExecuteTierSection(unittest.TestCase):
         cfg = AgentConfig()
         self.assertIn("## Execute tier", cfg.plan_prompt_template)
         self.assertIn("suggested_model:", cfg.plan_prompt_template)
+
+
+class TestPublishLiveThrottle(unittest.TestCase):
+    """`_publish_live` must coalesce result_json UPDATEs to ≤1/sec during
+    rapid streaming, but a terminal event (Claude `result` / explicit
+    `final=True`) must force a final write so the last envelope lands."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.root = Path(self.td.name) / "proj"
+        self.root.mkdir()
+        _init_project(self.root)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        self.addCleanup(self.store.conn.close)
+
+    def _make_claude_runner(self) -> ClaudeRunner:
+        cfg = Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(runner="claude", pool_size=1),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        return ClaudeRunner(cfg, self.store)
+
+    def _make_codex_runner(self) -> CodexRunner:
+        cfg = Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(runner="codex", pool_size=1),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        return CodexRunner(cfg, self.store)
+
+    def _seed_item(self) -> str:
+        (self.root / "backlog.md").write_text("- [ ] rapid events\n")
+        cfg = _mk_config(self.root)
+        scan_once(cfg, self.store)
+        return self.store.list_by_status(ItemStatus.QUEUED)[0].id
+
+    def test_claude_publish_throttled_between_wall_clock_seconds(self):
+        from agentor.runner import _StreamState
+        runner = self._make_claude_runner()
+        item_id = self._seed_item()
+        state = _StreamState(item_id=item_id, phase="execute")
+        writes: list[str] = []
+        def record(iid: str, blob: str) -> None:
+            writes.append(blob)
+        runner.store.update_result_json = record  # type: ignore[method-assign]
+
+        fake_ns = [1_000_000_000]
+        with patch("agentor.runner.time.monotonic_ns",
+                   side_effect=lambda: fake_ns[0]):
+            # First publish lands (cursor was 0, interval satisfied).
+            runner._publish_live(item_id, state)
+            # 100ms later — throttled.
+            fake_ns[0] += 100_000_000
+            runner._publish_live(item_id, state)
+            # 500ms after the write — still throttled.
+            fake_ns[0] += 400_000_000
+            runner._publish_live(item_id, state)
+            # 1.1s after the write — passes the guard.
+            fake_ns[0] += 700_000_000
+            runner._publish_live(item_id, state)
+        self.assertEqual(len(writes), 2)
+
+    def test_claude_publish_final_bypasses_throttle(self):
+        from agentor.runner import _StreamState
+        runner = self._make_claude_runner()
+        item_id = self._seed_item()
+        state = _StreamState(item_id=item_id, phase="execute")
+        writes: list[str] = []
+        runner.store.update_result_json = (  # type: ignore[method-assign]
+            lambda iid, blob: writes.append(blob)
+        )
+        fake_ns = [5_000_000_000]
+        with patch("agentor.runner.time.monotonic_ns",
+                   side_effect=lambda: fake_ns[0]):
+            runner._publish_live(item_id, state)  # 1st write
+            fake_ns[0] += 50_000_000
+            runner._publish_live(item_id, state)  # throttled
+            fake_ns[0] += 10_000_000
+            runner._publish_live(item_id, state, final=True)  # forced
+        self.assertEqual(len(writes), 2)
+
+    def test_codex_publish_throttled_between_wall_clock_seconds(self):
+        from agentor.runner import _CodexStreamState
+        runner = self._make_codex_runner()
+        item_id = self._seed_item()
+        state = _CodexStreamState(item_id=item_id, phase="execute")
+        writes: list[str] = []
+        runner.store.update_result_json = (  # type: ignore[method-assign]
+            lambda iid, blob: writes.append(blob)
+        )
+        fake_ns = [2_000_000_000]
+        with patch("agentor.runner.time.monotonic_ns",
+                   side_effect=lambda: fake_ns[0]):
+            runner._publish_live(item_id, state)          # write
+            fake_ns[0] += 200_000_000
+            runner._publish_live(item_id, state)          # throttled
+            fake_ns[0] += 900_000_000
+            runner._publish_live(item_id, state)          # write (>1s since)
+            fake_ns[0] += 10_000_000
+            runner._publish_live(item_id, state, final=True)  # forced
+        self.assertEqual(len(writes), 3)
+
+    def test_publish_updates_cursor_so_next_window_opens(self):
+        """After a successful publish, the throttle cursor advances to the
+        write time — not the call time — so a throttled call that was
+        suppressed doesn't re-open the window early."""
+        from agentor.runner import _StreamState
+        runner = self._make_claude_runner()
+        item_id = self._seed_item()
+        state = _StreamState(item_id=item_id, phase="execute")
+        writes: list[str] = []
+        runner.store.update_result_json = (  # type: ignore[method-assign]
+            lambda iid, blob: writes.append(blob)
+        )
+        fake_ns = [7_000_000_000]
+        with patch("agentor.runner.time.monotonic_ns",
+                   side_effect=lambda: fake_ns[0]):
+            runner._publish_live(item_id, state)          # write at t=7s
+            for _ in range(20):
+                fake_ns[0] += 40_000_000                  # 800ms of rapid calls
+                runner._publish_live(item_id, state)
+            # Cursor at t=7s, now t≈7.8s: still <1s elapsed, still suppressed.
+            self.assertEqual(len(writes), 1)
+            fake_ns[0] += 300_000_000                     # cross 1s threshold
+            runner._publish_live(item_id, state)
+        self.assertEqual(len(writes), 2)
 
 
 if __name__ == "__main__":

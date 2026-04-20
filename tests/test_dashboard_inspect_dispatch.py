@@ -720,11 +720,12 @@ class _KeyFeedStdscr:
 
 
 def _fake_cfg(project_root: Path) -> SimpleNamespace:
-    """Minimal Config stub — `_build_detail_lines` only reads
-    `cfg.project_root` (for transcript path) and `cfg.agent.max_attempts`."""
+    """Minimal Config stub — `_build_detail_lines` reads
+    `cfg.project_root` (transcript path), `cfg.agent.max_attempts`, and
+    `cfg.agent.runner` (via `_session_activity` → `detect_provider`)."""
     return SimpleNamespace(
         project_root=project_root,
-        agent=SimpleNamespace(max_attempts=3),
+        agent=SimpleNamespace(max_attempts=3, runner="stub"),
     )
 
 

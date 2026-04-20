@@ -24,11 +24,15 @@ from .checkpoint import CheckpointConfig, CheckpointEmitter
 from .config import AgentConfig, Config
 from .models import ItemStatus
 from .providers import Provider, make_provider
-from .resume_primer import build_primer
 from .slug import slugify
 from .store import Store, StoredItem
 
 T = TypeVar("T")
+
+# _publish_live coalesces result_json writes during streaming: dashboard polls
+# at 500ms, SQLite UPDATE per event is wasted I/O. Terminal events bypass the
+# guard so the final envelope always lands.
+_PUBLISH_INTERVAL_NS = 1_000_000_000
 
 
 class ChildStdinHolder:
@@ -772,11 +776,17 @@ def _run_stream_json_subprocess(
     # the file once before the first attempt.
     with transcript_path.open("a") as fh:
         fh.write(f"args: {args}\n\nstdout:\n")
+    # Hold the transcript open for the duration of the read loop so the hot
+    # path is write+flush per event rather than open+fstat+write+close. Flush
+    # preserves the live-tail guarantee that
+    # `dashboard/transcript.py::iter_events` relies on.
+    transcript_fh = None
     try:
+        transcript_fh = transcript_path.open("a")
         for line in iter(p.stdout.readline, ""):
             stdout_buf.append(line)
-            with transcript_path.open("a") as fh:
-                fh.write(line)
+            transcript_fh.write(line)
+            transcript_fh.flush()
             stripped = line.strip()
             if stripped:
                 try:
@@ -800,6 +810,11 @@ def _run_stream_json_subprocess(
             proc_registry.unregister(item_key)
         if stdin_holder is not None:
             stdin_holder.close()
+        if transcript_fh is not None:
+            try:
+                transcript_fh.close()
+            except Exception:
+                pass
         try:
             p.stdout.close()
         except Exception:
@@ -914,7 +929,9 @@ class ClaudeRunner(Runner):
         # worst observed case. Summarise the prior tool activity and
         # prepend it so the agent knows what not to re-fetch. The subprocess
         # will overwrite this log on start, so we read it before launching.
-        primer = build_primer(self._execute_transcript_path(item))
+        primer = self.provider.build_primer(
+            self._execute_transcript_path(item)
+        )
         if primer:
             prompt = f"{primer}\n{prompt}"
         prompt = self._prepend_feedback(item, prompt, phase="execute")
@@ -1147,7 +1164,9 @@ class ClaudeRunner(Runner):
         def on_event(ev: dict) -> str | None:
             state.ingest(ev)
             if ev.get("type") in ("assistant", "result"):
-                self._publish_live(item.id, state)
+                self._publish_live(
+                    item.id, state, final=ev.get("type") == "result",
+                )
             if emitter is not None and ev.get("type") == "assistant":
                 nudges = emitter.observe(
                     state.num_turns, state.total_output_tokens,
@@ -1208,9 +1227,14 @@ class ClaudeRunner(Runner):
         summary = _derive_summary(worktree, stdout_text, item.title)
         return summary, stdout_text
 
-    def _publish_live(self, item_id: str, state: "_StreamState") -> None:
+    def _publish_live(
+        self, item_id: str, state: "_StreamState", *, final: bool = False,
+    ) -> None:
         """Write the current partial envelope to result_json so the dashboard
         can show live CTX% / tokens without waiting for exit."""
+        now_ns = time.monotonic_ns()
+        if not final and now_ns - state.last_publish_ns < _PUBLISH_INTERVAL_NS:
+            return
         try:
             blob = json.dumps({
                 "phase": state.phase,
@@ -1218,6 +1242,7 @@ class ClaudeRunner(Runner):
                 **state.envelope(),
             })
             self.store.update_result_json(item_id, blob)
+            state.last_publish_ns = now_ns
         except Exception:
             # A publish failure shouldn't crash the run. Dashboard just
             # stays on the previous snapshot.
@@ -1467,10 +1492,19 @@ class CodexRunner(Runner):
             tail = (stderr_text or stdout_text)[-500:].strip()
             raise RuntimeError(f"codex exited {returncode}: {tail}")
         result_text = _read_output_message(output_path) or _extract_codex_result(stdout_text)
+        # Flush the final envelope past the throttle — codex JSONL has no
+        # single canonical terminal event to gate on in `on_event`, so do it
+        # here after the subprocess drains.
+        self._publish_live(item_ref[0].id, state, final=True)
         self._last_usage = state.envelope(result_text=result_text)
         return result_text or "", stdout_text
 
-    def _publish_live(self, item_id: str, state: "_CodexStreamState") -> None:
+    def _publish_live(
+        self, item_id: str, state: "_CodexStreamState", *, final: bool = False,
+    ) -> None:
+        now_ns = time.monotonic_ns()
+        if not final and now_ns - state.last_publish_ns < _PUBLISH_INTERVAL_NS:
+            return
         try:
             blob = json.dumps({
                 "phase": state.phase,
@@ -1478,6 +1512,7 @@ class CodexRunner(Runner):
                 **state.envelope(),
             })
             self.store.update_result_json(item_id, blob)
+            state.last_publish_ns = now_ns
         except Exception:
             pass
 
@@ -1500,6 +1535,8 @@ class _StreamState:
         self.stop_reason: str | None = None
         self.duration_ms: int | None = None
         self.duration_api_ms: int | None = None
+        # Throttle cursor for _publish_live (coalesces SQLite writes).
+        self.last_publish_ns: int = 0
         # modelUsage is keyed by model id, mirroring claude's final envelope.
         # Used for token accounting and context-window detection, not cost.
         self.model_usage: dict[str, dict] = {}
@@ -1647,6 +1684,8 @@ class _CodexStreamState:
         self.num_turns: int = 0
         self.result_text: str | None = None
         self.last_error: str | None = None
+        # Throttle cursor for _publish_live (coalesces SQLite writes).
+        self.last_publish_ns: int = 0
 
     def ingest(self, ev: dict) -> None:
         etype = ev.get("type")

@@ -82,16 +82,20 @@ def iter_raw_events(
     end mid-write, so robust-by-default tolerance matters.
 
     When `tail_bytes` is set, only the final N bytes are read and the first
-    (likely-partial) line in that slice is dropped. Callers that only need
-    a recent-activity view (dashboard inspect) use this to avoid paying
+    (likely-partial) line in that slice is dropped — but only when the
+    read actually seeked past the file start. Callers that only need a
+    recent-activity view (dashboard inspect) use this to avoid paying
     O(file-size) on every render tick for transcripts that can grow into
-    the tens of megabytes during long agent runs."""
+    the tens of megabytes during long agent runs. Small files where the
+    tail fits entirely keep their first line so a provider whose
+    transcript has no leading header row (Codex JSONL) doesn't silently
+    lose its first event."""
     try:
-        raw = _read_maybe_tail(path, tail_bytes)
+        raw, seeked = _read_maybe_tail(path, tail_bytes)
     except FileNotFoundError:
         return
     lines = raw.splitlines()
-    if tail_bytes is not None and lines:
+    if seeked and lines:
         # First line is almost certainly truncated by the seek boundary;
         # drop it so we never feed a half-object to json.loads.
         lines = lines[1:]
@@ -107,18 +111,24 @@ def iter_raw_events(
             yield ev
 
 
-def _read_maybe_tail(path: Path, tail_bytes: int | None) -> str:
+def _read_maybe_tail(
+    path: Path, tail_bytes: int | None,
+) -> tuple[str, bool]:
+    """Read the file; return (text, seeked). `seeked=True` means the read
+    started past byte 0 so the first emitted line may be partial."""
     if tail_bytes is None:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return path.read_text(encoding="utf-8", errors="replace"), False
     with path.open("rb") as fh:
         fh.seek(0, 2)
         size = fh.tell()
         if size <= tail_bytes:
             fh.seek(0)
+            seeked = False
         else:
             fh.seek(size - tail_bytes)
+            seeked = True
         data = fh.read()
-    return data.decode("utf-8", errors="replace")
+    return data.decode("utf-8", errors="replace"), seeked
 
 
 def tool_result_text(content: object) -> str:

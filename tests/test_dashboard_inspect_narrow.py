@@ -12,16 +12,24 @@ from agentor.models import ItemStatus
 from agentor.store import Store, StoredItem
 
 
+_mk_item_counter = 0
+
+
 def _mk_item(
     result: dict, status: ItemStatus = ItemStatus.WORKING,
     last_error: str | None = None,
 ) -> StoredItem:
+    # Each call gets a unique `updated_at` so the `_result_data` cache
+    # (keyed on `(id, updated_at)`) can't return a prior test's payload.
+    global _mk_item_counter
+    _mk_item_counter += 1
     return StoredItem(
         id="abc12345", title="t", body="", source_file="s.md",
         source_line=1, tags={}, status=status,
         worktree_path=None, branch=None, attempts=0, last_error=last_error,
         feedback=None, result_json=json.dumps(result), agent_ref=None,
-        agentor_version=None, priority=0, created_at=0.0, updated_at=0.0,
+        agentor_version=None, priority=0, created_at=0.0,
+        updated_at=float(_mk_item_counter),
     )
 
 
