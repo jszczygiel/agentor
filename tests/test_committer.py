@@ -412,6 +412,100 @@ class TestRetryMerge(unittest.TestCase):
         self.assertTrue(data.get("plan"))
 
 
+class TestResubmitConflictedFeedback(unittest.TestCase):
+    """`resubmit_conflicted` picks its feedback template by cause:
+    `last_error="agent-log missing"` (the `require_agent_log` gate)
+    gets a log-generation prompt; anything else gets the merge-conflict
+    prompt. Runner's `_prepend_feedback` concatenates this verbatim into
+    the next prompt, so the exact wording matters."""
+
+    def setUp(self):
+        _suppress_auto_chain(self)
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text(
+            "- [ ] Touch a file\n  details\n"
+        )
+        self.cfg = _mk_config(self.root)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        scan_once(self.cfg, self.store)
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _seed_conflicted(self, *, last_error: str):
+        """Drive an item to CONFLICTED with a given `last_error`, without
+        needing a real merge clash — `resubmit_conflicted` only reads
+        `status`, `worktree_path`, `branch`, and `last_error`."""
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(self.cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        StubRunner(self.cfg, self.store).run(claimed)
+        # StubRunner lands in AWAITING_REVIEW; jump straight to CONFLICTED
+        # with the desired cause.
+        self.store.transition(
+            claimed.id, ItemStatus.CONFLICTED,
+            last_error=last_error,
+            note="seeded for feedback test",
+        )
+        return self.store.get(claimed.id)
+
+    def test_feedback_is_log_generation_when_cause_is_agent_log_missing(self):
+        item = self._seed_conflicted(last_error="agent-log missing")
+
+        resubmit_conflicted(self.cfg, self.store, item)
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        fb = final.feedback or ""
+        self.assertIn("docs/agent-logs/", fb)
+        self.assertIn("Surprises", fb)
+        self.assertIn("Outcome", fb)
+        # Log-absence cause must NOT instruct the agent to run
+        # `git merge <base>` or resolve conflict markers — that was
+        # the bug the dedicated prompt fixes.
+        self.assertNotIn("git merge main", fb)
+        self.assertNotIn("conflict markers", fb)
+        self.assertNotIn("Conflict summary", fb)
+
+    def test_feedback_is_merge_conflict_when_cause_is_generic(self):
+        summary = (
+            "── merge conflict ──\nFeature: Touch a file\n"
+            "Branch:  agent/touch-a-file\nCONFLICT (content): README.md\n"
+        )
+        item = self._seed_conflicted(last_error=summary)
+
+        resubmit_conflicted(self.cfg, self.store, item)
+
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        fb = final.feedback or ""
+        self.assertIn("git merge main", fb)
+        self.assertIn("Conflict summary", fb)
+        self.assertIn("CONFLICT (content): README.md", fb)
+        self.assertNotIn("docs/agent-logs/", fb)
+
+    def test_feedback_falls_back_to_merge_conflict_when_last_error_is_none(self):
+        """Defensive: `last_error=None` (rare but legal) must not trigger
+        the agent-log prompt — the sentinel match is exact-string."""
+        item = self._seed_conflicted(last_error="")
+        # Clear the seeded last_error to None via a second transition.
+        self.store.transition(
+            item.id, ItemStatus.CONFLICTED, last_error=None,
+            note="clear last_error",
+        )
+        item = self.store.get(item.id)
+        self.assertIsNone(item.last_error)
+
+        resubmit_conflicted(self.cfg, self.store, item)
+
+        fb = self.store.get(item.id).feedback or ""
+        self.assertIn("git merge main", fb)
+        self.assertNotIn("docs/agent-logs/", fb)
+
+
 class TestConflictSummaryFormat(unittest.TestCase):
     """Feature-context framing of the CONFLICTED `last_error`."""
 
