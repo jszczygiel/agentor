@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import stat
 import subprocess
 import unittest
@@ -17,7 +18,9 @@ from agentor.runner import (CodexRunner, StubRunner,
                             _default_claude_command,
                             _extract_plan_questions,
                             _mark_done_instruction,
+                            _parse_execute_tier,
                             _prepend_plan_answers,
+                            _resolve_execute_tier,
                             make_runner, plan_worktree,
                             write_claude_settings)
 from agentor.store import Store
@@ -2844,6 +2847,264 @@ class TestPrependPlanAnswers(unittest.TestCase):
         self.assertIn(
             "  A: (no answer — proceed with your best judgment)", out,
         )
+
+
+class TestParseExecuteTier(unittest.TestCase):
+    """`_parse_execute_tier` extracts the alias nominated under the plan's
+    `## Execute tier` trailer, whitelist-gating the result. Returns None
+    on miss (missing heading, malformed body, unlisted alias) so callers
+    soft-fall through to the global default."""
+
+    _CANONICAL = (
+        "# Plan\n\n1. Deliverable\n- ship it\n\n"
+        "## Execute tier\n\n"
+        "suggested_model: haiku\n"
+        "reason: mechanical rename, no semantic risk\n"
+    )
+
+    def test_canonical_trailer_parses_haiku(self):
+        self.assertEqual(_parse_execute_tier(self._CANONICAL), "haiku")
+
+    def test_rejects_unlisted_alias(self):
+        plan = self._CANONICAL.replace("haiku", "gpt-4")
+        self.assertIsNone(_parse_execute_tier(plan))
+
+    def test_missing_heading_returns_none(self):
+        plan = "# Plan\n\n1. Deliverable\n- ship it\n"
+        self.assertIsNone(_parse_execute_tier(plan))
+
+    def test_heading_without_suggested_model_returns_none(self):
+        plan = (
+            "# Plan\n\n## Execute tier\n\n"
+            "reason: explained but no model line\n"
+        )
+        self.assertIsNone(_parse_execute_tier(plan))
+
+    def test_case_insensitive_parse(self):
+        plan = (
+            "# Plan\n\n## EXECUTE TIER\n\n"
+            "SUGGESTED_MODEL: Haiku\n"
+            "reason: any\n"
+        )
+        self.assertEqual(_parse_execute_tier(plan), "haiku")
+
+    def test_respects_custom_whitelist(self):
+        plan = self._CANONICAL  # suggests haiku
+        self.assertIsNone(_parse_execute_tier(plan, whitelist=["sonnet"]))
+        self.assertEqual(
+            _parse_execute_tier(plan, whitelist=["haiku", "sonnet"]),
+            "haiku",
+        )
+
+    def test_empty_plan_returns_none(self):
+        self.assertIsNone(_parse_execute_tier(""))
+        self.assertIsNone(_parse_execute_tier(None))  # type: ignore[arg-type]
+
+    def test_next_heading_bounds_block(self):
+        # A `suggested_model:` line sitting past the next heading MUST NOT
+        # be picked up — only the Execute tier block itself counts.
+        plan = (
+            "## Execute tier\n\n"
+            "reason: no model here\n\n"
+            "## Something else\n\n"
+            "suggested_model: haiku\n"
+        )
+        self.assertIsNone(_parse_execute_tier(plan))
+
+
+class TestResolveExecuteTier(unittest.TestCase):
+    """`_resolve_execute_tier` applies the `tag > plan > default`
+    precedence with a whitelist gate at every level and a soft warning
+    on invalid tag."""
+
+    def _mk_cfg(self, *, auto: bool = False,
+                whitelist: list[str] | None = None,
+                model: str = "claude-opus-4-6") -> Config:
+        return Config(
+            project_name="p", project_root=Path("/tmp/never"),
+            sources=SourcesConfig(watch=[], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                model=model,
+                auto_execute_model=auto,
+                execute_model_whitelist=(
+                    whitelist if whitelist is not None
+                    else ["haiku", "sonnet", "opus"]
+                ),
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+
+    def _mk_item(self, tags: dict[str, str] | None = None):
+        from agentor.store import StoredItem
+        return StoredItem(
+            id="x", title="t", body="b", source_file="docs/backlog/x.md",
+            source_line=1, tags=tags or {}, status=ItemStatus.QUEUED,
+            worktree_path=None, branch=None, attempts=0,
+            last_error=None, feedback=None,
+            result_json=None, session_id=None,
+            agentor_version=None, priority=0,
+            created_at=0.0, updated_at=0.0,
+        )
+
+    _PLAN_OPUS = (
+        "# Plan\n\n## Execute tier\n\nsuggested_model: opus\n"
+        "reason: heavy\n"
+    )
+    _PLAN_SONNET = (
+        "# Plan\n\n## Execute tier\n\nsuggested_model: sonnet\n"
+        "reason: medium\n"
+    )
+
+    def test_tag_beats_plan(self):
+        cfg = self._mk_cfg(auto=True)
+        item = self._mk_item({"model": "haiku"})
+        self.assertEqual(
+            _resolve_execute_tier(cfg, item, self._PLAN_OPUS),
+            ("haiku", "tag"),
+        )
+
+    def test_plan_when_opt_in_on(self):
+        cfg = self._mk_cfg(auto=True)
+        item = self._mk_item()
+        self.assertEqual(
+            _resolve_execute_tier(cfg, item, self._PLAN_SONNET),
+            ("sonnet", "plan"),
+        )
+
+    def test_falls_back_when_opt_in_off(self):
+        cfg = self._mk_cfg(auto=False)
+        item = self._mk_item()
+        alias, source = _resolve_execute_tier(cfg, item, self._PLAN_SONNET)
+        self.assertEqual(source, "default")
+        self.assertEqual(alias, "opus")
+
+    def test_invalid_tag_falls_through(self):
+        cfg = self._mk_cfg(auto=True)
+        # Operator typo: full model id instead of alias.
+        item = self._mk_item({"model": "claude-haiku-4-5"})
+        alias, source = _resolve_execute_tier(cfg, item, self._PLAN_SONNET)
+        self.assertNotEqual(source, "tag")
+        # Plan suggestion wins the fallthrough since opt-in is on.
+        self.assertEqual((alias, source), ("sonnet", "plan"))
+
+    def test_tag_case_normalised(self):
+        cfg = self._mk_cfg(auto=False)
+        item = self._mk_item({"model": "Haiku"})
+        self.assertEqual(
+            _resolve_execute_tier(cfg, item, ""),
+            ("haiku", "tag"),
+        )
+
+    def test_default_derived_from_agent_model(self):
+        cfg = self._mk_cfg(auto=False, model="claude-haiku-4-5")
+        item = self._mk_item()
+        self.assertEqual(
+            _resolve_execute_tier(cfg, item, ""),
+            ("haiku", "default"),
+        )
+
+    def test_single_phase_semantics_empty_plan_defaults(self):
+        # single_phase=true → _do_execute is called with an empty plan
+        # body; no trailer → default source.
+        cfg = self._mk_cfg(auto=True)
+        item = self._mk_item()
+        self.assertEqual(
+            _resolve_execute_tier(cfg, item, ""),
+            ("opus", "default"),
+        )
+
+
+class TestAliasMapShape(unittest.TestCase):
+    """`_ALIAS_TO_MODEL` rotates with Anthropic releases. Catch stale
+    typos at test-time instead of at claude CLI invocation time."""
+
+    def test_aliases_map_to_valid_model_ids(self):
+        from agentor.config import _ALIAS_TO_MODEL
+        pat = re.compile(r"^claude-(haiku|sonnet|opus)-\d+-\d+$")
+        for alias, mid in _ALIAS_TO_MODEL.items():
+            self.assertIn(alias, {"haiku", "sonnet", "opus"})
+            m = pat.match(mid)
+            self.assertIsNotNone(
+                m, msg=f"{alias!r} → {mid!r} fails shape regex",
+            )
+            # Alias must match the middle segment (haiku→claude-haiku-…).
+            self.assertEqual(
+                m.group(1), alias,
+                msg=f"alias {alias!r} points at {mid!r} (mismatched family)",
+            )
+
+
+class TestResultJsonRecordsExecuteModel(unittest.TestCase):
+    """End-to-end: on an execute-phase run the runner lands
+    `execute_model` + `execute_model_source` on `result_json` from the
+    subclass-set `_last_execute_model*` attrs. Plan-phase runs leave
+    them out."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] Demo item\n")
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _claim_one(self, cfg: Config):
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        return self.store.claim_next_queued(str(wt), br)
+
+    def test_execute_records_model_and_source(self):
+        class ExecStub(StubRunner):
+            def do_work(self, item, worktree):
+                # Mimic ClaudeRunner._do_execute's state-setting.
+                self._last_phase = "execute"
+                self._last_execute_model = "haiku"
+                self._last_execute_model_source = "plan"
+                return super().do_work(item, worktree)
+
+        cfg = _mk_config(self.root)
+        claimed = self._claim_one(cfg)
+        ExecStub(cfg, self.store).run(claimed)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_REVIEW)
+        data = json.loads(refreshed.result_json)
+        self.assertEqual(data["execute_model"], "haiku")
+        self.assertEqual(data["execute_model_source"], "plan")
+
+    def test_plan_phase_omits_model_fields(self):
+        # Plan run: even if a subclass set the attrs, Runner.run only
+        # copies them when phase == "execute".
+        class PlanStub(StubRunner):
+            def do_work(self, item, worktree):
+                self._last_phase = "plan"
+                self._last_execute_model = "haiku"
+                self._last_execute_model_source = "plan"
+                return super().do_work(item, worktree)
+
+        cfg = _mk_config(self.root)
+        claimed = self._claim_one(cfg)
+        PlanStub(cfg, self.store).run(claimed)
+        refreshed = self.store.get(claimed.id)
+        data = json.loads(refreshed.result_json)
+        self.assertNotIn("execute_model", data)
+        self.assertNotIn("execute_model_source", data)
+
+
+class TestPlanPromptIncludesExecuteTierSection(unittest.TestCase):
+    """The default plan-prompt template instructs the plan to emit a
+    `## Execute tier` trailer so the runner has something to parse.
+    Guards against accidental template edits dropping the section."""
+
+    def test_default_plan_template_mentions_execute_tier(self):
+        cfg = AgentConfig()
+        self.assertIn("## Execute tier", cfg.plan_prompt_template)
+        self.assertIn("suggested_model:", cfg.plan_prompt_template)
 
 
 if __name__ == "__main__":
