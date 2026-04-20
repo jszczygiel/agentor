@@ -92,6 +92,12 @@ def _has_uncommitted(wt: Path) -> bool:
 _BODY_CAP = 2000
 _RAW_CAP = 1500
 
+# Sentinel `last_error` value set by `approve_and_commit` when the
+# per-run findings log gate blocks a merge under `require_agent_log=True`.
+# `resubmit_conflicted` matches on this to emit log-generation feedback
+# instead of the default merge-conflict feedback.
+_AGENT_LOG_MISSING_CAUSE = "agent-log missing"
+
 # Marker prefix on the CONFLICTED → QUEUED transition note when the
 # auto-resolve chain fires from `approve_and_commit`. The dashboard reads
 # this to flag an auto-chained resubmit in the transitions history.
@@ -231,7 +237,7 @@ def approve_and_commit(
             p("blocked: no agent-log added on feature branch")
             store.transition(
                 item.id, ItemStatus.CONFLICTED,
-                last_error="agent-log missing",
+                last_error=_AGENT_LOG_MISSING_CAUSE,
                 note="blocked: agent-log missing",
             )
             return sha
@@ -408,36 +414,9 @@ def _coerce_phase_plan(blob: str | None) -> str:
     return json.dumps(data)
 
 
-def resubmit_conflicted(
-    config: Config, store: Store, item: StoredItem,
-    *, force_execute: bool = False, note: str | None = None,
-) -> None:
-    """Send a CONFLICTED item back to the agent to resolve the merge
-    conflict itself. Transitions CONFLICTED → QUEUED; the worktree,
-    feature branch, and session_id are left intact so the runner resumes
-    the same session in execute phase and the injected feedback tells
-    the agent what to fix.
-
-    The agent's instructions: run `git merge <base>` in its own worktree
-    to surface the conflicts, resolve them, and commit. On next approval
-    the integration retries — if the feature now includes base's tip,
-    the merge fast-forwards.
-
-    `force_execute=True` rewrites `result_json` so the runner skips its
-    plan phase and dispatches straight into execute — conflict resolution
-    is pure execute work (open worktree, resolve markers, re-run tests,
-    commit), and the plan turn is wasted tokens + wall-clock. Used by
-    `approve_and_commit`'s auto-resolve chain.
-
-    `note` overrides the transition note — `approve_and_commit` passes a
-    string prefixed with `AUTO_RESOLVE_NOTE_PREFIX` so the dashboard can
-    flag an auto-chained resubmit in the transitions history."""
-    assert item.status == ItemStatus.CONFLICTED, \
-        f"resubmit_conflicted expects CONFLICTED, got {item.status}"
-    assert item.worktree_path and item.branch
-    base = config.git.base_branch
-    conflict_detail = (item.last_error or "(no conflict summary recorded)")
-    feedback = (
+def _build_merge_conflict_feedback(item: StoredItem, base: str) -> str:
+    conflict_detail = item.last_error or "(no conflict summary recorded)"
+    return (
         f"Your branch's changes conflict with `{base}`. Resolve the "
         f"conflict so the integration can proceed.\n\n"
         f"Steps to run in this worktree:\n"
@@ -453,6 +432,75 @@ def resubmit_conflicted(
         f"Conflict summary from the failed integration:\n"
         f"{conflict_detail}"
     )
+
+
+def _build_agent_log_feedback(item: StoredItem) -> str:
+    """Feedback for items blocked by the `require_agent_log` gate. The
+    merge itself never ran — the only remaining work is authoring the
+    per-run findings log and committing it on the feature branch so the
+    next integration pass clears the gate."""
+    slug = (item.branch or item.id[:8]).replace("/", "-")
+    return (
+        "Your feature branch was blocked from merging because no "
+        "per-run findings log was added under `docs/agent-logs/`. "
+        "No merge conflict occurred — do NOT run `git merge`. Just "
+        "write the missing log and commit it on this branch.\n\n"
+        "Steps to run in this worktree:\n"
+        "  1. Create `docs/agent-logs/<YYYY-MM-DD>-<slug>.md` where "
+        f"`<YYYY-MM-DD>` is today's date and `<slug>` is a short "
+        f"identifier for this item (e.g. derived from `{slug}`).\n"
+        "  2. Populate it with concise bullets under these sections "
+        "(omit any empty section):\n"
+        "       # <title> — <YYYY-MM-DD>\n\n"
+        "       ## Surprises\n"
+        "       - things that didn't match the plan or CLAUDE.md\n\n"
+        "       ## Gotchas for future runs\n"
+        "       - codebase quirks worth codifying in CLAUDE.md later\n\n"
+        "       ## Follow-ups\n"
+        "       - out-of-scope items worth a future backlog entry\n\n"
+        "       ## Outcome\n"
+        "       - Files touched: relative paths, cap 6\n"
+        "       - Tests added/adjusted: new or modified test cases\n"
+        "       - Follow-ups: out-of-scope items\n"
+        "  3. `git add docs/agent-logs/<...>.md` and `git commit` it "
+        "on this feature branch. No merge commit needed.\n"
+        "  4. Do NOT modify any other file — this is a log-only fix."
+    )
+
+
+def resubmit_conflicted(
+    config: Config, store: Store, item: StoredItem,
+    *, force_execute: bool = False, note: str | None = None,
+) -> None:
+    """Send a CONFLICTED item back to the agent to resolve the merge
+    conflict itself. Transitions CONFLICTED → QUEUED; the worktree,
+    feature branch, and session_id are left intact so the runner resumes
+    the same session in execute phase and the injected feedback tells
+    the agent what to fix.
+
+    Feedback is selected by cause: `last_error == "agent-log missing"`
+    (the `require_agent_log` gate in `approve_and_commit`) emits a
+    log-generation prompt; every other cause emits the merge-conflict
+    prompt instructing the agent to run `git merge <base>`, resolve the
+    markers, and commit.
+
+    `force_execute=True` rewrites `result_json` so the runner skips its
+    plan phase and dispatches straight into execute — conflict resolution
+    (and log generation) is pure execute work, and the plan turn is
+    wasted tokens + wall-clock. Used by `approve_and_commit`'s
+    auto-resolve chain.
+
+    `note` overrides the transition note — `approve_and_commit` passes a
+    string prefixed with `AUTO_RESOLVE_NOTE_PREFIX` so the dashboard can
+    flag an auto-chained resubmit in the transitions history."""
+    assert item.status == ItemStatus.CONFLICTED, \
+        f"resubmit_conflicted expects CONFLICTED, got {item.status}"
+    assert item.worktree_path and item.branch
+    base = config.git.base_branch
+    if item.last_error == _AGENT_LOG_MISSING_CAUSE:
+        feedback = _build_agent_log_feedback(item)
+    else:
+        feedback = _build_merge_conflict_feedback(item, base)
     fields: dict[str, object] = {
         "feedback": feedback,
         "last_error": None,
