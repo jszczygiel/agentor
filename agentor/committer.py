@@ -422,7 +422,7 @@ _FORCE_EXECUTE_PLAN_FALLBACK = "(no plan; conflict resolution — see feedback)"
 def _coerce_phase_plan(blob: str | None) -> str:
     """Rewrite a stored `result_json` so the runner's two-phase dispatch
     routes the next run into execute-only. Preserves all prior keys (usage,
-    session_id, summary, etc.) and guarantees a non-empty `plan` string so
+    agent_ref, summary, etc.) and guarantees a non-empty `plan` string so
     the execute prompt template's `{plan}` placeholder substitutes cleanly."""
     try:
         data = json.loads(blob) if blob else {}
@@ -496,7 +496,7 @@ def resubmit_conflicted(
 ) -> None:
     """Send a CONFLICTED item back to the agent to resolve the merge
     conflict itself. Transitions CONFLICTED → QUEUED; the worktree,
-    feature branch, and session_id are left intact so the runner resumes
+    feature branch, and agent_ref are left intact so the runner resumes
     the same session in execute phase and the injected feedback tells
     the agent what to fix.
 
@@ -632,7 +632,7 @@ def approve_plan(
 
 def retry(store: Store, item: StoredItem) -> None:
     """Re-queue a rejected or errored item for another attempt. Keeps the
-    existing worktree and session_id so the runner can --resume if still live.
+    existing worktree and agent_ref so the runner can --resume if still live.
     Clears last_error and resets the attempt counter — human-driven retry
     shouldn't consume the agent's own retry budget."""
     assert item.status in (ItemStatus.REJECTED, ItemStatus.ERRORED)

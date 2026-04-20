@@ -287,7 +287,7 @@ def cmd_revert(args: argparse.Namespace) -> int:
     transitions log to find what the item was doing before the most recent
     failure cascade (e.g. AWAITING_PLAN_REVIEW before a slot-broken bounce
     loop ended in REJECTED). Resets attempts/last_error/worktree/branch/
-    session_id so the next dispatch starts fresh."""
+    agent_ref so the next dispatch starts fresh."""
     cfg = load(_find_config(args.config))
     store = _open_store(cfg)
     try:
@@ -310,7 +310,7 @@ def cmd_revert(args: argparse.Namespace) -> int:
                 return 0
         store.transition(
             item.id, prev,
-            worktree_path=None, branch=None, session_id=None,
+            worktree_path=None, branch=None, agent_ref=None,
             attempts=0, last_error=None, feedback=None,
             note=f"manual revert from {item.status.value}",
         )

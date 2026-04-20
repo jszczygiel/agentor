@@ -228,7 +228,7 @@ def _make_item(title="hello", src="docs/backlog/foo.md") -> StoredItem:
         id="abc12345", title=title, body="", source_file=src,
         source_line=1, tags={}, status=ItemStatus.WORKING,
         worktree_path=None, branch=None, attempts=0, last_error=None,
-        feedback=None, result_json=None, session_id=None,
+        feedback=None, result_json=None, agent_ref=None,
         agentor_version=None, priority=0, created_at=0.0, updated_at=0.0,
     )
 

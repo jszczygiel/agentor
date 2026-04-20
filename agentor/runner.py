@@ -456,10 +456,10 @@ class Runner:
         branch = item.branch
         repo = self.config.project_root
 
-        # Resume path: session_id persisted + worktree still on disk → skip
+        # Resume path: agent_ref persisted + worktree still on disk → skip
         # teardown/recreate so the agent picks up where it left off. Otherwise
         # do the normal pre-flight nuke so stale state doesn't leak.
-        resume = bool(item.session_id) and wt_path.exists()
+        resume = bool(item.agent_ref) and wt_path.exists()
         try:
             if (self.stop_event is not None
                     and self.stop_event.is_set()):
@@ -520,7 +520,7 @@ class Runner:
                     raise InfrastructureError(err)
                 self.store.transition(
                     item.id, ItemStatus.ERRORED,
-                    worktree_path=None, branch=None, session_id=None,
+                    worktree_path=None, branch=None, agent_ref=None,
                     last_error=f"worktree_add: {err}",
                     note="worktree_add failed → errored",
                 )
@@ -544,17 +544,17 @@ class Runner:
                     # state alone, refund the attempt, surface to user.
                     self.store.note_infra_failure(item.id, last_error)
                     raise InfrastructureError(last_error)
-                if self.provider.is_dead_session_error(last_error) and item.session_id:
-                    # The provider lost the session. Resuming with the same id
-                    # will keep failing on every attempt until rejection —
-                    # drop the session_id, refund the attempt, and bounce
-                    # back to QUEUED so the next dispatch starts a fresh
-                    # session. result_json (with the approved plan) is
+                if self.provider.is_dead_session_error(last_error) and item.agent_ref:
+                    # The provider lost the session. Resuming with the same
+                    # agent_ref will keep failing on every attempt until
+                    # rejection — drop the agent_ref, refund the attempt, and
+                    # bounce back to QUEUED so the next dispatch starts a
+                    # fresh session. result_json (with the approved plan) is
                     # kept so we don't make the user re-approve.
                     git_ops.worktree_remove(repo, wt_path, force=True)
                     self.store.transition(
                         item.id, ItemStatus.QUEUED,
-                        worktree_path=None, branch=None, session_id=None,
+                        worktree_path=None, branch=None, agent_ref=None,
                         attempts=max(0, item.attempts - 1),
                         last_error=last_error,
                         note="agent session lost; restart with fresh session",
@@ -568,7 +568,7 @@ class Runner:
                 # fixed — no auto-retry loop.
                 self.store.transition(
                     item.id, ItemStatus.ERRORED,
-                    worktree_path=None, branch=None, session_id=None,
+                    worktree_path=None, branch=None, agent_ref=None,
                     last_error=last_error,
                     note="do_work failed → errored",
                 )
@@ -841,7 +841,8 @@ def _write_checkpoint_marker(
 
 class ClaudeRunner(Runner):
     """Spawns a headless `claude -p` subprocess inside the worktree. Runs in
-    two phases tied together by session_id:
+    two phases tied together by the persisted agent_ref (Claude's wire-format
+    session_id, stored provider-neutrally on the item):
 
     1) plan — agent writes a development plan (no code changes), item stops at
        AWAITING_PLAN_REVIEW for human approval.
@@ -1001,11 +1002,13 @@ class ClaudeRunner(Runner):
         # Session id: pre-generated + persisted before the child starts so a
         # mid-run crash can be recovered via `claude --resume <id>` on the
         # next agentor startup. Reuse a previously-persisted one if present.
-        session_id = item.session_id or str(uuid.uuid4())
-        had_session = bool(item.session_id)
+        # `session_id` is Claude-CLI wire vocabulary; we store it
+        # provider-neutrally as agent_ref on the item.
+        session_id = item.agent_ref or str(uuid.uuid4())
+        had_session = bool(item.agent_ref)
         if not had_session:
             self.store.transition(
-                item.id, ItemStatus.WORKING, session_id=session_id,
+                item.id, ItemStatus.WORKING, agent_ref=session_id,
                 note="session id assigned",
             )
         if had_session:
@@ -1340,7 +1343,7 @@ class CodexRunner(Runner):
         self, item: StoredItem, worktree: Path, prompt: str, output_path: Path,
         model_override: str | None = None,
     ) -> tuple[str, str]:
-        phase_tag = "execute" if item.session_id else "plan"
+        phase_tag = "execute" if item.agent_ref else "plan"
         transcript_path = (
             self.config.project_root / ".agentor" / "transcripts"
             / f"{item.id}.{phase_tag}.log"
@@ -1378,10 +1381,13 @@ class CodexRunner(Runner):
         values = {
             "prompt": prompt,
             "model": model_override or self.config.agent.model,
-            "session_id": item.session_id or "",
+            # Placeholder key stays `session_id` to match the operator-facing
+            # `{session_id}` token in `agent.command` / `agent.resume_command`;
+            # value comes from the provider-neutral agent_ref column.
+            "session_id": item.agent_ref or "",
             "output_path": str(output_path),
         }
-        if item.session_id:
+        if item.agent_ref:
             tmpl = (
                 self.config.agent.resume_command
                 or _default_codex_resume_command()
@@ -1419,10 +1425,10 @@ class CodexRunner(Runner):
         def on_event(ev: dict) -> str | None:
             state.ingest(ev)
             cur = item_ref[0]
-            if state.session_id and state.session_id != cur.session_id:
+            if state.session_id and state.session_id != cur.agent_ref:
                 self.store.transition(
                     cur.id, ItemStatus.WORKING,
-                    session_id=state.session_id,
+                    agent_ref=state.session_id,
                     note="session id assigned",
                 )
                 refreshed = self.store.get(cur.id)
@@ -1611,7 +1617,7 @@ class _StreamState:
         if self.duration_api_ms is not None:
             out["duration_api_ms"] = self.duration_api_ms
         if self.session_id:
-            out["session_id"] = self.session_id
+            out["agent_ref"] = self.session_id
         if self.result_text:
             out["result"] = self.result_text
         if self.rate_limits:
@@ -1673,7 +1679,7 @@ class _CodexStreamState:
             "num_turns": self.num_turns,
         }
         if self.session_id:
-            out["session_id"] = self.session_id
+            out["agent_ref"] = self.session_id
         if result_text or self.result_text:
             out["result"] = result_text or self.result_text
         if self.last_error:
@@ -1919,9 +1925,11 @@ def _parse_usage(stdout: str) -> dict | None:
     # Flatten fields the dashboard cares about. `usage` stays as a nested
     # dict because existing readers (_tokens_used variants) pick from it.
     out: dict = {}
+    # `session_id` kept for back-compat with result_json blobs written before
+    # the agent_ref rename; new writes use `agent_ref`.
     for k in ("usage", "modelUsage", "num_turns",
-              "duration_ms", "duration_api_ms", "stop_reason", "session_id",
-              "result"):
+              "duration_ms", "duration_api_ms", "stop_reason",
+              "agent_ref", "session_id", "result"):
         if k in obj and obj[k] is not None:
             out[k] = obj[k]
     return out or None

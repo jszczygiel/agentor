@@ -561,7 +561,7 @@ def _build_detail_lines(
     out.append(f"source:   {item.source_file}:{item.source_line}")
     out.append(f"branch:   {item.branch or '—'}")
     out.append(f"worktree: {item.worktree_path or '—'}")
-    out.append(f"session:  {item.session_id or '—'}")
+    out.append(f"agent:    {item.agent_ref or '—'}")
     out.append(f"attempts: {item.attempts} / {cfg.agent.max_attempts}")
     out.append(f"agentor:  {item.agentor_version or '—'}")
     if item.status in (ItemStatus.QUEUED, ItemStatus.WORKING,

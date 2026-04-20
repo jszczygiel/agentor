@@ -36,7 +36,7 @@ def _item(result_json: str | None) -> StoredItem:
         last_error=None,
         feedback=None,
         result_json=result_json,
-        session_id=None,
+        agent_ref=None,
         agentor_version=None,
         priority=0,
         created_at=0.0,
