@@ -27,7 +27,7 @@ def _mk_item(
         id="abc12345", title="t", body="", source_file="s.md",
         source_line=1, tags={}, status=status,
         worktree_path=None, branch=None, attempts=0, last_error=last_error,
-        feedback=None, result_json=json.dumps(result), session_id=None,
+        feedback=None, result_json=json.dumps(result), agent_ref=None,
         agentor_version=None, priority=0, created_at=0.0,
         updated_at=float(_mk_item_counter),
     )

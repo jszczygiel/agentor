@@ -80,10 +80,10 @@ class TestRecoveryWorkingItems(unittest.TestCase):
         self.td.cleanup()
 
     def _seed_working(
-        self, id: str, session_id: str | None = None,
+        self, id: str, agent_ref: str | None = None,
         worktree_path: str | None = None, prior_status: ItemStatus | None = None,
     ) -> None:
-        """Seed an item in WORKING state with optional session_id / worktree."""
+        """Seed an item in WORKING state with optional agent_ref / worktree."""
         self.store.upsert_discovered(_mk_item(id))
         self.store.transition(id, ItemStatus.QUEUED, note="promote")
         if prior_status and prior_status != ItemStatus.QUEUED:
@@ -92,17 +92,17 @@ class TestRecoveryWorkingItems(unittest.TestCase):
         self.store.transition(
             id, ItemStatus.WORKING,
             worktree_path=worktree_path, branch="br",
-            session_id=session_id, note="claim",
+            agent_ref=agent_ref, note="claim",
         )
 
     def test_live_session_demoted_to_queued_preserves_fields(self):
         wt = self.root / "wt-live"
         wt.mkdir()
-        self._seed_working("a", session_id="sess-1", worktree_path=str(wt))
+        self._seed_working("a", agent_ref="sess-1", worktree_path=str(wt))
         result = recover_on_startup(self.config, self.store)
         item = self.store.get("a")
         self.assertEqual(item.status, ItemStatus.QUEUED)
-        self.assertEqual(item.session_id, "sess-1")
+        self.assertEqual(item.agent_ref, "sess-1")
         self.assertEqual(item.worktree_path, str(wt))
         self.assertEqual(item.branch, "br")
         self.assertEqual(item.attempts, 0)  # reset for resume
@@ -112,12 +112,12 @@ class TestRecoveryWorkingItems(unittest.TestCase):
         self.mock_wt_remove.assert_not_called()
 
     def test_dead_session_worktree_gone_reverts_to_queued(self):
-        self._seed_working("a", session_id="sess-1",
+        self._seed_working("a", agent_ref="sess-1",
                            worktree_path=str(self.root / "gone"))
         result = recover_on_startup(self.config, self.store)
         item = self.store.get("a")
         self.assertEqual(item.status, ItemStatus.QUEUED)
-        self.assertIsNone(item.session_id)
+        self.assertIsNone(item.agent_ref)
         self.assertIsNone(item.worktree_path)
         self.assertIsNone(item.branch)
         self.assertEqual(result.requeued, ["a"])
@@ -125,10 +125,10 @@ class TestRecoveryWorkingItems(unittest.TestCase):
         # worktree_remove called to force cleanup, even though dir missing.
         self.mock_wt_remove.assert_called_once()
 
-    def test_no_session_id_reverts_even_if_worktree_exists(self):
+    def test_no_agent_ref_reverts_even_if_worktree_exists(self):
         wt = self.root / "orphan-wt"
         wt.mkdir()
-        self._seed_working("a", session_id=None, worktree_path=str(wt))
+        self._seed_working("a", agent_ref=None, worktree_path=str(wt))
         recover_on_startup(self.config, self.store)
         item = self.store.get("a")
         self.assertEqual(item.status, ItemStatus.QUEUED)
@@ -140,7 +140,7 @@ class TestRecoveryWorkingItems(unittest.TestCase):
         Recovery restores user-visible progress rather than forcing re-approval."""
         wt = self.root / "gone"
         self._seed_working(
-            "a", session_id=None, worktree_path=str(wt),
+            "a", agent_ref=None, worktree_path=str(wt),
             prior_status=ItemStatus.AWAITING_PLAN_REVIEW,
         )
         recover_on_startup(self.config, self.store)
@@ -148,7 +148,7 @@ class TestRecoveryWorkingItems(unittest.TestCase):
         self.assertEqual(item.status, ItemStatus.AWAITING_PLAN_REVIEW)
 
     def test_no_worktree_path_skips_remove(self):
-        self._seed_working("a", session_id=None, worktree_path=None)
+        self._seed_working("a", agent_ref=None, worktree_path=None)
         recover_on_startup(self.config, self.store)
         self.assertEqual(self.store.get("a").status, ItemStatus.QUEUED)
         self.mock_wt_remove.assert_not_called()
@@ -253,7 +253,7 @@ class TestRecoveryStaleSession(unittest.TestCase):
         self.td.cleanup()
 
     def _seed_working(
-        self, id: str, session_id: str | None = None,
+        self, id: str, agent_ref: str | None = None,
         worktree_path: str | None = None,
     ) -> None:
         self.store.upsert_discovered(_mk_item(id))
@@ -261,7 +261,7 @@ class TestRecoveryStaleSession(unittest.TestCase):
         self.store.transition(
             id, ItemStatus.WORKING,
             worktree_path=worktree_path, branch="br",
-            session_id=session_id, note="claim",
+            agent_ref=agent_ref, note="claim",
         )
 
     def _backdate_working_transition(self, id: str, seconds_ago: float) -> None:
@@ -281,14 +281,14 @@ class TestRecoveryStaleSession(unittest.TestCase):
     def test_old_session_demoted_to_fresh_plan(self):
         wt = self.root / "wt-old"
         wt.mkdir()
-        self._seed_working("a", session_id="sess-1", worktree_path=str(wt))
+        self._seed_working("a", agent_ref="sess-1", worktree_path=str(wt))
         self._backdate_working_transition("a", seconds_ago=5 * 3600)
 
         result = recover_on_startup(self.config, self.store)
 
         item = self.store.get("a")
         self.assertEqual(item.status, ItemStatus.QUEUED)
-        self.assertIsNone(item.session_id)
+        self.assertIsNone(item.agent_ref)
         self.assertIsNone(item.worktree_path)
         self.assertIsNone(item.branch)
         self.assertEqual(item.attempts, 0)
@@ -300,7 +300,7 @@ class TestRecoveryStaleSession(unittest.TestCase):
     def test_recent_session_with_dead_session_failure_demoted(self):
         wt = self.root / "wt-recent"
         wt.mkdir()
-        self._seed_working("a", session_id="sess-1", worktree_path=str(wt))
+        self._seed_working("a", agent_ref="sess-1", worktree_path=str(wt))
         # Fresh claim (no backdating) — the failure row alone must trigger demotion.
         self.store.record_failure(
             item_id="a", attempt=1, phase="execute",
@@ -312,7 +312,7 @@ class TestRecoveryStaleSession(unittest.TestCase):
 
         item = self.store.get("a")
         self.assertEqual(item.status, ItemStatus.QUEUED)
-        self.assertIsNone(item.session_id)
+        self.assertIsNone(item.agent_ref)
         self.assertEqual(item.last_error, _STALE_SESSION_MARKER)
         self.assertEqual(result.stale_sessions, ["a"])
         self.assertEqual(result.resumable, [])
@@ -322,13 +322,13 @@ class TestRecoveryStaleSession(unittest.TestCase):
         nothing flags the session as dead."""
         wt = self.root / "wt-fresh"
         wt.mkdir()
-        self._seed_working("a", session_id="sess-1", worktree_path=str(wt))
+        self._seed_working("a", agent_ref="sess-1", worktree_path=str(wt))
 
         result = recover_on_startup(self.config, self.store)
 
         item = self.store.get("a")
         self.assertEqual(item.status, ItemStatus.QUEUED)
-        self.assertEqual(item.session_id, "sess-1")
+        self.assertEqual(item.agent_ref, "sess-1")
         self.assertEqual(item.worktree_path, str(wt))
         self.assertEqual(result.stale_sessions, [])
         self.assertEqual(len(result.resumable), 1)
@@ -336,7 +336,7 @@ class TestRecoveryStaleSession(unittest.TestCase):
     def test_threshold_configurable_via_config(self):
         wt = self.root / "wt-low-threshold"
         wt.mkdir()
-        self._seed_working("a", session_id="sess-1", worktree_path=str(wt))
+        self._seed_working("a", agent_ref="sess-1", worktree_path=str(wt))
         # Push the threshold below the fresh claim's age (a few ms is enough).
         self.config.agent.session_max_age_hours = 0.0001
         # Make sure the WORKING transition is at least a few seconds old so
@@ -346,13 +346,13 @@ class TestRecoveryStaleSession(unittest.TestCase):
         result = recover_on_startup(self.config, self.store)
 
         self.assertEqual(result.stale_sessions, ["a"])
-        self.assertEqual(self.store.get("a").session_id, None)
+        self.assertEqual(self.store.get("a").agent_ref, None)
 
     def test_unrelated_failure_row_does_not_demote(self):
         """A non-dead-session failure row must not trigger the stale path."""
         wt = self.root / "wt-other-fail"
         wt.mkdir()
-        self._seed_working("a", session_id="sess-1", worktree_path=str(wt))
+        self._seed_working("a", agent_ref="sess-1", worktree_path=str(wt))
         self.store.record_failure(
             item_id="a", attempt=1, phase="execute",
             error="claude exited 1: rate limited",
@@ -363,14 +363,14 @@ class TestRecoveryStaleSession(unittest.TestCase):
 
         self.assertEqual(result.stale_sessions, [])
         self.assertEqual(len(result.resumable), 1)
-        self.assertEqual(self.store.get("a").session_id, "sess-1")
+        self.assertEqual(self.store.get("a").agent_ref, "sess-1")
 
     def test_stale_session_removes_worktree_dir(self):
         """Stale-session demote must nuke the worktree dir on disk so a
         re-dispatch with a fresh slug doesn't collide with the old one."""
         wt = self.root / "wt-stale"
         wt.mkdir()
-        self._seed_working("a", session_id="sess-1", worktree_path=str(wt))
+        self._seed_working("a", agent_ref="sess-1", worktree_path=str(wt))
         self.store.record_failure(
             item_id="a", attempt=1, phase="execute",
             error="claude exited 1: No conversation found with session ID sess-1",
@@ -408,19 +408,19 @@ class TestRecoveryStaleSessionCodex(unittest.TestCase):
         self.store.close()
         self.td.cleanup()
 
-    def _seed_working(self, id: str, session_id: str, worktree_path: str) -> None:
+    def _seed_working(self, id: str, agent_ref: str, worktree_path: str) -> None:
         self.store.upsert_discovered(_mk_item(id))
         self.store.transition(id, ItemStatus.QUEUED, note="promote")
         self.store.transition(
             id, ItemStatus.WORKING,
             worktree_path=worktree_path, branch="br",
-            session_id=session_id, note="claim",
+            agent_ref=agent_ref, note="claim",
         )
 
     def test_thread_not_found_failure_demotes(self):
         wt = self.root / "wt-codex-dead"
         wt.mkdir()
-        self._seed_working("a", session_id="thr-1", worktree_path=str(wt))
+        self._seed_working("a", agent_ref="thr-1", worktree_path=str(wt))
         self.store.record_failure(
             item_id="a", attempt=1, phase="execute",
             error="codex exited 1: thread not found: thr-1",
@@ -431,14 +431,14 @@ class TestRecoveryStaleSessionCodex(unittest.TestCase):
 
         item = self.store.get("a")
         self.assertEqual(item.status, ItemStatus.QUEUED)
-        self.assertIsNone(item.session_id)
+        self.assertIsNone(item.agent_ref)
         self.assertEqual(item.last_error, _STALE_SESSION_MARKER)
         self.assertEqual(result.stale_sessions, ["a"])
 
     def test_thread_start_failed_failure_demotes(self):
         wt = self.root / "wt-codex-start"
         wt.mkdir()
-        self._seed_working("a", session_id="thr-1", worktree_path=str(wt))
+        self._seed_working("a", agent_ref="thr-1", worktree_path=str(wt))
         self.store.record_failure(
             item_id="a", attempt=1, phase="execute",
             error="codex exited 1: thread/start failed",
@@ -448,7 +448,7 @@ class TestRecoveryStaleSessionCodex(unittest.TestCase):
         result = recover_on_startup(self.config, self.store)
 
         self.assertEqual(result.stale_sessions, ["a"])
-        self.assertIsNone(self.store.get("a").session_id)
+        self.assertIsNone(self.store.get("a").agent_ref)
 
     def test_claude_signature_does_not_demote_codex_item(self):
         """Cross-provider safety: a Claude-shaped dead-session row on a
@@ -456,7 +456,7 @@ class TestRecoveryStaleSessionCodex(unittest.TestCase):
         signature is Claude-only; the codex provider ignores it)."""
         wt = self.root / "wt-codex-claudesig"
         wt.mkdir()
-        self._seed_working("a", session_id="thr-1", worktree_path=str(wt))
+        self._seed_working("a", agent_ref="thr-1", worktree_path=str(wt))
         self.store.record_failure(
             item_id="a", attempt=1, phase="execute",
             error="claude exited 1: No conversation found with session ID sess-1",
@@ -467,7 +467,7 @@ class TestRecoveryStaleSessionCodex(unittest.TestCase):
 
         self.assertEqual(result.stale_sessions, [])
         self.assertEqual(len(result.resumable), 1)
-        self.assertEqual(self.store.get("a").session_id, "thr-1")
+        self.assertEqual(self.store.get("a").agent_ref, "thr-1")
 
 
 class TestRecoveryStubProviderOptsOut(unittest.TestCase):
@@ -488,13 +488,13 @@ class TestRecoveryStubProviderOptsOut(unittest.TestCase):
         self.store.close()
         self.td.cleanup()
 
-    def _seed_working(self, id: str, session_id: str, worktree_path: str) -> None:
+    def _seed_working(self, id: str, agent_ref: str, worktree_path: str) -> None:
         self.store.upsert_discovered(_mk_item(id))
         self.store.transition(id, ItemStatus.QUEUED, note="promote")
         self.store.transition(
             id, ItemStatus.WORKING,
             worktree_path=worktree_path, branch="br",
-            session_id=session_id, note="claim",
+            agent_ref=agent_ref, note="claim",
         )
 
     def _backdate_working_transition(self, id: str, seconds_ago: float) -> None:
@@ -511,7 +511,7 @@ class TestRecoveryStubProviderOptsOut(unittest.TestCase):
     def test_stub_skips_age_gate(self):
         wt = self.root / "wt-stub-old"
         wt.mkdir()
-        self._seed_working("a", session_id="sess-1", worktree_path=str(wt))
+        self._seed_working("a", agent_ref="sess-1", worktree_path=str(wt))
         # Tight threshold + backdated claim would demote under claude.
         self.config.agent.session_max_age_hours = 0.0001
         self._backdate_working_transition("a", seconds_ago=10)
@@ -520,7 +520,7 @@ class TestRecoveryStubProviderOptsOut(unittest.TestCase):
 
         self.assertEqual(result.stale_sessions, [])
         self.assertEqual(len(result.resumable), 1)
-        self.assertEqual(self.store.get("a").session_id, "sess-1")
+        self.assertEqual(self.store.get("a").agent_ref, "sess-1")
 
 
 if __name__ == "__main__":

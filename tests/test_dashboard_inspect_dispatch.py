@@ -542,7 +542,7 @@ class TestInspectDispatch(unittest.TestCase):
         self.store.transition(
             "live1", ItemStatus.WORKING,
             worktree_path="/tmp/nope", branch="agent/live1",
-            session_id="sess-abc", note="t",
+            agent_ref="sess-abc", note="t",
         )
         with patch(
             "agentor.dashboard.modes._prompt_yn", return_value=True,

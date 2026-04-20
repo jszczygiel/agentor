@@ -279,7 +279,7 @@ class Daemon:
         return newest
 
     def _check_stale_sessions(self, now_ns: int) -> None:
-        """Walk WORKING items with a live session_id; flag any whose
+        """Walk WORKING items with a live agent_ref; flag any whose
         newest transcript mtime is older than the configured threshold.
         Informational — does not pause dispatch or kill the child."""
         threshold_s = self.config.agent.stale_session_alert_seconds
@@ -287,7 +287,7 @@ class Daemon:
             return
         threshold_ns = threshold_s * 1_000_000_000
         for item in self.store.list_by_status(ItemStatus.WORKING):
-            if not item.session_id:
+            if not item.agent_ref:
                 continue
             mtime_ns = self._transcript_mtime_ns(item.id)
             if mtime_ns is None:

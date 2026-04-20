@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS items (
     last_error    TEXT,
     feedback      TEXT,
     result_json   TEXT,
-    session_id    TEXT,
+    agent_ref     TEXT,
     agentor_version TEXT,
     priority      INTEGER NOT NULL DEFAULT 0,
     created_at    REAL NOT NULL,
@@ -73,8 +73,15 @@ CREATE TABLE IF NOT EXISTS deletions (
 def _migrate(conn: sqlite3.Connection) -> None:
     """Idempotent migrations for DBs created before new columns existed."""
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(items)")}
-    if "session_id" not in cols:
-        conn.execute("ALTER TABLE items ADD COLUMN session_id TEXT")
+    if "session_id" in cols and "agent_ref" not in cols:
+        # Legacy column name was Claude-CLI-centric; codex runner overloaded
+        # it for thread_id. Rename to a provider-neutral term; values are
+        # preserved by RENAME COLUMN (SQLite >= 3.25).
+        conn.execute("ALTER TABLE items RENAME COLUMN session_id TO agent_ref")
+        cols.discard("session_id")
+        cols.add("agent_ref")
+    if "agent_ref" not in cols:
+        conn.execute("ALTER TABLE items ADD COLUMN agent_ref TEXT")
     if "feedback" not in cols:
         conn.execute("ALTER TABLE items ADD COLUMN feedback TEXT")
     if "agentor_version" not in cols:
@@ -116,6 +123,20 @@ def _decode_status(raw: str) -> ItemStatus:
     return ItemStatus(raw)
 
 
+def _encode_agent_ref(ref: str | None) -> str | None:
+    """Serialize an agent resume token for storage in SQLite. Pass-through
+    today; kept as a boundary helper so any future encoding (length caps,
+    provider-tag prefix, etc.) lives in one place — same pattern as
+    _encode_status."""
+    return ref
+
+
+def _decode_agent_ref(raw: str | None) -> str | None:
+    """Deserialize an agent resume token read from SQLite. Pass-through
+    mirror of _encode_agent_ref so every read crosses the same boundary."""
+    return raw
+
+
 @dataclass
 class Transition:
     """A row from the `transitions` table, with status fields decoded back
@@ -141,7 +162,7 @@ class StoredItem:
     last_error: str | None
     feedback: str | None
     result_json: str | None
-    session_id: str | None
+    agent_ref: str | None
     agentor_version: str | None
     priority: int
     created_at: float
@@ -163,7 +184,7 @@ def _row_to_stored(row: sqlite3.Row) -> StoredItem:
         last_error=row["last_error"],
         feedback=row["feedback"],
         result_json=row["result_json"],
-        session_id=row["session_id"],
+        agent_ref=_decode_agent_ref(row["agent_ref"]),
         agentor_version=row["agentor_version"],
         priority=row["priority"],
         created_at=row["created_at"],
@@ -340,14 +361,17 @@ class Store:
         like worktree_path, branch, attempts, last_error, result_json."""
         now = time.time()
         allowed = {"worktree_path", "branch", "attempts", "last_error",
-                   "feedback", "result_json", "session_id"}
+                   "feedback", "result_json", "agent_ref"}
         sets = ["status = ?", "updated_at = ?"]
         params: list[object] = [_encode_status(to), now]
         for k, v in fields.items():
             if k not in allowed:
                 raise ValueError(f"cannot update field: {k}")
             sets.append(f"{k} = ?")
-            params.append(v)
+            if k == "agent_ref":
+                params.append(_encode_agent_ref(v))  # type: ignore[arg-type]
+            else:
+                params.append(v)
         params.append(item_id)
 
         with self.tx() as c:
