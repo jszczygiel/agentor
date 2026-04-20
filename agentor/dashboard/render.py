@@ -3,10 +3,12 @@ import os
 import queue
 import threading
 import time
+from dataclasses import replace as _dataclasses_replace
 from typing import Callable
 
 from ..capabilities import ProviderCapabilities, capabilities_for
 from ..models import ItemStatus
+from ..providers import make_provider
 from ..store import StoredItem
 
 from .formatters import (
@@ -17,6 +19,7 @@ from .formatters import (
     _ctx_fill_pct,
     _elapsed_for,
     _fmt_elapsed,
+    _fmt_tier_row,
     _fmt_token_compact,
     _fmt_token_row,
     _phase_for,
@@ -190,9 +193,19 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     # unresolved last_error. Surfaces stuck/faulty items in the header
     # even when the default 'all' filter would visually smear them into
     # the rest of the queue.
+    # Resolve provider for per-tier token breakdown; fall back to None
+    # (no tier breakdown) on unknown runner kind rather than crashing.
+    override = getattr(daemon, "provider_override", None)
+    try:
+        _agent_cfg = cfg.agent
+        if override and override != cfg.agent.runner:
+            _agent_cfg = _dataclasses_replace(cfg.agent, runner=override)
+        _provider = make_provider(_dataclasses_replace(cfg, agent=_agent_cfg))
+    except Exception:
+        _provider = None
     # Compute once and reuse — the token-windows cache makes the second
     # call free but explicit sharing keeps the data-flow obvious.
-    token_windows = _token_windows(store, daemon.started_at)
+    token_windows = _token_windows(store, daemon.started_at, provider=_provider)
     token_compact = _fmt_token_compact(token_windows, cfg.agent)
     status_line = _build_status_line(
         tier, cfg, s, counts, len(daemon.workers),
@@ -203,7 +216,10 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     token_row = " " + _fmt_token_row(token_windows, cfg.agent, tier)
     _safe_addstr(stdscr, row, 0, token_row.ljust(w), w, curses.A_DIM)
     row += 1
-    override = getattr(daemon, "provider_override", None)
+    tier_row = _fmt_tier_row(token_windows, tier)
+    if tier_row:
+        _safe_addstr(stdscr, row, 0, (" " + tier_row).ljust(w), w, curses.A_DIM)
+        row += 1
     if override:
         strip = f" provider override: {override} (session-only) "
         _safe_addstr(stdscr, row, 0, strip[:w].ljust(w), w,

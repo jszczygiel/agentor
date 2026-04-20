@@ -352,7 +352,7 @@ class _FakeStore:
     def latest_transition_at(self, *a, **k):
         return None
 
-    def aggregate_token_usage(self, *, since=None):
+    def aggregate_token_usage(self, *, since=None, classifier=None):
         # Returned shape matches Store.aggregate_token_usage; zeros keep
         # the token panel renderable without a real SQLite backend.
         return {"input": 0, "output": 0, "cache_read": 0,

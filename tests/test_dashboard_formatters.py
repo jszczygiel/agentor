@@ -9,6 +9,7 @@ from agentor.dashboard import formatters
 from agentor.dashboard.formatters import (
     _ctx_fill_pct,
     _fmt_elapsed,
+    _fmt_tier_row,
     _fmt_token_compact,
     _fmt_token_row,
     _fmt_tokens,
@@ -448,9 +449,16 @@ class _FakeStore:
 
     def __init__(self) -> None:
         self.calls: list[float | None] = []
+        self.classifiers: list = []
 
-    def aggregate_token_usage(self, since: float | None = None) -> dict:
+    def aggregate_token_usage(
+        self,
+        since: float | None = None,
+        *,
+        classifier=None,
+    ) -> dict:
         self.calls.append(since)
+        self.classifiers.append(classifier)
         return {"input": 1, "output": 0, "cache_read": 0,
                 "cache_create": 0, "total": 1}
 
@@ -518,6 +526,107 @@ class TestTokenWindowsCache(unittest.TestCase):
         # week-since (now - 7*86400).
         self.assertEqual(store.calls[0], base - 5 * 3600)
         self.assertEqual(store.calls[1], base - 7 * 86400)
+
+    def test_provider_classifier_forwarded(self):
+        """When a provider is passed, its model_to_alias becomes the classifier."""
+        store = _FakeStore()
+
+        class _FakeProvider:
+            def model_to_alias(self, model_id: str):
+                return "haiku" if "haiku" in model_id else None
+
+        _token_windows(store, daemon_started_at=0.0, provider=_FakeProvider())
+        # Classifier should have been forwarded (non-None) for both windows.
+        self.assertTrue(all(c is not None for c in store.classifiers))
+        self.assertEqual(len(store.classifiers), 2)
+
+    def test_provider_class_change_busts_cache(self):
+        """Swapping provider class forces recompute even within TTL."""
+
+        class _ProvA:
+            def model_to_alias(self, _):
+                return "haiku"
+
+        class _ProvB:
+            def model_to_alias(self, _):
+                return "sonnet"
+
+        store = _FakeStore()
+        _token_windows(store, daemon_started_at=0.0, provider=_ProvA())
+        _token_windows(store, daemon_started_at=0.0, provider=_ProvB())
+        # Two distinct cache keys → two separate compute passes → 4 calls.
+        self.assertEqual(len(store.calls), 4)
+
+    def test_no_provider_no_classifier(self):
+        store = _FakeStore()
+        _token_windows(store, daemon_started_at=0.0)
+        self.assertTrue(all(c is None for c in store.classifiers))
+
+
+class TestFmtTierRow(unittest.TestCase):
+    def _windows(self, haiku=0, sonnet=0, opus=0, other=0):
+        def _mk_bt(*items):
+            bt = {}
+            for alias, val in items:
+                if val:
+                    bt[alias] = {"input": val, "output": 0,
+                                 "cache_read": 0, "cache_create": 0,
+                                 "total": val}
+            return bt
+
+        bt = _mk_bt(("haiku", haiku), ("sonnet", sonnet),
+                    ("opus", opus), ("other", other))
+        return {"5h": {"total": haiku + sonnet + opus + other, "by_tier": bt},
+                "week": {"total": 0, "by_tier": {}}}
+
+    def test_empty_on_narrow(self):
+        w = self._windows(sonnet=1000)
+        self.assertEqual(_fmt_tier_row(w, tier="narrow"), "")
+
+    def test_empty_when_no_by_tier(self):
+        self.assertEqual(_fmt_tier_row({"5h": {"total": 0}, "week": {"total": 0}}), "")
+
+    def test_zero_tiers_hidden(self):
+        w = self._windows(sonnet=500)
+        row = _fmt_tier_row(w, tier="wide")
+        self.assertIn("sonnet", row)
+        self.assertNotIn("haiku", row)
+        self.assertNotIn("opus", row)
+
+    def test_sorted_by_total_desc(self):
+        w = self._windows(haiku=100, sonnet=5000, opus=1000)
+        row = _fmt_tier_row(w, tier="wide")
+        idx_sonnet = row.index("sonnet")
+        idx_opus = row.index("opus")
+        idx_haiku = row.index("haiku")
+        self.assertLess(idx_sonnet, idx_opus)
+        self.assertLess(idx_opus, idx_haiku)
+
+    def test_mid_clips_to_two_tiers(self):
+        w = self._windows(haiku=100, sonnet=5000, opus=1000, other=50)
+        row = _fmt_tier_row(w, tier="mid")
+        # top-2 by total are sonnet (5000) and opus (1000)
+        self.assertIn("sonnet", row)
+        self.assertIn("opus", row)
+        # haiku and other dropped
+        self.assertNotIn("haiku", row)
+        self.assertNotIn("other", row)
+
+    def test_other_bucket_shown(self):
+        w = self._windows(other=999)
+        row = _fmt_tier_row(w, tier="wide")
+        self.assertIn("other", row)
+
+    def test_both_windows_shown(self):
+        w = {"5h": {"total": 100, "by_tier": {"sonnet": {"input": 100, "output": 0,
+                    "cache_read": 0, "cache_create": 0, "total": 100}}},
+             "week": {"total": 200, "by_tier": {"opus": {"input": 200, "output": 0,
+                      "cache_read": 0, "cache_create": 0, "total": 200}}}}
+        row = _fmt_tier_row(w, tier="wide")
+        self.assertIn("5h", row)
+        self.assertIn("wk", row)
+        self.assertIn("sonnet", row)
+        self.assertIn("opus", row)
 
 
 class TestResultDataCache(unittest.TestCase):

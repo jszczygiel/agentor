@@ -5,7 +5,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from . import __version__ as AGENTOR_VERSION
 from .models import Item, ItemStatus
@@ -445,7 +445,12 @@ class Store:
             ).fetchone()
         return row is not None
 
-    def aggregate_token_usage(self, since: float | None = None) -> dict:
+    def aggregate_token_usage(
+        self,
+        since: float | None = None,
+        *,
+        classifier: Callable[[str], str | None] | None = None,
+    ) -> dict:
         """Sum token usage across all items whose `result_json` carries one.
 
         Returns a dict with `input`, `output`, `cache_read`, `cache_create`,
@@ -457,14 +462,32 @@ class Store:
         updated_at is strictly less than `since` are skipped. `None` keeps
         every row. Time bucketing (session/today/7d) is the caller's job.
 
+        When `classifier` is provided (a callable mapping model_id → alias),
+        the result also includes a `by_tier` key: a dict from tier name to
+        a sub-bucket dict with the same shape as the top-level keys. Models
+        that the classifier cannot resolve fall into the `"other"` tier. The
+        flat `usage` fallback path (no per-model ids) also routes to `"other"`.
+
         Multi-attempt items only contribute their latest result_json — the
         column is overwritten per run — so this is a "current state" total,
         not a full historical sum across retries.
         """
-        buckets = {
+        buckets: dict = {
             "input": 0, "output": 0,
             "cache_read": 0, "cache_create": 0,
         }
+        by_tier: dict[str, dict] = {}
+
+        def _tier_add(tier: str, inp: int, out: int, cr: int, cc: int) -> None:
+            if tier not in by_tier:
+                by_tier[tier] = {"input": 0, "output": 0,
+                                 "cache_read": 0, "cache_create": 0}
+            t = by_tier[tier]
+            t["input"] += inp
+            t["output"] += out
+            t["cache_read"] += cr
+            t["cache_create"] += cc
+
         with self._lock:
             rows = self.conn.execute(
                 "SELECT updated_at, result_json FROM items "
@@ -481,25 +504,40 @@ class Store:
                 continue
             mu = data.get("modelUsage")
             if isinstance(mu, dict) and mu:
-                for v in mu.values():
+                for model_id, v in mu.items():
                     if not isinstance(v, dict):
                         continue
-                    buckets["input"] += int(v.get("inputTokens", 0) or 0)
-                    buckets["output"] += int(v.get("outputTokens", 0) or 0)
-                    buckets["cache_read"] += int(
-                        v.get("cacheReadInputTokens", 0) or 0)
-                    buckets["cache_create"] += int(
-                        v.get("cacheCreationInputTokens", 0) or 0)
+                    inp = int(v.get("inputTokens", 0) or 0)
+                    out = int(v.get("outputTokens", 0) or 0)
+                    cr = int(v.get("cacheReadInputTokens", 0) or 0)
+                    cc = int(v.get("cacheCreationInputTokens", 0) or 0)
+                    buckets["input"] += inp
+                    buckets["output"] += out
+                    buckets["cache_read"] += cr
+                    buckets["cache_create"] += cc
+                    if classifier is not None:
+                        tier = classifier(model_id) or "other"
+                        _tier_add(tier, inp, out, cr, cc)
                 continue
             usage = data.get("usage")
             if isinstance(usage, dict):
-                buckets["input"] += int(usage.get("input_tokens", 0) or 0)
-                buckets["output"] += int(usage.get("output_tokens", 0) or 0)
-                buckets["cache_read"] += int(
-                    usage.get("cache_read_input_tokens", 0) or 0)
-                buckets["cache_create"] += int(
-                    usage.get("cache_creation_input_tokens", 0) or 0)
-        buckets["total"] = sum(buckets.values())
+                inp = int(usage.get("input_tokens", 0) or 0)
+                out = int(usage.get("output_tokens", 0) or 0)
+                cr = int(usage.get("cache_read_input_tokens", 0) or 0)
+                cc = int(usage.get("cache_creation_input_tokens", 0) or 0)
+                buckets["input"] += inp
+                buckets["output"] += out
+                buckets["cache_read"] += cr
+                buckets["cache_create"] += cc
+                if classifier is not None:
+                    _tier_add("other", inp, out, cr, cc)
+        buckets["total"] = sum(
+            v for k, v in buckets.items() if k != "by_tier"
+        )
+        if classifier is not None:
+            for t in by_tier.values():
+                t["total"] = sum(t.values())
+            buckets["by_tier"] = by_tier
         return buckets
 
     def update_result_json(self, item_id: str, blob: str) -> None:

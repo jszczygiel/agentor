@@ -1,9 +1,13 @@
 import json
 import time
+from typing import TYPE_CHECKING
 
 from ..capabilities import CLAUDE_CAPS, ProviderCapabilities
 from ..models import ItemStatus
 from ..store import Store, StoredItem
+
+if TYPE_CHECKING:
+    from ..providers import Provider
 
 
 # Table column layout. The TITLE column gets whatever width remains.
@@ -284,7 +288,11 @@ def _token_windows_invalidate() -> None:
     _token_cache["value"] = None
 
 
-def _token_windows(store: Store, daemon_started_at: float) -> dict[str, dict]:
+def _token_windows(
+    store: Store,
+    daemon_started_at: float,
+    provider: "Provider | None" = None,
+) -> dict[str, dict]:
     """Compute rolling 5-hour and weekly token totals in one pass — the same
     two windows that `claude.ai/settings/usage` headlines.
 
@@ -293,6 +301,13 @@ def _token_windows(store: Store, daemon_started_at: float) -> dict[str, dict]:
     windows are rolling against `now()` so the dashboard mirrors what the
     operator sees on the Anthropic usage page.
 
+    When `provider` is supplied its `model_to_alias` method is used as a
+    classifier so each window's dict also carries a `by_tier` key mapping
+    provider alias names (e.g. `haiku`, `sonnet`, `opus`) to sub-buckets.
+    Unknown model ids land in the `"other"` tier. Cache key includes the
+    provider class name so a mid-session provider flip (dashboard `[M]`)
+    busts the stale aggregate.
+
     Result is cached for `_TOKEN_CACHE_TTL_S` seconds so the 500ms render
     loop doesn't re-aggregate the whole items table every tick.
     """
@@ -300,15 +315,19 @@ def _token_windows(store: Store, daemon_started_at: float) -> dict[str, dict]:
     # Key includes id(store) so swapping the backing Store (notably between
     # tests with fresh TemporaryDirectory-backed DBs) correctly bypasses a
     # cached aggregate that belonged to a prior store.
-    key = (id(store), daemon_started_at)
+    provider_cls = type(provider).__name__ if provider is not None else None
+    key = (id(store), daemon_started_at, provider_cls)
     cached = _token_cache["value"]
     if (cached is not None
             and _token_cache["key"] == key
             and now - _token_cache["computed_at"] < _TOKEN_CACHE_TTL_S):
         return cached  # type: ignore[return-value]
+    classifier = provider.model_to_alias if provider is not None else None
     result = {
-        "5h": store.aggregate_token_usage(since=now - _TOKEN_5H_SECONDS),
-        "week": store.aggregate_token_usage(since=now - _TOKEN_WEEK_SECONDS),
+        "5h": store.aggregate_token_usage(
+            since=now - _TOKEN_5H_SECONDS, classifier=classifier),
+        "week": store.aggregate_token_usage(
+            since=now - _TOKEN_WEEK_SECONDS, classifier=classifier),
     }
     _token_cache["key"] = key
     _token_cache["computed_at"] = now
@@ -370,6 +389,25 @@ def _fmt_token_compact(windows: dict, agent_cfg=None) -> str:
             f"wk={_fmt_pct_cell(wk, wk_budget, compact=True)}")
 
 
+def _fmt_tier_breakdown(by_tier: dict, max_tiers: int) -> str:
+    """Format per-tier token totals as a compact inline string.
+
+    Returns an empty string when `by_tier` is empty. Non-zero tiers only,
+    sorted by total descending, capped at `max_tiers`."""
+    if not by_tier:
+        return ""
+    rows = [
+        (alias, int(t.get("total", 0)))
+        for alias, t in by_tier.items()
+        if int(t.get("total", 0)) > 0
+    ]
+    if not rows:
+        return ""
+    rows.sort(key=lambda r: -r[1])
+    parts = [f"{alias}:{_fmt_tokens(total)}" for alias, total in rows[:max_tiers]]
+    return "  ".join(parts)
+
+
 def _fmt_token_row(windows: dict, agent_cfg=None, tier: str = "wide") -> str:
     """One-line token readout mirroring claude.ai/settings/usage's two
     cells: rolling 5-hour and rolling weekly windows. Each cell leads with
@@ -388,6 +426,29 @@ def _fmt_token_row(windows: dict, agent_cfg=None, tier: str = "wide") -> str:
                 f"wk={_fmt_pct_cell(wk, wk_budget, compact=True)}")
     return (f"usage  5h {_fmt_pct_cell(five_h, five_h_budget)}  "
             f"wk {_fmt_pct_cell(wk, wk_budget)}")
+
+
+def _fmt_tier_row(windows: dict, tier: str = "wide") -> str:
+    """Per-provider-tier breakdown sub-line for the token panel.
+
+    Returns an empty string on narrow tier or when no `by_tier` data is
+    available (e.g. no provider threaded into `_token_windows`). Wide tier
+    shows all non-zero tiers; mid shows top-2 to stay inside ~60 cols."""
+    if tier == "narrow":
+        return ""
+    max_t = 99 if tier == "wide" else 2
+    five_h_tiers = _fmt_tier_breakdown(
+        windows.get("5h", {}).get("by_tier", {}), max_tiers=max_t)
+    wk_tiers = _fmt_tier_breakdown(
+        windows.get("week", {}).get("by_tier", {}), max_tiers=max_t)
+    if not five_h_tiers and not wk_tiers:
+        return ""
+    parts = []
+    if five_h_tiers:
+        parts.append(f"5h [{five_h_tiers}]")
+    if wk_tiers:
+        parts.append(f"wk [{wk_tiers}]")
+    return "       " + "  ".join(parts)
 
 
 def _build_commit_message(item: StoredItem) -> str:
