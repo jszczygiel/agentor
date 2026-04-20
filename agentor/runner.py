@@ -607,6 +607,14 @@ class Runner:
                 questions = getattr(self, "_last_questions", []) or []
                 if questions:
                     result["questions"] = questions
+                # Record resolved plan-tier + source for post-hoc attribution.
+                # Only populated when the runner subclass set the attrs
+                # (ClaudeRunner/CodexRunner do; StubRunner doesn't).
+                plan_alias = getattr(self, "_last_plan_model", None)
+                plan_src = getattr(self, "_last_plan_model_source", None)
+                if plan_alias and plan_src:
+                    result["plan_model"] = plan_alias
+                    result["plan_model_source"] = plan_src
             else:
                 # Carry the approved plan forward on the final result.
                 prior = _parse_result_json(item.result_json)
@@ -903,8 +911,14 @@ class ClaudeRunner(Runner):
         self._last_execute_model = None
         self._last_execute_model_source = None
         self._last_plan_suggestion = None
+        self._last_plan_model = None
+        self._last_plan_model_source = None
+        alias, source = _resolve_plan_tier(self.config, self.provider, item)
+        self._last_plan_model = alias
+        self._last_plan_model_source = source
+        model_override = self.provider.model_aliases.get(alias)
         _, stdout = self._invoke_claude(
-            item, worktree, prompt,
+            item, worktree, prompt, model_override=model_override,
         )
         # For plan phase, _derive_summary is misleading (no commits, no
         # AGENT_SUMMARY.md → falls back to the base branch commit message).
@@ -943,6 +957,8 @@ class ClaudeRunner(Runner):
             prompt = f"{primer}\n{prompt}"
         prompt = self._prepend_feedback(item, prompt, phase="execute")
         prompt = _prepend_plan_answers(item, prompt)
+        self._last_plan_model = None
+        self._last_plan_model_source = None
         alias, source = _resolve_execute_tier(
             self.config, self.provider, item, plan,
         )
@@ -1306,9 +1322,15 @@ class CodexRunner(Runner):
         self._last_execute_model = None
         self._last_execute_model_source = None
         self._last_plan_suggestion = None
+        self._last_plan_model = None
+        self._last_plan_model_source = None
+        alias, source = _resolve_plan_tier(self.config, self.provider, item)
+        self._last_plan_model = alias
+        self._last_plan_model_source = source
+        model_override = self.provider.model_aliases.get(alias)
         output_path = self._last_message_path(item, "plan")
         _, stdout = self._invoke_codex(
-            item, worktree, prompt, output_path,
+            item, worktree, prompt, output_path, model_override=model_override,
         )
         plan_text = _read_output_message(output_path)
         if not plan_text:
@@ -1329,6 +1351,8 @@ class CodexRunner(Runner):
         prompt += _mark_done_instruction(self.config, item.source_file)
         prompt = self._prepend_feedback(item, prompt, phase="execute")
         prompt = _prepend_plan_answers(item, prompt)
+        self._last_plan_model = None
+        self._last_plan_model_source = None
         alias, source = _resolve_execute_tier(
             self.config, self.provider, item, plan,
         )
@@ -1918,6 +1942,62 @@ def _resolve_execute_tier(
     # used elsewhere. If the model id isn't known to this provider, fall
     # through to its first-listed alias rather than a hardcoded "opus"
     # (which would be wrong under any non-Claude provider).
+    default_alias = provider.model_to_alias(config.agent.model)
+    if default_alias is None:
+        default_alias = (
+            next(iter(provider.model_aliases)) if provider.model_aliases
+            else config.agent.model
+        )
+    return default_alias, "default"
+
+
+def _resolve_plan_tier(
+    config: Config, provider: Provider, item: StoredItem,
+) -> tuple[str, str]:
+    """Resolve the alias + source for the plan-phase model dispatch.
+
+    Precedence (first match wins):
+      1. `@plan_model:<alias>` tag on the item — whitelist-gated; typo/unknown
+         alias logs a soft warning and falls through, never raises.
+      2. `agent.plan_model` config knob — whitelist-gated same as tag.
+      3. Global default — reverse-mapped from `agent.model` via the provider's
+         `model_to_alias`, else first alias in `provider.model_aliases`, else
+         the raw `agent.model` string.
+
+    Whitelist is `agent.plan_model_whitelist` when non-empty, else the active
+    provider's full `model_aliases.keys()`. Alias vocabulary is per-provider —
+    `@plan_model:haiku` on a Codex-routed item falls through with a warning.
+
+    No self-nomination: the plan hasn't run yet so there is no trailer to
+    parse. `agent.single_phase=true` skips the plan phase entirely — callers
+    are responsible for not invoking the resolver in that case.
+
+    Returns `(alias, source)` where `source ∈ {"tag", "config", "default"}`.
+    """
+    configured = list(config.agent.plan_model_whitelist or [])
+    whitelist = configured or list(provider.model_aliases.keys())
+    allowed = {a.lower() for a in whitelist}
+
+    tag_raw = (item.tags or {}).get("plan_model")
+    if tag_raw:
+        tag = tag_raw.strip().lower()
+        if tag in allowed:
+            return tag, "tag"
+        print(
+            f"[runner] ignoring @plan_model tag {tag_raw!r} on item {item.id} — "
+            f"not in {provider.__class__.__name__} alias whitelist {sorted(allowed)!r}. "
+            "Use a short alias, not the full model id.",
+        )
+
+    if config.agent.plan_model:
+        alias = config.agent.plan_model.strip().lower()
+        if alias in allowed:
+            return alias, "config"
+        print(
+            f"[runner] ignoring agent.plan_model={config.agent.plan_model!r} — "
+            f"not in {provider.__class__.__name__} alias whitelist {sorted(allowed)!r}.",
+        )
+
     default_alias = provider.model_to_alias(config.agent.model)
     if default_alias is None:
         default_alias = (
