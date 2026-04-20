@@ -587,21 +587,45 @@ def reject_and_retry(store: Store, item: StoredItem, feedback: str) -> None:
 
 def approve_plan(
     store: Store, item: StoredItem, feedback: str | None = None,
+    answers: list[str] | None = None,
 ) -> None:
     """User approved the agent's development plan. Push the item back to QUEUED
     so the daemon re-claims it; the runner sees the persisted plan in
     result_json and runs the execute phase (resumes the same claude session).
 
     Optional `feedback` is persisted and consumed once by the runner's
-    `_prepend_feedback` on the execute phase — same path as reject_and_retry."""
+    `_prepend_feedback` on the execute phase — same path as reject_and_retry.
+
+    Optional `answers` (one string per plan-phase `## Open Questions` bullet)
+    is merged into `result_json["answers"]`; the runner's
+    `_prepend_plan_answers` surfaces the Q/A pairs at the top of the execute
+    prompt. Answers aren't consumed — they stay in result_json until the
+    execute phase overwrites the blob on completion."""
     assert item.status == ItemStatus.AWAITING_PLAN_REVIEW
     fields: dict[str, object] = {}
     if feedback:
         fields["feedback"] = feedback
+    if answers and any(a.strip() for a in answers):
+        data: dict = {}
+        if item.result_json:
+            try:
+                loaded = json.loads(item.result_json)
+                if isinstance(loaded, dict):
+                    data = loaded
+            except json.JSONDecodeError:
+                pass
+        data["answers"] = list(answers)
+        fields["result_json"] = json.dumps(data)
+    note_suffix = ""
+    if feedback and fields.get("result_json"):
+        note_suffix = " with feedback + answers"
+    elif feedback:
+        note_suffix = " with feedback"
+    elif fields.get("result_json"):
+        note_suffix = " with answers"
     store.transition(
         item.id, ItemStatus.QUEUED,
-        note="plan approved — execute phase queued"
-        + (" with feedback" if feedback else ""),
+        note="plan approved — execute phase queued" + note_suffix,
         **fields,
     )
 

@@ -554,6 +554,9 @@ class Runner:
                 # Keep the plan text intact so the execute phase can inject
                 # it into the follow-up prompt and the review UI can show it.
                 result["plan"] = summary
+                questions = getattr(self, "_last_questions", []) or []
+                if questions:
+                    result["questions"] = questions
             else:
                 # Carry the approved plan forward on the final result.
                 prior = _parse_result_json(item.result_json)
@@ -814,6 +817,7 @@ class ClaudeRunner(Runner):
             or "(no plan text returned)"
         )
         self._last_phase = "plan"
+        self._last_questions = _extract_plan_questions(plan_text)
         return plan_text, []
 
     def _do_execute(
@@ -836,6 +840,7 @@ class ClaudeRunner(Runner):
         if primer:
             prompt = f"{primer}\n{prompt}"
         prompt = self._prepend_feedback(item, prompt, phase="execute")
+        prompt = _prepend_plan_answers(item, prompt)
         summary, stdout = self._invoke_claude(item, worktree, prompt)
         files = _list_changes(worktree, self.config.git.base_branch)
         summary = _derive_summary(worktree, stdout, item.title)
@@ -1142,6 +1147,7 @@ class CodexRunner(Runner):
                 getattr(self, "_last_usage", None) or {}
             ).get("result") or _extract_codex_result(stdout) or "(no plan text returned)"
         self._last_phase = "plan"
+        self._last_questions = _extract_plan_questions(plan_text)
         return plan_text, []
 
     def _do_execute(
@@ -1153,6 +1159,7 @@ class CodexRunner(Runner):
         )
         prompt += _mark_done_instruction(self.config, item.source_file)
         prompt = self._prepend_feedback(item, prompt, phase="execute")
+        prompt = _prepend_plan_answers(item, prompt)
         output_path = self._last_message_path(item, "execute")
         summary, stdout = self._invoke_codex(item, worktree, prompt, output_path)
         files = _list_changes(worktree, self.config.git.base_branch)
@@ -1589,6 +1596,65 @@ def _parse_result_json(blob: str | None) -> dict:
     except json.JSONDecodeError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _prepend_plan_answers(item: StoredItem, prompt: str) -> str:
+    """If the reviewer answered any of the agent's plan-phase questions,
+    surface their Q/A pairs at the very top of the execute prompt. The
+    parallel block to `_prepend_feedback` but fed from `result_json`
+    instead of the `feedback` column, and is idempotent — answers live in
+    result_json and don't need clearing (the execute phase overwrites the
+    blob on completion)."""
+    data = _parse_result_json(item.result_json)
+    questions = data.get("questions") or []
+    answers = data.get("answers") or []
+    if not questions or not any(
+        isinstance(a, str) and a.strip() for a in answers
+    ):
+        return prompt
+    lines = ["REVIEWER ANSWERS TO YOUR PLAN QUESTIONS:"]
+    for i, q in enumerate(questions):
+        a = answers[i] if i < len(answers) else ""
+        a = a.strip() if isinstance(a, str) else ""
+        lines.append(f"- Q: {q}")
+        lines.append(
+            f"  A: {a if a else '(no answer — proceed with your best judgment)'}"
+        )
+    lines.append("")
+    return "\n".join(lines) + "\n" + prompt
+
+
+_QUESTIONS_HEADING_RE = re.compile(
+    r"(?im)^\s*#{1,6}\s*open\s+questions?\s*$"
+)
+_NEXT_HEADING_RE = re.compile(r"(?m)^\s*#{1,6}\s+\S")
+_BULLET_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+
+
+def _extract_plan_questions(plan: str) -> list[str]:
+    """Return `?`-terminated bullets under the first `## Open Questions`
+    heading (any level, case-insensitive). Returns [] when the heading is
+    absent. Only bulleted lines (`-`, `*`, `+`, `1.`, `1)`) are considered;
+    unbulleted prose in the block is ignored. Lines that don't end in `?`
+    are dropped — guards against the agent stashing non-questions under the
+    heading."""
+    if not plan:
+        return []
+    m = _QUESTIONS_HEADING_RE.search(plan)
+    if not m:
+        return []
+    rest = plan[m.end():]
+    nxt = _NEXT_HEADING_RE.search(rest)
+    block = rest[:nxt.start()] if nxt else rest
+    out: list[str] = []
+    for raw in block.splitlines():
+        match = _BULLET_LINE_RE.match(raw)
+        if not match:
+            continue
+        text = match.group(1).strip()
+        if text.endswith("?"):
+            out.append(text)
+    return out
 
 
 def _parse_usage(stdout: str) -> dict | None:

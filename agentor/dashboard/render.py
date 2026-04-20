@@ -752,7 +752,9 @@ def _prompt_text(stdscr, message: str) -> str:
         return ""
 
 
-def _prompt_multiline(stdscr, label: str, *, rows: int | None = None) -> str:
+def _prompt_multiline(
+    stdscr, label: str, *, rows: int | None = None, initial: str = "",
+) -> str:
     """Multi-line text entry in a centered overlay. Enter inserts a newline;
     Ctrl-G or Ctrl-X submits; Ctrl-C or Esc cancels (empty string). Empty
     submit also returns empty. Falls back to `_prompt_text` on very small
@@ -760,7 +762,12 @@ def _prompt_multiline(stdscr, label: str, *, rows: int | None = None) -> str:
 
     `rows` is the visible edit area height. When None, it adapts to the
     terminal — larger terminals get more room for longer feedback, capped
-    so the overlay never eats the whole screen."""
+    so the overlay never eats the whole screen.
+
+    `initial` seeds the edit buffer with starter text (e.g. a `Q1:…\nA1:`
+    scaffold). The cursor lands at the end of the seeded content so the
+    operator can type immediately without navigating. Empty string (the
+    default) preserves pre-existing behavior."""
     import curses.textpad
 
     h, w = stdscr.getmaxyx()
@@ -805,6 +812,29 @@ def _prompt_multiline(stdscr, label: str, *, rows: int | None = None) -> str:
     # stripspaces=True (default) drops trailing whitespace per-line; that
     # wipes intentional blank paragraph separators in multi-line feedback.
     box.stripspaces = False
+
+    if initial:
+        # Seed the edit buffer. Paint each line via addnstr then move the
+        # cursor to the end of the last line so the operator can type
+        # immediately. Lines longer than inner_cols are clipped (the
+        # seeded text is meant to be short scaffolding, not a paste).
+        seeded_lines = initial.splitlines() or [""]
+        last_y = 0
+        last_x = 0
+        for i, line in enumerate(seeded_lines):
+            if i >= inner_rows:
+                break
+            try:
+                edit_win.addnstr(i, 0, line, max(0, inner_cols - 1))
+            except curses.error:
+                pass
+            last_y = i
+            last_x = min(len(line), max(0, inner_cols - 1))
+        try:
+            edit_win.move(last_y, last_x)
+        except curses.error:
+            pass
+        edit_win.refresh()
 
     cancelled = {"flag": False}
     # Mutable holder so the validator closure can swap the live windows on

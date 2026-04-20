@@ -790,6 +790,51 @@ class TestApproveFeedbackSplit(unittest.TestCase):
         self.assertEqual(final.status, ItemStatus.QUEUED)
         self.assertIsNone(final.feedback)
 
+    def test_approve_plan_persists_answers_into_result_json(self):
+        item = self._plan_review_item()
+        approve_plan(
+            self.store, item,
+            answers=["yes keep it", "under .agentor/"],
+        )
+        final = self.store.get(item.id)
+        self.assertEqual(final.status, ItemStatus.QUEUED)
+        data = json.loads(final.result_json)
+        self.assertEqual(
+            data.get("answers"), ["yes keep it", "under .agentor/"],
+        )
+        # Plan text preserved.
+        self.assertEqual(data.get("plan"), "draft")
+        last = self.store.transitions_for(item.id)[-1]
+        self.assertIn("with answers", last.note or "")
+
+    def test_approve_plan_none_answers_leaves_result_json_untouched(self):
+        item = self._plan_review_item()
+        approve_plan(self.store, item, answers=None)
+        final = self.store.get(item.id)
+        data = json.loads(final.result_json)
+        self.assertNotIn("answers", data)
+
+    def test_approve_plan_all_blank_answers_is_noop(self):
+        item = self._plan_review_item()
+        approve_plan(self.store, item, answers=["", "  "])
+        final = self.store.get(item.id)
+        data = json.loads(final.result_json)
+        self.assertNotIn("answers", data)
+
+    def test_approve_plan_feedback_and_answers_both_set(self):
+        item = self._plan_review_item()
+        approve_plan(
+            self.store, item,
+            feedback="also, avoid touching store.py",
+            answers=["yes keep it"],
+        )
+        final = self.store.get(item.id)
+        self.assertEqual(final.feedback, "also, avoid touching store.py")
+        data = json.loads(final.result_json)
+        self.assertEqual(data.get("answers"), ["yes keep it"])
+        last = self.store.transitions_for(item.id)[-1]
+        self.assertIn("feedback + answers", last.note or "")
+
 
 class TestConcurrentIntegration(unittest.TestCase):
     """Two AWAITING_REVIEW items approved simultaneously must both reach

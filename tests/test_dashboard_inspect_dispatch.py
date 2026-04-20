@@ -104,6 +104,115 @@ class TestInspectDispatch(unittest.TestCase):
         self.assertEqual(self.store.get("plan1").status, ItemStatus.QUEUED)
         self.assertEqual(self.daemon.filled, 1)
 
+    def test_plan_review_approve_with_questions_prompts_for_answers(self):
+        """When the agent's plan contained `## Open Questions`, pressing `a`
+        on AWAITING_PLAN_REVIEW must open the multiline overlay seeded with
+        the Q/A scaffold, then persist the parsed answers into
+        `result_json["answers"]` so the runner can inject them during the
+        resumed execute phase."""
+        import json
+        self._seed("plan1", ItemStatus.QUEUED)
+        self.store.transition("plan1", ItemStatus.WORKING, note="t")
+        self.store.transition(
+            "plan1", ItemStatus.AWAITING_PLAN_REVIEW,
+            result_json=json.dumps({
+                "phase": "plan",
+                "plan": "draft",
+                "questions": [
+                    "Should we keep the legacy flag?",
+                    "Where does the lock file live?",
+                ],
+            }),
+            note="t",
+        )
+        captured: dict = {}
+
+        def fake_multiline(_stdscr, _label, **kwargs):
+            captured["initial"] = kwargs.get("initial", "")
+            return (
+                "Q1: Should we keep the legacy flag?\n"
+                "A1: yes, keep for one release\n"
+                "\n"
+                "Q2: Where does the lock file live?\n"
+                "A2: under .agentor/merge.lock\n"
+            )
+
+        with patch(
+            "agentor.dashboard.modes._prompt_multiline", fake_multiline,
+        ):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("plan1"), "a",
+            )
+        self.assertTrue(acted)
+        self.assertIn("answers", msg)
+        self.assertIn("Q1:", captured["initial"])
+        self.assertIn("A1: ", captured["initial"])
+        self.assertIn("Q2:", captured["initial"])
+        got = self.store.get("plan1")
+        self.assertEqual(got.status, ItemStatus.QUEUED)
+        data = json.loads(got.result_json)
+        self.assertEqual(
+            data["answers"],
+            ["yes, keep for one release", "under .agentor/merge.lock"],
+        )
+
+    def test_plan_review_approve_with_questions_empty_reply_cancels(self):
+        """Empty reply from the answers overlay must cancel the approve —
+        no transition, item stays in AWAITING_PLAN_REVIEW so the operator
+        can try again or switch to `r`-reject."""
+        import json
+        self._seed("plan1", ItemStatus.QUEUED)
+        self.store.transition("plan1", ItemStatus.WORKING, note="t")
+        self.store.transition(
+            "plan1", ItemStatus.AWAITING_PLAN_REVIEW,
+            result_json=json.dumps({
+                "phase": "plan", "plan": "draft",
+                "questions": ["keep flag?"],
+            }),
+            note="t",
+        )
+        with patch(
+            "agentor.dashboard.modes._prompt_multiline",
+            lambda *_a, **_kw: "",
+        ):
+            acted, msg = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("plan1"), "a",
+            )
+        self.assertFalse(acted)
+        self.assertEqual(msg, "")
+        self.assertEqual(
+            self.store.get("plan1").status, ItemStatus.AWAITING_PLAN_REVIEW,
+        )
+
+    def test_plan_review_approve_without_questions_skips_overlay(self):
+        """No questions → no overlay. Flow identical to pre-feature — a
+        single `approve_plan(store, item)` with answers=None, no prompt."""
+        self._seed("plan1", ItemStatus.QUEUED)
+        self.store.transition("plan1", ItemStatus.WORKING, note="t")
+        self.store.transition(
+            "plan1", ItemStatus.AWAITING_PLAN_REVIEW,
+            result_json='{"phase":"plan","plan":"draft"}',
+            note="t",
+        )
+        called = {"multiline": 0}
+
+        def fake_multiline(*_a, **_kw):
+            called["multiline"] += 1
+            return ""
+
+        with patch(
+            "agentor.dashboard.modes._prompt_multiline", fake_multiline,
+        ):
+            acted, _ = _inspect_dispatch(
+                None, None, self.store, self.daemon,
+                self._fresh("plan1"), "a",
+            )
+        self.assertTrue(acted)
+        self.assertEqual(called["multiline"], 0)
+        self.assertEqual(self.store.get("plan1").status, ItemStatus.QUEUED)
+
     def test_plan_review_feedback_key_requeues_with_note(self):
         """`r` in plan review calls `reject_and_retry`: item goes back to
         QUEUED with feedback set, result_json cleared, attempts reset.
@@ -684,6 +793,75 @@ class TestInspectFooterPriorityHint(unittest.TestCase):
         footer = _inspect_footer(ItemStatus.AWAITING_PLAN_REVIEW, cycle=False)
         self.assertIn("[P/O]priority", footer)
         self.assertIn("[a]approve→execute", footer)
+
+
+class TestAnswersScaffoldAndParse(unittest.TestCase):
+    """Pure-function tests for the helpers that translate between the
+    agent's question list and the operator's seeded / filled-in overlay
+    buffer. Decoupled from curses so they run quickly and pin the
+    format contract the approve flow depends on."""
+
+    def test_scaffold_formats_sequentially(self):
+        from agentor.dashboard.modes import _answers_scaffold
+        out = _answers_scaffold([
+            "Should we keep the legacy flag?",
+            "Where does the lock file live?",
+        ])
+        self.assertIn("Q1: Should we keep the legacy flag?\nA1: ", out)
+        self.assertIn("Q2: Where does the lock file live?\nA2: ", out)
+        # Blank line separates pairs so the overlay renders a paragraph
+        # gap between questions.
+        self.assertIn("\n\nQ2:", out)
+
+    def test_parse_answers_happy_path(self):
+        from agentor.dashboard.modes import _parse_answers
+        reply = (
+            "Q1: Should we keep the legacy flag?\n"
+            "A1: yes, for one release\n"
+            "\n"
+            "Q2: Where does the lock file live?\n"
+            "A2: under .agentor/\n"
+        )
+        self.assertEqual(
+            _parse_answers(reply, 2),
+            ["yes, for one release", "under .agentor/"],
+        )
+
+    def test_parse_answers_multiline_body(self):
+        """Continuation lines between A1 and Q2 belong to A1 so the
+        reviewer can expand on a single answer across several rows."""
+        from agentor.dashboard.modes import _parse_answers
+        reply = (
+            "Q1: Big question?\n"
+            "A1: first line\n"
+            "  second line\n"
+            "  third line\n"
+            "\n"
+            "Q2: Small question?\n"
+            "A2: short\n"
+        )
+        parsed = _parse_answers(reply, 2)
+        self.assertEqual(
+            parsed[0], "first line\n  second line\n  third line",
+        )
+        self.assertEqual(parsed[1], "short")
+
+    def test_parse_answers_blank_entries_pad_to_length(self):
+        """Reviewer skipped A2 entirely. Parser still returns `n` strings
+        so downstream alignment with the questions list stays intact."""
+        from agentor.dashboard.modes import _parse_answers
+        reply = "Q1: first?\nA1: yes\n\nQ2: second?\n"
+        self.assertEqual(_parse_answers(reply, 2), ["yes", ""])
+
+    def test_parse_answers_handles_missing_prefix(self):
+        """Operator typed freeform without Q/A markers — parser returns all
+        blanks rather than crashing. The approve flow treats this as
+        `(no answer)` for every question, which the runner renders as the
+        "proceed with best judgment" fallback."""
+        from agentor.dashboard.modes import _parse_answers
+        self.assertEqual(
+            _parse_answers("just rambling text\n", 2), ["", ""],
+        )
 
 
 if __name__ == "__main__":

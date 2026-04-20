@@ -15,7 +15,10 @@ from agentor.models import ItemStatus
 from agentor.recovery import recover_on_startup
 from agentor.runner import (CodexRunner, StubRunner,
                             _default_claude_command,
-                            _mark_done_instruction, make_runner, plan_worktree,
+                            _extract_plan_questions,
+                            _mark_done_instruction,
+                            _prepend_plan_answers,
+                            make_runner, plan_worktree,
                             write_claude_settings)
 from agentor.store import Store
 from agentor.watcher import scan_once
@@ -2612,6 +2615,235 @@ class TestCodexRunnerCheckpointObservation(unittest.TestCase):
         # Helper must not receive stdin-wiring kwargs; claude-only feature.
         self.assertNotIn("stdin_payload", extra)
         self.assertNotIn("stdin_holder", extra)
+
+
+class TestExtractPlanQuestions(unittest.TestCase):
+    """`_extract_plan_questions` parses the agent's `## Open Questions`
+    block into a list that downstream code can seed into the reviewer's
+    answer prompt. Anchoring on an explicit heading + `?`-terminated bullets
+    keeps the parser immune to stray question marks in the rest of the
+    plan prose."""
+
+    def test_absent_heading_returns_empty(self):
+        plan = "1. Deliverable\n- ship it\n\n2. Risks\n- none\n"
+        self.assertEqual(_extract_plan_questions(plan), [])
+
+    def test_empty_plan_returns_empty(self):
+        self.assertEqual(_extract_plan_questions(""), [])
+        self.assertEqual(_extract_plan_questions(None), [])  # type: ignore[arg-type]
+
+    def test_basic_dash_bullets(self):
+        plan = (
+            "Plan body here.\n\n"
+            "## Open Questions\n"
+            "- Should we keep the legacy flag?\n"
+            "- Where does the config live?\n"
+        )
+        self.assertEqual(
+            _extract_plan_questions(plan),
+            [
+                "Should we keep the legacy flag?",
+                "Where does the config live?",
+            ],
+        )
+
+    def test_mixed_bullet_styles(self):
+        plan = (
+            "## Open Questions\n"
+            "- Dash bullet?\n"
+            "* Star bullet?\n"
+            "1. Numbered bullet?\n"
+            "2) Paren-numbered bullet?\n"
+        )
+        self.assertEqual(
+            _extract_plan_questions(plan),
+            [
+                "Dash bullet?",
+                "Star bullet?",
+                "Numbered bullet?",
+                "Paren-numbered bullet?",
+            ],
+        )
+
+    def test_heading_case_insensitive_and_any_level(self):
+        for h in ("# Open Questions", "### open questions", "###### OPEN QUESTION"):
+            plan = f"intro\n\n{h}\n- Really?\n"
+            self.assertEqual(_extract_plan_questions(plan), ["Really?"])
+
+    def test_non_question_lines_skipped(self):
+        plan = (
+            "## Open Questions\n"
+            "- Keep legacy flag?\n"
+            "- Just a statement without qmark.\n"
+            "- Trailing space preserved?\n"
+        )
+        self.assertEqual(
+            _extract_plan_questions(plan),
+            ["Keep legacy flag?", "Trailing space preserved?"],
+        )
+
+    def test_stops_at_next_heading(self):
+        plan = (
+            "## Open Questions\n"
+            "- First?\n"
+            "- Second?\n"
+            "\n"
+            "## Next Section\n"
+            "- Not a question?\n"
+        )
+        self.assertEqual(
+            _extract_plan_questions(plan),
+            ["First?", "Second?"],
+        )
+
+    def test_unbulleted_lines_ignored(self):
+        plan = (
+            "## Open Questions\n"
+            "Should we consider this?\n"
+            "- But this one counts?\n"
+        )
+        self.assertEqual(
+            _extract_plan_questions(plan), ["But this one counts?"],
+        )
+
+
+class TestClaudeRunnerQuestionsPersisted(unittest.TestCase):
+    """End-to-end: when the plan phase output contains `## Open Questions`,
+    the extracted list lands in `result_json["questions"]` after the runner
+    transitions the item to AWAITING_PLAN_REVIEW."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name) / "proj"
+        self.root.mkdir()
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] Plan with questions\n")
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _run_plan_with_fake(self, plan_text: str) -> "StoredItem":
+        """Wire a fake `claude` that prints a single --output-format=json
+        envelope whose `result` field is the supplied plan_text. Drives the
+        plan phase only and returns the refreshed item."""
+        bin_dir = Path(self.td.name) / "bin"
+        # Fake claude emits a minimal JSON envelope; runner parses `result`.
+        envelope = json.dumps({"result": plan_text, "session_id": "fake-sess"})
+        _write_fake_claude(bin_dir, f"cat <<'EOF'\n{envelope}\nEOF\n")
+        cfg = Config(
+            project_name=self.root.name, project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                runner="claude", pool_size=1,
+                command=[str(bin_dir / "claude"), "-p", "{prompt}"],
+                plan_prompt_template="PLAN: {title}",
+                execute_prompt_template="EXEC: {title}\nplan={plan}",
+                timeout_seconds=10,
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+        runner = make_runner(cfg, self.store)
+        runner.run(claimed)
+        return self.store.get(claimed.id)
+
+    def test_questions_persisted_when_present(self):
+        plan = (
+            "# Plan\n\n1. Deliverable\n- ship it\n\n"
+            "## Open Questions\n"
+            "- Should we keep compat shim?\n"
+            "- Where does the lock file live?\n"
+        )
+        refreshed = self._run_plan_with_fake(plan)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_PLAN_REVIEW)
+        data = json.loads(refreshed.result_json)
+        self.assertEqual(
+            data.get("questions"),
+            [
+                "Should we keep compat shim?",
+                "Where does the lock file live?",
+            ],
+        )
+
+    def test_questions_absent_key_omitted(self):
+        plan = "# Plan\n\n1. Deliverable\n- ship it\n\n2. Risks\n- none\n"
+        refreshed = self._run_plan_with_fake(plan)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_PLAN_REVIEW)
+        data = json.loads(refreshed.result_json)
+        self.assertNotIn("questions", data)
+
+
+class TestPrependPlanAnswers(unittest.TestCase):
+    """`_prepend_plan_answers` reads the reviewer's responses from
+    `result_json` and lands a Q/A block at the very top of the execute
+    prompt. No answers → untouched prompt."""
+
+    def _mk_item(self, questions, answers):
+        payload: dict = {"phase": "plan", "plan": "..."}
+        if questions:
+            payload["questions"] = questions
+        if answers is not None:
+            payload["answers"] = answers
+        from agentor.store import StoredItem
+        return StoredItem(
+            id="x", title="t", body="b", source_file="docs/backlog/x.md",
+            source_line=1, tags={}, status=ItemStatus.QUEUED,
+            worktree_path=None, branch=None, attempts=0,
+            last_error=None, feedback=None,
+            result_json=json.dumps(payload), session_id=None,
+            agentor_version=None, priority=0,
+            created_at=0.0, updated_at=0.0,
+        )
+
+    def test_no_questions_is_noop(self):
+        item = self._mk_item([], None)
+        self.assertEqual(_prepend_plan_answers(item, "BODY"), "BODY")
+
+    def test_all_blank_answers_is_noop(self):
+        item = self._mk_item(["Why?"], ["   "])
+        self.assertEqual(_prepend_plan_answers(item, "BODY"), "BODY")
+
+    def test_answers_block_prepended(self):
+        item = self._mk_item(
+            ["Keep the legacy flag?", "Where does the lock live?"],
+            ["yes, keep it for one release", "under .agentor/"],
+        )
+        out = _prepend_plan_answers(item, "BODY")
+        self.assertTrue(out.startswith("REVIEWER ANSWERS TO YOUR PLAN QUESTIONS:"))
+        self.assertIn("- Q: Keep the legacy flag?", out)
+        self.assertIn("  A: yes, keep it for one release", out)
+        self.assertIn("- Q: Where does the lock live?", out)
+        self.assertIn("  A: under .agentor/", out)
+        self.assertTrue(out.endswith("BODY"))
+
+    def test_partial_answers_use_fallback(self):
+        item = self._mk_item(
+            ["First?", "Second?", "Third?"],
+            ["yes", "", "no"],
+        )
+        out = _prepend_plan_answers(item, "BODY")
+        self.assertIn("- Q: Second?", out)
+        self.assertIn(
+            "  A: (no answer — proceed with your best judgment)", out,
+        )
+
+    def test_more_questions_than_answers_use_fallback(self):
+        item = self._mk_item(
+            ["First?", "Second?"],
+            ["only-first"],  # missing second entirely
+        )
+        out = _prepend_plan_answers(item, "BODY")
+        self.assertIn("  A: only-first", out)
+        self.assertIn(
+            "  A: (no answer — proceed with your best judgment)", out,
+        )
 
 
 if __name__ == "__main__":

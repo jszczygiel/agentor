@@ -41,6 +41,50 @@ from .transcript import (
 )
 
 
+_ANSWER_SPLIT_RE = None  # lazily compiled on first use
+
+
+def _answers_scaffold(questions: list[str]) -> str:
+    """Build the `Q1: …\\nA1: \\n\\nQ2: …\\nA2: \\n…` seed the multiline
+    prompt is pre-populated with. Keeps Q/A pairs together so the operator
+    can reply inline without scrolling back to correlate the question."""
+    chunks = []
+    for i, q in enumerate(questions, start=1):
+        chunks.append(f"Q{i}: {q}\nA{i}: ")
+    return "\n\n".join(chunks)
+
+
+def _parse_answers(reply: str, n: int) -> list[str]:
+    """Parse the operator's filled-in scaffold back into a list of exactly
+    `n` answers. Each `A<i>:` line (plus any continuation lines up to the
+    next `Q<j>:`) becomes one answer. Missing entries land as empty
+    strings so callers can detect "reviewer skipped this question" and
+    fall back to the (no answer — …) hint at execute-prompt assembly time."""
+    import re
+    global _ANSWER_SPLIT_RE
+    if _ANSWER_SPLIT_RE is None:
+        _ANSWER_SPLIT_RE = re.compile(r"(?m)^\s*([QA])(\d+)\s*:\s*(.*)$")
+    answers: dict[int, list[str]] = {}
+    current: tuple[str, int] | None = None
+    for raw_line in reply.splitlines():
+        m = _ANSWER_SPLIT_RE.match(raw_line)
+        if m:
+            kind = m.group(1)
+            idx = int(m.group(2))
+            body = m.group(3)
+            current = (kind, idx)
+            if kind == "A":
+                answers[idx] = [body]
+            continue
+        if current is not None and current[0] == "A":
+            answers[current[1]].append(raw_line)
+    out: list[str] = []
+    for i in range(1, n + 1):
+        parts = answers.get(i, [])
+        out.append("\n".join(parts).strip())
+    return out
+
+
 # Unified action keymap per item status. Each entry is (key, label).
 # The inspect view renders these as footer hints and gates keystrokes
 # against the set so a key only fires when the status allows it.
@@ -321,10 +365,24 @@ def _inspect_dispatch(
 
     if status == ItemStatus.AWAITING_PLAN_REVIEW:
         if key == "a":
-            approve_plan(store, item)
+            data = _result_data(item) or {}
+            questions = data.get("questions") or []
+            answers: list[str] | None = None
+            if questions:
+                seed = _answers_scaffold(questions)
+                reply = _prompt_multiline(
+                    stdscr,
+                    "answer open questions (empty=cancel approve)",
+                    initial=seed,
+                )
+                if not reply:
+                    return False, ""
+                answers = _parse_answers(reply, len(questions))
+            approve_plan(store, item, answers=answers)
             if daemon is not None:
                 daemon.try_fill_pool()
-            return True, "plan approved → execute queued"
+            suffix = " + answers" if answers else ""
+            return True, f"plan approved → execute queued{suffix}"
         if key == "r":
             feedback = _prompt_multiline(
                 stdscr, "feedback (plan retry)"
@@ -555,6 +613,12 @@ def _build_detail_lines(
             out.append("")
             out.append("── plan ──")
             out.extend(str(plan_text)[:4000].splitlines())
+        questions = data.get("questions") or []
+        if questions:
+            out.append("")
+            out.append("── open questions (answer on approve) ──")
+            for i, q in enumerate(questions, start=1):
+                out.append(f"  {i}. {q}")
     if item.status == ItemStatus.AWAITING_REVIEW:
         files = data.get("files_changed") or []
         if files:

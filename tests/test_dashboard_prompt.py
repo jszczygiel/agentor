@@ -44,12 +44,15 @@ class _FakeWin:
 
     def __init__(self):
         self.keypad_calls: list[bool] = []
+        self.addnstr_calls: list[tuple] = []
+        self.move_calls: list[tuple[int, int]] = []
 
     def bkgd(self, *_a, **_kw): pass
     def box(self): pass
-    def addnstr(self, *_a, **_kw): pass
+    def addnstr(self, *a, **_kw): self.addnstr_calls.append(a)
     def refresh(self): pass
     def keypad(self, flag): self.keypad_calls.append(flag)
+    def move(self, y, x): self.move_calls.append((y, x))
 
 
 def _install_fakes(monkey, textbox_factory, newwin_calls=None):
@@ -163,6 +166,84 @@ class TestPromptMultiline(unittest.TestCase):
         render._prompt_multiline(stdscr, "label")
         self.assertEqual(returned,
                          [curses.KEY_BACKSPACE] * 3)
+
+    def test_initial_seed_paints_and_positions_cursor(self):
+        """When `initial=` is provided, each seeded line is painted into the
+        edit window via addnstr and the cursor is moved to the end of the
+        last line. Omitting the kwarg leaves the window untouched — the
+        backwards-compatibility guarantee existing call sites rely on."""
+        painted_wins: list[_FakeWin] = []
+
+        class _RecordingWin(_FakeWin):
+            def __init__(self):
+                super().__init__()
+                painted_wins.append(self)
+
+        def _newwin(*_a, **_kw):
+            return _RecordingWin()
+
+        class FakeTextbox:
+            def __init__(self, win):
+                self.win = win
+                self.stripspaces = True
+
+            def edit(self, _validator):
+                pass
+
+            def gather(self):
+                return "Q1: Keep flag?\nA1: yes\n"
+
+        self.ctx.enter_context(patch.object(curses, "newwin", _newwin))
+        self.ctx.enter_context(patch.object(curses, "curs_set", lambda *_a: 0))
+        self.ctx.enter_context(patch("curses.textpad.Textbox", FakeTextbox))
+        stdscr = _FakeStdscr()
+        seed = "Q1: Keep the legacy flag?\nA1: "
+        out = render._prompt_multiline(stdscr, "label", initial=seed)
+        # Widget creates frame then edit. Edit is the only window move()
+        # is ever called on (cursor positioning); frame only gets addnstr.
+        edit_candidates = [w for w in painted_wins if w.move_calls]
+        self.assertTrue(edit_candidates, "expected cursor move on edit window")
+        edit_win = edit_candidates[-1]
+        # Each seeded line shows up as addnstr(y, x, line, maxlen).
+        line_strings = [call[2] for call in edit_win.addnstr_calls]
+        self.assertIn("Q1: Keep the legacy flag?", line_strings)
+        self.assertIn("A1: ", line_strings)
+        # Cursor lands at end of last seeded line (row 1, col = len("A1: ")).
+        self.assertEqual(edit_win.move_calls[-1], (1, len("A1: ")))
+        # Sanity: gather() drives the return path unchanged.
+        self.assertEqual(out, "Q1: Keep flag?\nA1: yes")
+
+    def test_no_initial_paints_nothing(self):
+        """Default `initial=''` must not call addnstr on the edit window —
+        existing callers depend on the blank-buffer contract."""
+        painted_wins: list[_FakeWin] = []
+
+        class _RecordingWin(_FakeWin):
+            def __init__(self):
+                super().__init__()
+                painted_wins.append(self)
+
+        def _newwin(*_a, **_kw):
+            return _RecordingWin()
+
+        class FakeTextbox:
+            def __init__(self, win):
+                self.stripspaces = True
+
+            def edit(self, _validator):
+                pass
+
+            def gather(self):
+                return ""
+
+        self.ctx.enter_context(patch.object(curses, "newwin", _newwin))
+        self.ctx.enter_context(patch.object(curses, "curs_set", lambda *_a: 0))
+        self.ctx.enter_context(patch("curses.textpad.Textbox", FakeTextbox))
+        render._prompt_multiline(_FakeStdscr(), "label")
+        # Frame window paints via addnstr (header/footer); edit window
+        # should not be painted at all.
+        edit_wins = [w for w in painted_wins if not w.addnstr_calls]
+        self.assertTrue(edit_wins, "expected an unpainted edit window")
 
     def _run_capture_newwin(self, *, stdscr, rows=None):
         """Run the widget and return the edit-window size `curses.newwin`

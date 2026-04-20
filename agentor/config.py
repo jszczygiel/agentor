@@ -77,7 +77,10 @@ class AgentConfig:
         "3. Changes — numbered file:function edits, one line each.\n"
         "4. Tests — test files/cases to add or touch.\n"
         "5. Risks — what could break.\n"
-        "6. Open questions — only if reviewer must resolve.\n\n"
+        "6. Open questions — only if the reviewer must resolve before "
+        "execution. When present, emit them AFTER the numbered list under "
+        "a literal `## Open Questions` heading, one `?`-terminated bullet "
+        "per question (`- ...?`). Omit the heading entirely if none.\n\n"
         "A human reviews this plan before execution runs. Keep it tight."
     )
     execute_prompt_template: str = (
