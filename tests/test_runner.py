@@ -2070,6 +2070,43 @@ sleep 3
         self.assertEqual([e["type"] for e in events], ["first", "second"])
         self.assertEqual(events[1]["line"], "nudge-payload")
 
+    def test_transcript_flushed_before_event_callback(self):
+        # Regression guard: the hot loop holds the transcript open and must
+        # flush each line to disk BEFORE calling on_event, so live-tail
+        # consumers (dashboard/transcript.py::iter_events) see events as they
+        # happen rather than only after the subprocess exits.
+        from agentor.runner import _run_stream_json_subprocess
+
+        cli = self._fake_cli(
+            'printf \'{"type":"first"}\\n\'\n'
+            'sleep 0.2\n'
+            'printf \'{"type":"second"}\\n\'\n'
+        )
+        seen_on_disk: list[str] = []
+
+        def on_event(ev: dict) -> None:
+            seen_on_disk.append(self.transcript.read_text())
+            return None
+
+        _run_stream_json_subprocess(
+            args=[str(cli)],
+            cwd=self.root,
+            timeout_seconds=5,
+            transcript_path=self.transcript,
+            proc_registry=None,
+            item_key="k",
+            fnfe_hint="missing",
+            on_event=on_event,
+        )
+        self.assertEqual(len(seen_on_disk), 2)
+        # When the first event's callback fires, the first JSON line is
+        # already on disk but the second hasn't been emitted yet.
+        self.assertIn('"type":"first"', seen_on_disk[0])
+        self.assertNotIn('"type":"second"', seen_on_disk[0])
+        # By the second callback, both lines are visible on disk.
+        self.assertIn('"type":"first"', seen_on_disk[1])
+        self.assertIn('"type":"second"', seen_on_disk[1])
+
 
 class TestClaudeRunnerCheckpointInjection(unittest.TestCase):
     """Drive `_invoke_claude_streaming` with a stubbed stream-json helper

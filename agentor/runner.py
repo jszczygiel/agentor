@@ -776,11 +776,17 @@ def _run_stream_json_subprocess(
     # the file once before the first attempt.
     with transcript_path.open("a") as fh:
         fh.write(f"args: {args}\n\nstdout:\n")
+    # Hold the transcript open for the duration of the read loop so the hot
+    # path is write+flush per event rather than open+fstat+write+close. Flush
+    # preserves the live-tail guarantee that
+    # `dashboard/transcript.py::iter_events` relies on.
+    transcript_fh = None
     try:
+        transcript_fh = transcript_path.open("a")
         for line in iter(p.stdout.readline, ""):
             stdout_buf.append(line)
-            with transcript_path.open("a") as fh:
-                fh.write(line)
+            transcript_fh.write(line)
+            transcript_fh.flush()
             stripped = line.strip()
             if stripped:
                 try:
@@ -804,6 +810,11 @@ def _run_stream_json_subprocess(
             proc_registry.unregister(item_key)
         if stdin_holder is not None:
             stdin_holder.close()
+        if transcript_fh is not None:
+            try:
+                transcript_fh.close()
+            except Exception:
+                pass
         try:
             p.stdout.close()
         except Exception:
