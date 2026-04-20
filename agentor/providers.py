@@ -25,7 +25,8 @@ top without a cycle.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import re
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
     from .config import Config
@@ -33,6 +34,13 @@ if TYPE_CHECKING:
 
 class Provider:
     """Base class. Subclasses override both methods."""
+
+    # Short alias → current-best model id for this CLI. Rotated in lockstep
+    # with the vendor's releases. `execute_model_whitelist` in AgentConfig
+    # defaults to `[]` meaning "this map's keys" — keep the default path
+    # honest by populating the map on every concrete subclass. Empty maps
+    # disable the `@model:` tag / plan-nomination channel for that provider.
+    model_aliases: ClassVar[dict[str, str]] = {}
 
     def is_dead_session_error(self, msg: str) -> bool:
         """True when the error message means the persisted session id /
@@ -51,6 +59,18 @@ class Provider:
         but stops demoting purely on wall-clock age."""
         raise NotImplementedError
 
+    def model_to_alias(self, model_id: str) -> str | None:
+        """Reverse lookup: map a full model id back to its short alias.
+        Default is exact-match against `model_aliases`; subclasses that
+        want a prefix fallback (e.g. `claude-opus-4-6` → `opus` even when
+        the map has rotated to `claude-opus-4-7`) override."""
+        if not model_id:
+            return None
+        for alias, mid in self.model_aliases.items():
+            if mid == model_id:
+                return alias
+        return None
+
 
 class ClaudeProvider(Provider):
     """Claude CLI. Sessions live ~5h and produce `No conversation found
@@ -60,6 +80,15 @@ class ClaudeProvider(Provider):
         "no conversation found with session id",
     )
     _SIG_NEEDLES = tuple(n.replace(" ", "") for n in _NEEDLES)
+
+    # Rotated in lockstep with Anthropic releases.
+    model_aliases: ClassVar[dict[str, str]] = {
+        "haiku": "claude-haiku-4-5",
+        "sonnet": "claude-sonnet-4-6",
+        "opus": "claude-opus-4-7",
+    }
+
+    _ALIAS_PREFIX_RE = re.compile(r"^claude-(haiku|sonnet|opus)\b")
 
     def __init__(self, config: "Config") -> None:
         self._config = config
@@ -76,6 +105,15 @@ class ClaudeProvider(Provider):
         hours = float(self._config.agent.session_max_age_hours)
         return hours if hours > 0 else None
 
+    def model_to_alias(self, model_id: str) -> str | None:
+        # Prefix fallback so e.g. `claude-opus-4-6` still resolves to
+        # `opus` when `model_aliases["opus"]` has rotated to a newer id.
+        exact = super().model_to_alias(model_id)
+        if exact is not None:
+            return exact
+        m = self._ALIAS_PREFIX_RE.match(model_id or "")
+        return m.group(1) if m else None
+
 
 class CodexProvider(Provider):
     """Codex CLI. Threads aren't immortal either — the CLI returns
@@ -89,6 +127,15 @@ class CodexProvider(Provider):
         "session not found",
     )
     _SIG_NEEDLES = tuple(n.replace(" ", "") for n in _NEEDLES)
+
+    # Size-tier aliases over OpenAI's current flagships. Distinct from
+    # Claude's `haiku/sonnet/opus` vocabulary — `@model:haiku` on a
+    # Codex-routed item correctly falls through to the default with a
+    # soft warning instead of silently pinning a Claude id.
+    model_aliases: ClassVar[dict[str, str]] = {
+        "mini": "gpt-5-mini",
+        "full": "gpt-5",
+    }
 
     def __init__(self, config: "Config") -> None:
         self._config = config
@@ -109,6 +156,11 @@ class CodexProvider(Provider):
 class StubProvider(Provider):
     """Test runner — no real sessions, no wall-clock expiry, no dead-
     session signature."""
+
+    # Mirror Claude's aliases so `runner="stub"` tests that expected the
+    # old global `_ALIAS_TO_MODEL` continue to resolve `haiku/sonnet/opus`
+    # without needing to pin `runner="claude"`.
+    model_aliases: ClassVar[dict[str, str]] = dict(ClaudeProvider.model_aliases)
 
     def __init__(self, config: "Config") -> None:
         self._config = config

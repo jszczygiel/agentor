@@ -3148,8 +3148,14 @@ class TestParseExecuteTier(unittest.TestCase):
         self.assertEqual(_parse_execute_tier(self._CANONICAL), "haiku")
 
     def test_rejects_unlisted_alias(self):
+        # Whitelist is required for gating now — the active provider's
+        # alias map is the authority, so `_resolve_execute_tier` always
+        # passes one. Callers that skip the whitelist get any well-formed
+        # alias back.
         plan = self._CANONICAL.replace("haiku", "gpt-4")
-        self.assertIsNone(_parse_execute_tier(plan))
+        self.assertIsNone(
+            _parse_execute_tier(plan, whitelist=["haiku", "sonnet", "opus"]),
+        )
 
     def test_missing_heading_returns_none(self):
         plan = "# Plan\n\n1. Deliverable\n- ship it\n"
@@ -3210,13 +3216,18 @@ class TestResolveExecuteTier(unittest.TestCase):
                 model=model,
                 auto_execute_model=auto,
                 execute_model_whitelist=(
-                    whitelist if whitelist is not None
-                    else ["haiku", "sonnet", "opus"]
+                    whitelist if whitelist is not None else []
                 ),
             ),
             git=GitConfig(base_branch="main", branch_prefix="agent/"),
             review=ReviewConfig(),
         )
+
+    def _mk_provider(self, cfg: Config, kind: str = "claude"):
+        from agentor.providers import ClaudeProvider, CodexProvider, StubProvider
+        cls = {"claude": ClaudeProvider, "codex": CodexProvider,
+               "stub": StubProvider}[kind]
+        return cls(cfg)
 
     def _mk_item(self, tags: dict[str, str] | None = None):
         from agentor.store import StoredItem
@@ -3241,49 +3252,59 @@ class TestResolveExecuteTier(unittest.TestCase):
 
     def test_tag_beats_plan(self):
         cfg = self._mk_cfg(auto=True)
+        provider = self._mk_provider(cfg)
         item = self._mk_item({"model": "haiku"})
         self.assertEqual(
-            _resolve_execute_tier(cfg, item, self._PLAN_OPUS),
+            _resolve_execute_tier(cfg, provider, item, self._PLAN_OPUS),
             ("haiku", "tag"),
         )
 
     def test_plan_when_opt_in_on(self):
         cfg = self._mk_cfg(auto=True)
+        provider = self._mk_provider(cfg)
         item = self._mk_item()
         self.assertEqual(
-            _resolve_execute_tier(cfg, item, self._PLAN_SONNET),
+            _resolve_execute_tier(cfg, provider, item, self._PLAN_SONNET),
             ("sonnet", "plan"),
         )
 
     def test_falls_back_when_opt_in_off(self):
         cfg = self._mk_cfg(auto=False)
+        provider = self._mk_provider(cfg)
         item = self._mk_item()
-        alias, source = _resolve_execute_tier(cfg, item, self._PLAN_SONNET)
+        alias, source = _resolve_execute_tier(
+            cfg, provider, item, self._PLAN_SONNET,
+        )
         self.assertEqual(source, "default")
         self.assertEqual(alias, "opus")
 
     def test_invalid_tag_falls_through(self):
         cfg = self._mk_cfg(auto=True)
+        provider = self._mk_provider(cfg)
         # Operator typo: full model id instead of alias.
         item = self._mk_item({"model": "claude-haiku-4-5"})
-        alias, source = _resolve_execute_tier(cfg, item, self._PLAN_SONNET)
+        alias, source = _resolve_execute_tier(
+            cfg, provider, item, self._PLAN_SONNET,
+        )
         self.assertNotEqual(source, "tag")
         # Plan suggestion wins the fallthrough since opt-in is on.
         self.assertEqual((alias, source), ("sonnet", "plan"))
 
     def test_tag_case_normalised(self):
         cfg = self._mk_cfg(auto=False)
+        provider = self._mk_provider(cfg)
         item = self._mk_item({"model": "Haiku"})
         self.assertEqual(
-            _resolve_execute_tier(cfg, item, ""),
+            _resolve_execute_tier(cfg, provider, item, ""),
             ("haiku", "tag"),
         )
 
     def test_default_derived_from_agent_model(self):
         cfg = self._mk_cfg(auto=False, model="claude-haiku-4-5")
+        provider = self._mk_provider(cfg)
         item = self._mk_item()
         self.assertEqual(
-            _resolve_execute_tier(cfg, item, ""),
+            _resolve_execute_tier(cfg, provider, item, ""),
             ("haiku", "default"),
         )
 
@@ -3291,31 +3312,89 @@ class TestResolveExecuteTier(unittest.TestCase):
         # single_phase=true → _do_execute is called with an empty plan
         # body; no trailer → default source.
         cfg = self._mk_cfg(auto=True)
+        provider = self._mk_provider(cfg)
         item = self._mk_item()
         self.assertEqual(
-            _resolve_execute_tier(cfg, item, ""),
+            _resolve_execute_tier(cfg, provider, item, ""),
             ("opus", "default"),
+        )
+
+    def test_codex_rejects_claude_alias_tag(self):
+        # Codex ships `{mini, full}` — a `@model:haiku` tag is a legacy
+        # Claude value under a Codex-routed item and MUST fall through
+        # with a soft warning rather than silently pinning a Claude id.
+        cfg = self._mk_cfg(auto=False, model="gpt-5")
+        provider = self._mk_provider(cfg, kind="codex")
+        item = self._mk_item({"model": "haiku"})
+        alias, source = _resolve_execute_tier(cfg, provider, item, "")
+        self.assertNotEqual(source, "tag")
+        # Default falls through to agent.model → codex's own reverse
+        # lookup returns "full" (gpt-5).
+        self.assertEqual((alias, source), ("full", "default"))
+
+    def test_codex_plan_nomination_scoped_to_codex_aliases(self):
+        cfg = self._mk_cfg(auto=True, model="gpt-5")
+        provider = self._mk_provider(cfg, kind="codex")
+        item = self._mk_item()
+        # A Claude-shaped plan nominating `sonnet` must NOT leak into a
+        # Codex execute dispatch; whitelist derives from Codex aliases.
+        alias, source = _resolve_execute_tier(
+            cfg, provider, item, self._PLAN_SONNET,
+        )
+        self.assertEqual(source, "default")
+        self.assertEqual(alias, "full")
+
+    def test_empty_whitelist_falls_through_to_provider_map(self):
+        # Default (empty) execute_model_whitelist == "all of this
+        # provider's aliases". Claude provider → haiku passes the gate.
+        cfg = self._mk_cfg(auto=False, whitelist=[])
+        provider = self._mk_provider(cfg)
+        item = self._mk_item({"model": "haiku"})
+        self.assertEqual(
+            _resolve_execute_tier(cfg, provider, item, ""),
+            ("haiku", "tag"),
         )
 
 
 class TestAliasMapShape(unittest.TestCase):
-    """`_ALIAS_TO_MODEL` rotates with Anthropic releases. Catch stale
-    typos at test-time instead of at claude CLI invocation time."""
+    """`ClaudeProvider.model_aliases` rotates with Anthropic releases.
+    Catch stale typos at test-time instead of at claude CLI invocation
+    time. Mirror the shape check for each other concrete provider so a
+    provider-specific alias set can't silently ship malformed."""
 
-    def test_aliases_map_to_valid_model_ids(self):
-        from agentor.config import _ALIAS_TO_MODEL
+    def test_claude_aliases_shape(self):
+        from agentor.providers import ClaudeProvider
         pat = re.compile(r"^claude-(haiku|sonnet|opus)-\d+-\d+$")
-        for alias, mid in _ALIAS_TO_MODEL.items():
+        for alias, mid in ClaudeProvider.model_aliases.items():
             self.assertIn(alias, {"haiku", "sonnet", "opus"})
             m = pat.match(mid)
             self.assertIsNotNone(
                 m, msg=f"{alias!r} → {mid!r} fails shape regex",
             )
-            # Alias must match the middle segment (haiku→claude-haiku-…).
             self.assertEqual(
                 m.group(1), alias,
                 msg=f"alias {alias!r} points at {mid!r} (mismatched family)",
             )
+
+    def test_codex_aliases_shape(self):
+        from agentor.providers import CodexProvider
+        # Codex aliases are size-tiers over OpenAI flagships. Enforce a
+        # non-empty map and non-empty string values; exact ids rotate.
+        aliases = CodexProvider.model_aliases
+        self.assertTrue(aliases)
+        for alias, mid in aliases.items():
+            self.assertTrue(alias)
+            self.assertTrue(mid)
+            self.assertNotIn("claude-", mid, msg=f"{alias!r} → {mid!r} looks Claude-shaped")
+
+    def test_codex_aliases_disjoint_from_claude(self):
+        from agentor.providers import ClaudeProvider, CodexProvider
+        # The bug the refactor closes: `@model:haiku` on a Codex item
+        # previously resolved to a Claude id. Guard against a future
+        # Codex alias accidentally overloading a Claude tier name.
+        self.assertFalse(
+            set(CodexProvider.model_aliases) & set(ClaudeProvider.model_aliases),
+        )
 
 
 class TestResultJsonRecordsExecuteModel(unittest.TestCase):
@@ -3464,9 +3543,10 @@ class TestDaemonProviderOverrideThreading(unittest.TestCase):
     def test_model_tag_still_resolves_tier_after_switcher_rework(self):
         # Regression guard: removing the model-override plumbing must
         # leave `@model:` tag → model id resolution intact.
-        from agentor.config import _ALIAS_TO_MODEL
+        from agentor.providers import ClaudeProvider
         from agentor.runner import _resolve_execute_tier
         cfg = self._cfg()
+        provider = ClaudeProvider(cfg)
         claimed = self._claim(cfg)
         # Stamp the @model tag on the persisted row and re-read.
         self.store.conn.execute(
@@ -3475,10 +3555,12 @@ class TestDaemonProviderOverrideThreading(unittest.TestCase):
         )
         self.store.conn.commit()
         tagged = self.store.get(claimed.id)
-        alias, source = _resolve_execute_tier(cfg, tagged, "")
+        alias, source = _resolve_execute_tier(cfg, provider, tagged, "")
         self.assertEqual(alias, "haiku")
         self.assertEqual(source, "tag")
-        self.assertEqual(_ALIAS_TO_MODEL[alias], "claude-haiku-4-5")
+        self.assertEqual(
+            ClaudeProvider.model_aliases[alias], "claude-haiku-4-5",
+        )
 
 
 class TestPlanPromptIncludesExecuteTierSection(unittest.TestCase):
