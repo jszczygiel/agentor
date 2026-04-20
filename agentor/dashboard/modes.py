@@ -419,15 +419,32 @@ def _inspect_dispatch(
                 except AttributeError:
                     term_w = 80
                 overlay_inner = max(10, min(80, term_w - 4) - 2)
-                seed = _answers_scaffold(questions, width=overlay_inner)
-                reply = _prompt_multiline(
-                    stdscr,
-                    "answer open questions (empty=cancel approve)",
-                    initial=seed,
-                )
-                if not reply:
+                n = len(questions)
+                collected: list[str] = []
+                aborted = False
+                for i, q in enumerate(questions, start=1):
+                    seed = _answers_scaffold([q], width=overlay_inner)
+                    reply = _prompt_multiline(
+                        stdscr,
+                        f"question {i}/{n} (empty=skip \u00b7 Ctrl-C=abort)",
+                        initial=seed,
+                    )
+                    # Empty reply means Ctrl-C/Esc cancel. Non-empty (even
+                    # when operator just left the A1: line blank) means
+                    # submit — _parse_answers extracts "" for a blank answer.
+                    # This distinguishes "skip this Q" from "abort all".
+                    if not reply:
+                        aborted = True
+                        break
+                    collected.append(_parse_answers(reply, 1)[0])
+                # Pad unanswered trailing questions with empty strings.
+                while len(collected) < n:
+                    collected.append("")
+                # Cancel approve only when operator aborted before entering
+                # any real content — matches pre-existing empty-reply semantics.
+                if aborted and not any(a.strip() for a in collected):
                     return False, ""
-                answers = _parse_answers(reply, len(questions))
+                answers = collected
             approve_plan(store, item, answers=answers)
             if daemon is not None:
                 daemon.try_fill_pool()
