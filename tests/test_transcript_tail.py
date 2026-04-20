@@ -4,12 +4,26 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from agentor.config import (
+    AgentConfig, Config, GitConfig, ParsingConfig, ReviewConfig, SourcesConfig,
+)
 from agentor.dashboard.transcript import (
     _TAIL_BYTES,
     _session_activity,
     _tail_lines,
 )
 from agentor.transcript import iter_raw_events
+
+
+def _cfg(root: Path) -> Config:
+    return Config(
+        project_name="p", project_root=root,
+        sources=SourcesConfig(watch=[], exclude=[]),
+        parsing=ParsingConfig(mode="checkbox"),
+        agent=AgentConfig(runner="claude"),
+        git=GitConfig(base_branch="main", branch_prefix="agent/"),
+        review=ReviewConfig(),
+    )
 
 
 def _write_large_transcript(path: Path, n_events: int) -> None:
@@ -55,8 +69,9 @@ class TestTailReads(unittest.TestCase):
         self.assertGreater(size, _TAIL_BYTES,
                            "fixture must exceed tail window")
 
+        cfg = _cfg(self.path.parent)
         t0 = time.monotonic()
-        out = _session_activity(self.path, limit=25)
+        out = _session_activity(cfg, self.path, limit=25)
         elapsed = time.monotonic() - t0
 
         self.assertLessEqual(len(out), 25)

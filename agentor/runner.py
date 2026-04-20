@@ -24,7 +24,6 @@ from .checkpoint import CheckpointConfig, CheckpointEmitter
 from .config import AgentConfig, Config
 from .models import ItemStatus
 from .providers import Provider, make_provider
-from .resume_primer import build_primer
 from .slug import slugify
 from .store import Store, StoredItem
 
@@ -913,7 +912,9 @@ class ClaudeRunner(Runner):
         # worst observed case. Summarise the prior tool activity and
         # prepend it so the agent knows what not to re-fetch. The subprocess
         # will overwrite this log on start, so we read it before launching.
-        primer = build_primer(self._execute_transcript_path(item))
+        primer = self.provider.build_primer(
+            self._execute_transcript_path(item)
+        )
         if primer:
             prompt = f"{primer}\n{prompt}"
         prompt = self._prepend_feedback(item, prompt, phase="execute")
