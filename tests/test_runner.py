@@ -2496,5 +2496,123 @@ class TestClaudeRunnerStreamJsonIntegration(unittest.TestCase):
         self.assertEqual(refreshed.status, ItemStatus.AWAITING_PLAN_REVIEW)
 
 
+class TestCodexRunnerCheckpointObservation(unittest.TestCase):
+    """Codex has no stream-json stdin, so the checkpoint emitter runs as a
+    passive dry-run observer — thresholds still fire, but each nudge is
+    written only as a `checkpoint-observed-dry-run` transcript marker.
+    Parallels TestClaudeRunnerCheckpointInjection."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] Big codex task\n  body\n")
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _mk_codex_cfg(self, **agent_overrides) -> Config:
+        kwargs = dict(
+            pool_size=1, runner="codex", model="gpt-5-codex",
+            turn_checkpoint_soft=3,
+            turn_checkpoint_hard=0,
+            output_token_checkpoint=0,
+        )
+        kwargs.update(agent_overrides)
+        agent = AgentConfig(**kwargs)
+        return Config(
+            project_name=self.root.name,
+            project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=agent,
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+
+    def _drive(self, cfg: Config, events: list[dict]) -> tuple[Path, dict]:
+        """Monkeypatch `_run_stream_json_subprocess`, drive `_invoke_codex_jsonl`
+        with the canned events, return (transcript_path, captured helper kwargs)."""
+        from agentor import runner as runner_mod
+        from agentor.runner import CodexRunner
+
+        runner = CodexRunner(cfg, self.store)
+        scan_once(cfg, self.store)
+        wt = self.root / "wt"
+        wt.mkdir()
+        claimed = self.store.claim_next_queued(str(wt), "agent/big-codex-task")
+        transcript_path = (
+            self.root / ".agentor" / "transcripts" / f"{claimed.id}.plan.log"
+        )
+        output_path = self.root / ".agentor" / "last-message" / "plan.txt"
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        transcript_path.write_text("")
+
+        captured_kwargs: dict = {}
+
+        def stub(*, args, cwd, timeout_seconds, transcript_path,
+                 proc_registry, item_key, fnfe_hint, on_event, **extra):
+            captured_kwargs["args"] = args
+            captured_kwargs["extra"] = extra
+            for ev in events:
+                on_event(ev)
+            return "codex result text", "", 0, False, None
+
+        original = runner_mod._run_stream_json_subprocess
+        runner_mod._run_stream_json_subprocess = stub
+        try:
+            runner._invoke_codex_jsonl(
+                claimed, ["codex", "exec", "--json", "-o",
+                          str(output_path), "THE-PROMPT"],
+                wt, transcript_path, output_path, "plan",
+            )
+        finally:
+            runner_mod._run_stream_json_subprocess = original
+
+        return transcript_path, captured_kwargs
+
+    def test_soft_threshold_emits_dry_run_marker_at_configured_turn(self):
+        cfg = self._mk_codex_cfg()
+        events = [{"type": "turn.started"} for _ in range(5)]
+        transcript_path, _ = self._drive(cfg, events)
+        transcript = transcript_path.read_text()
+        # Exactly one marker — soft threshold fires once at turn 3 and does
+        # not re-fire on turns 4 and 5 (CheckpointEmitter dedupes per-run).
+        self.assertEqual(transcript.count("checkpoint-observed-dry-run"), 1)
+        self.assertIn(
+            "[checkpoint-observed-dry-run @ turn 3 output_tokens=0]",
+            transcript,
+        )
+        # Marker includes the soft-template body; .format renders `{turns}`.
+        self.assertIn("You're at 3 turns", transcript)
+        # Never the `injected` variant on codex — no stdin.
+        self.assertNotIn("checkpoint-injected", transcript)
+
+    def test_all_disabled_skips_emitter(self):
+        cfg = self._mk_codex_cfg(
+            turn_checkpoint_soft=0,
+            turn_checkpoint_hard=0,
+            output_token_checkpoint=0,
+        )
+        events = [{"type": "turn.started"} for _ in range(5)]
+        transcript_path, _ = self._drive(cfg, events)
+        transcript = transcript_path.read_text()
+        self.assertNotIn("checkpoint-", transcript)
+
+    def test_codex_never_injects_via_stdin(self):
+        """Codex CLI has no stream-json stdin — the subprocess helper must be
+        invoked without stdin_payload/stdin_holder even when the emitter fires."""
+        cfg = self._mk_codex_cfg()
+        events = [{"type": "turn.started"} for _ in range(5)]
+        _, captured = self._drive(cfg, events)
+        extra = captured["extra"]
+        # Helper must not receive stdin-wiring kwargs; claude-only feature.
+        self.assertNotIn("stdin_payload", extra)
+        self.assertNotIn("stdin_holder", extra)
+
+
 if __name__ == "__main__":
     unittest.main()
