@@ -525,6 +525,30 @@ def _inspect_dispatch(
     return False, ""
 
 
+def _execute_model_lines(cfg: Config, item: StoredItem, data: dict) -> list[str]:
+    """Return 0-2 metadata lines for the plan-nominated and resolved execute
+    model tier. Lazy-imports `_parse_execute_tier` to avoid pulling `runner`
+    at module load (mirrors the committer lazy-import convention)."""
+    from ..runner import _parse_execute_tier
+
+    out: list[str] = []
+    plan_text = data.get("plan") or ""
+    if plan_text:
+        alias = _parse_execute_tier(plan_text, whitelist=None)
+        if alias:
+            if not getattr(cfg.agent, "auto_execute_model", False):
+                out.append(
+                    f"suggested: {alias} (advisory — auto_execute_model=false)"
+                )
+            else:
+                out.append(f"suggested: {alias}")
+    execute_alias = data.get("execute_model")
+    execute_source = data.get("execute_model_source")
+    if execute_alias and execute_source:
+        out.append(f"execute:   {execute_alias} (source: {execute_source})")
+    return out
+
+
 def _is_auto_resolve_chain(store: Store, item: StoredItem) -> bool:
     """True when the item most recently entered QUEUED via the auto-resolve
     chain from `approve_and_commit` — i.e. the last CONFLICTED → QUEUED
@@ -565,6 +589,7 @@ def _build_detail_lines(
     out.append(f"agent:    {item.agent_ref or '—'}")
     out.append(f"attempts: {item.attempts} / {cfg.agent.max_attempts}")
     out.append(f"agentor:  {item.agentor_version or '—'}")
+    out.extend(_execute_model_lines(cfg, item, data or {}))
     if item.status in (ItemStatus.QUEUED, ItemStatus.WORKING,
                        ItemStatus.CONFLICTED) \
             and _is_auto_resolve_chain(store, item):
