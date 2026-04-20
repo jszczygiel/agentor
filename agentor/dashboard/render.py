@@ -249,18 +249,25 @@ def _table_header(tier: str) -> str:
 
 
 def _table_row(tier: str, item, st, elapsed_s: str, ctx_s: str,
-               has_err: bool, w: int) -> str:
+               has_err: bool, w: int, auto_resolve: bool = False) -> str:
     """Compose one main-table row respecting the active width tier.
     The priority glyph (`*` for priority>0, space otherwise) is always
     reserved before the TITLE so pinned rows stay column-aligned with
-    ordinary ones."""
+    ordinary ones.
+
+    `auto_resolve` flags a QUEUED row that landed here via the
+    committer's auto-resolve chain (see `_is_auto_resolve_chain` in
+    `dashboard/modes.py`). Wide/mid suffix the state label with `·auto`;
+    narrow swaps the 3-char state cell's trailing space for `a` so the
+    column budget stays identical."""
     marker = "!" if has_err else " "
     pri_glyph = "*" if item.priority > 0 else " "
     pri_cell = f"{pri_glyph} "  # glyph + separator
 
     if tier == "narrow":
         glyph = _state_glyph(st)
-        state_cell = f"{marker}{glyph} "  # 3 chars total — matches header
+        tail = "a" if auto_resolve else " "
+        state_cell = f"{marker}{glyph}{tail}"  # 3 chars — matches header
         cols_used = 1 + (_COL_ID - 1) + 3 + _COL_ELAPSED + len(pri_cell)
         title_max = max(0, w - cols_used)
         title = item.title[:title_max]
@@ -273,6 +280,8 @@ def _table_row(tier: str, item, st, elapsed_s: str, ctx_s: str,
         if not phase:
             phase = "execute" if item.session_id else "plan"
         state_label = f"{state_label}·{'plan' if phase == 'plan' else 'exec'}"
+    elif auto_resolve:
+        state_label = f"{state_label}·auto"
     state_cell = f"{marker}{state_label}"[: _COL_STATE]
 
     if tier == "mid":
@@ -456,7 +465,16 @@ def _render_table(
         elapsed = _elapsed_for(store, it.id) if st == ItemStatus.WORKING else None
         elapsed_s = _fmt_elapsed(elapsed) if elapsed is not None else "—"
         ctx_s = _ctx_fill_pct(it, context_window)
-        line = _table_row(tier, it, st, elapsed_s, ctx_s, has_err, w)
+        # Short-circuit: only QUEUED rows pay the transition-history scan.
+        # Lazy import — modes depends on render-less pieces; importing at
+        # module top would flip the layering (render → modes is fine;
+        # modes → render is not).
+        auto = False
+        if st == ItemStatus.QUEUED:
+            from .modes import _is_auto_resolve_chain
+            auto = _is_auto_resolve_chain(store, it)
+        line = _table_row(tier, it, st, elapsed_s, ctx_s, has_err, w,
+                          auto_resolve=auto)
         if has_err:
             attr = curses.color_pair(4) | curses.A_BOLD
         else:
@@ -560,6 +578,7 @@ def _show_help(stdscr) -> None:
         "  Q queued   W working   P awaiting plan   R awaiting review",
         "  M merged   C conflicted  E errored  X rejected  D deferred",
         "  K cancelled  B backlog  A approved",
+        "  queued·auto / Qa — QUEUED re-enqueued by committer auto-resolve",
         "",
         "close help: q / enter / esc",
     ]
