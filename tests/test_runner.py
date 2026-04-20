@@ -2396,6 +2396,101 @@ class TestClaudeSettingsHookWiring(unittest.TestCase):
         self.assertIn(str(settings), args)
 
 
+class TestGuardrailAbstraction(unittest.TestCase):
+    """Provider-hook contract: `write_tool_guardrails` yields the
+    command-template substitutions for the provider's guardrail channel
+    (Claude → settings JSON), and `warn_silent_guardrails` lets providers
+    without such a channel (Codex) flag dead knobs at daemon startup."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _cfg(self, threshold: int = 400,
+             enforce_grep: bool = True) -> Config:
+        return Config(
+            project_name="proj", project_root=self.root,
+            sources=SourcesConfig(watch=[], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                large_file_line_threshold=threshold,
+                enforce_grep_head_limit=enforce_grep,
+            ),
+            git=GitConfig(), review=ReviewConfig(),
+        )
+
+    def test_stub_runner_write_tool_guardrails_returns_empty(self):
+        cfg = self._cfg()
+        runner = StubRunner(cfg, self.store)
+        self.assertEqual(runner.write_tool_guardrails(cfg, "abc"), {})
+
+    def test_claude_runner_write_tool_guardrails_returns_settings_path(self):
+        cfg = self._cfg()
+        runner = ClaudeRunner(cfg, self.store)
+        got = runner.write_tool_guardrails(cfg, "item-xyz")
+        self.assertEqual(set(got), {"settings_path"})
+        path = Path(got["settings_path"])
+        self.assertTrue(path.is_absolute())
+        self.assertTrue(path.exists())
+        # And the payload is still a valid claude settings JSON.
+        data = json.loads(path.read_text())
+        self.assertIn("hooks", data)
+
+    def test_codex_runner_write_tool_guardrails_returns_empty(self):
+        """Codex has no hook channel; it must NOT write a settings file
+        (that path is Claude-specific). Absence of
+        `.agentor/claude-settings/` is the observable signal."""
+        cfg = self._cfg()
+        runner = CodexRunner(cfg, self.store)
+        self.assertEqual(runner.write_tool_guardrails(cfg, "item-xyz"), {})
+        self.assertFalse(
+            (self.root / ".agentor" / "claude-settings").exists(),
+        )
+
+    def test_codex_warn_silent_guardrails_silent_on_defaults(self):
+        cfg = self._cfg()  # defaults: threshold=400, enforce_grep=True
+        runner = CodexRunner(cfg, self.store)
+        lines: list[str] = []
+        runner.warn_silent_guardrails(cfg, lines.append)
+        self.assertEqual(lines, [])
+
+    def test_codex_warn_silent_guardrails_flags_threshold(self):
+        cfg = self._cfg(threshold=800)
+        runner = CodexRunner(cfg, self.store)
+        lines: list[str] = []
+        runner.warn_silent_guardrails(cfg, lines.append)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("large_file_line_threshold=800", lines[0])
+        self.assertIn("no effect", lines[0])
+
+    def test_codex_warn_silent_guardrails_flags_grep(self):
+        cfg = self._cfg(enforce_grep=False)
+        runner = CodexRunner(cfg, self.store)
+        lines: list[str] = []
+        runner.warn_silent_guardrails(cfg, lines.append)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("enforce_grep_head_limit=False", lines[0])
+
+    def test_codex_warn_silent_guardrails_flags_both(self):
+        cfg = self._cfg(threshold=0, enforce_grep=False)
+        runner = CodexRunner(cfg, self.store)
+        lines: list[str] = []
+        runner.warn_silent_guardrails(cfg, lines.append)
+        self.assertEqual(len(lines), 2)
+
+    def test_claude_and_stub_runner_warn_silent_guardrails_no_op(self):
+        cfg = self._cfg(threshold=0, enforce_grep=False)
+        lines: list[str] = []
+        ClaudeRunner(cfg, self.store).warn_silent_guardrails(cfg, lines.append)
+        StubRunner(cfg, self.store).warn_silent_guardrails(cfg, lines.append)
+        self.assertEqual(lines, [])
+
+
 class TestStreamStateRateLimitHarvester(unittest.TestCase):
     """Passive capture of any `rate_limit`/`ratelimits`/`anthropic-ratelimit-*`
     fields the claude CLI might surface on future versions. Current CLI strips

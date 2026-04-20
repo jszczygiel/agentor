@@ -694,5 +694,70 @@ class TestStaleSessionWatchdog(unittest.TestCase):
         self.assertIn("a", d.stale_session_alerts)
 
 
+class TestStartupGuardrailWarning(unittest.TestCase):
+    """Daemon.run() invokes the provider's warn_silent_guardrails hook
+    exactly once at startup so operators learn at boot — not mid-review
+    — when a configured guardrail has no effect under the chosen runner."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _run_once(self, runner_factory, agent: AgentConfig) -> list[str]:
+        cfg = Config(
+            project_name="t", project_root=self.root,
+            sources=SourcesConfig(), parsing=ParsingConfig(),
+            agent=agent, git=GitConfig(), review=ReviewConfig(),
+        )
+        logs: list[str] = []
+        d = Daemon(cfg, self.store, runner_factory,
+                   scan_interval=0.01, install_signals=False,
+                   log=logs.append)
+        d.stop_event.set()  # exit the main loop immediately after startup
+        d.run()
+        return logs
+
+    def test_codex_factory_warns_on_non_default_knob(self):
+        from agentor.runner import CodexRunner
+        calls: list[tuple] = []
+
+        class _Codex(CodexRunner):
+            def warn_silent_guardrails(self_, config, log):
+                calls.append((config.agent.large_file_line_threshold,))
+                return super().warn_silent_guardrails(config, log)
+
+        def factory(c, s):
+            return _Codex(c, s)
+
+        agent = AgentConfig(pool_size=0, large_file_line_threshold=800)
+        logs = self._run_once(factory, agent)
+        # Hook invoked exactly once from the startup path.
+        self.assertEqual(len(calls), 1, calls)
+        warnings = [m for m in logs if "no effect" in m]
+        self.assertEqual(len(warnings), 1, logs)
+        self.assertIn("large_file_line_threshold=800", warnings[0])
+
+    def test_claude_factory_emits_no_warning(self):
+        """ClaudeRunner honours the knobs, so its warn hook is a no-op
+        even when non-default values are set."""
+        from agentor.runner import ClaudeRunner
+
+        def factory(c, s):
+            return ClaudeRunner(c, s)
+
+        agent = AgentConfig(
+            pool_size=0, large_file_line_threshold=800,
+            enforce_grep_head_limit=False,
+        )
+        logs = self._run_once(factory, agent)
+        warnings = [m for m in logs if "no effect" in m]
+        self.assertEqual(warnings, [])
+
+
 if __name__ == "__main__":
     unittest.main()

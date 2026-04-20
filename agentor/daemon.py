@@ -340,6 +340,16 @@ class Daemon:
             self.log(f"queued {len(rec.resumable)} resumable item(s) "
                      f"for dispatch")
 
+        # Provider-level startup warning: runners without a tool-guardrail
+        # channel (codex) log here if any guardrail knob is set to a
+        # non-default value, so operators learn at startup instead of
+        # mid-review that their config has no effect. Throwaway runner —
+        # not registered with `proc_registry`/`stop_event`, not attached
+        # to the worker pool.
+        self.runner_factory(self.config, self.store).warn_silent_guardrails(
+            self.config, self.log,
+        )
+
         # Heartbeat bookkeeping: log a one-liner once the daemon has been
         # idle (no new items, no dispatches, no workers) for ~30s of wall
         # time, so operator reports of "the app seems hung" can be

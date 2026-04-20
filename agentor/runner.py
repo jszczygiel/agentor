@@ -15,7 +15,7 @@ from typing import Callable, TypeVar
 
 from . import git_ops
 from .checkpoint import CheckpointConfig, CheckpointEmitter
-from .config import _ALIAS_TO_MODEL, Config
+from .config import _ALIAS_TO_MODEL, AgentConfig, Config
 from .models import ItemStatus
 from .providers import Provider, make_provider
 from .resume_primer import build_primer
@@ -383,6 +383,31 @@ class Runner:
         """Perform the agent's work inside the worktree. Return (summary, files_changed).
         Subclasses override. The base class commits no changes — committer does that."""
         raise NotImplementedError
+
+    def write_tool_guardrails(
+        self, config: Config, item_id: str,
+    ) -> dict[str, str]:
+        """Provider hook: produce placeholder substitutions for
+        `agent.command` templates that register tool guardrails (e.g.
+        PreToolUse Read/Grep hooks). Return a mapping of
+        `{placeholder_name: value}` splice into the command template via
+        `.format(**values)`. Return an empty dict when the provider has
+        no guardrail channel (Codex) so `agent.large_file_line_threshold`
+        / `agent.enforce_grep_head_limit` become observable no-ops.
+        Placeholder names are namespaced per provider — Claude uses
+        `{settings_path}`; future providers MUST pick a distinct key to
+        avoid collisions in shared command templates."""
+        return {}
+
+    def warn_silent_guardrails(
+        self, config: Config, log: Callable[[str], None],
+    ) -> None:
+        """Provider hook invoked once per daemon startup. Providers
+        without a guardrail channel (Codex) emit a log line when any
+        guardrail knob is set to a non-default value so operators learn
+        at startup — not mid-review — that their config has no effect.
+        Default is a no-op for providers that honour the knobs."""
+        return None
 
     def _record_failure(
         self, item: StoredItem, phase: str, error: str,
@@ -824,6 +849,18 @@ class ClaudeRunner(Runner):
             )
         return self._do_plan(item, worktree)
 
+    def write_tool_guardrails(
+        self, config: Config, item_id: str,
+    ) -> dict[str, str]:
+        """Claude's PreToolUse Read/Grep hooks ride on the `--settings
+        <path>` CLI flag. `write_claude_settings` writes the per-item
+        JSON registering the bundled hook scripts; the returned path is
+        spliced into `agent.command` via `{settings_path}`. Custom
+        templates dropping that placeholder silently disable
+        enforcement."""
+        path = write_claude_settings(config, item_id)
+        return {"settings_path": str(path)}
+
     def _do_plan(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
         prompt = self.config.agent.plan_prompt_template.format(
             title=item.title, body=item.body, source_file=item.source_file,
@@ -940,14 +977,10 @@ class ClaudeRunner(Runner):
         `{settings_path}` opt-out pattern."""
         template = self.config.agent.command or _default_claude_command()
         legacy_prompt_arg = _command_has_prompt_placeholder(template)
-        settings_path = write_claude_settings(self.config, item.id)
+        guardrails = self.write_tool_guardrails(self.config, item.id)
         model = model_override or self.config.agent.model
         args = [
-            a.format(
-                prompt=prompt,
-                model=model,
-                settings_path=str(settings_path),
-            )
+            a.format(prompt=prompt, model=model, **guardrails)
             for a in template
         ]
 
@@ -1175,6 +1208,28 @@ class CodexRunner(Runner):
                 item, worktree, "(no plan; spec is in the task body)",
             )
         return self._do_plan(item, worktree)
+
+    def warn_silent_guardrails(
+        self, config: Config, log: Callable[[str], None],
+    ) -> None:
+        """Codex CLI has no hook channel — `large_file_line_threshold`
+        and `enforce_grep_head_limit` are dead knobs under this runner.
+        Log one line per tripped knob so operators learn at startup, not
+        mid-review, that their guardrail config is silently ignored."""
+        defaults = AgentConfig()
+        agent = config.agent
+        if agent.large_file_line_threshold != defaults.large_file_line_threshold:
+            log(
+                "codex runner: agent.large_file_line_threshold="
+                f"{agent.large_file_line_threshold} has no effect — "
+                "codex has no hook channel"
+            )
+        if agent.enforce_grep_head_limit != defaults.enforce_grep_head_limit:
+            log(
+                "codex runner: agent.enforce_grep_head_limit="
+                f"{agent.enforce_grep_head_limit} has no effect — "
+                "codex has no hook channel"
+            )
 
     def _do_plan(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
         prompt = self.config.agent.plan_prompt_template.format(
