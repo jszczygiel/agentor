@@ -33,6 +33,7 @@ from .render import (
     _scroll_key,
     _show_item_screen,
     _view_text_in_curses,
+    _wrap,
 )
 from .transcript import (
     _session_activity,
@@ -44,13 +45,27 @@ from .transcript import (
 _ANSWER_SPLIT_RE = None  # lazily compiled on first use
 
 
-def _answers_scaffold(questions: list[str]) -> str:
+def _answers_scaffold(questions: list[str], width: int = 78) -> str:
     """Build the `Q1: …\\nA1: \\n\\nQ2: …\\nA2: \\n…` seed the multiline
     prompt is pre-populated with. Keeps Q/A pairs together so the operator
-    can reply inline without scrolling back to correlate the question."""
+    can reply inline without scrolling back to correlate the question.
+
+    Long questions are soft-wrapped to `width` with a 4-space continuation
+    indent so the full text is visible inside the overlay's Textbox (which
+    clips rather than soft-wraps). `_parse_answers` tolerates the extra
+    indented lines because its `^\\s*([QA])\\d+:` marker does not match a
+    plain-text continuation."""
+    import textwrap
     chunks = []
+    wrap_width = max(10, width - 4)
     for i, q in enumerate(questions, start=1):
-        chunks.append(f"Q{i}: {q}\nA{i}: ")
+        wrapped = textwrap.wrap(
+            q, width=wrap_width,
+            break_long_words=True, break_on_hyphens=False,
+        ) or [""]
+        head = f"Q{i}: {wrapped[0]}"
+        tail = "".join(f"\n    {line}" for line in wrapped[1:])
+        chunks.append(f"{head}{tail}\nA{i}: ")
     return "\n\n".join(chunks)
 
 
@@ -369,7 +384,15 @@ def _inspect_dispatch(
             questions = data.get("questions") or []
             answers: list[str] | None = None
             if questions:
-                seed = _answers_scaffold(questions)
+                # Match _prompt_multiline's inner_cols: bw=min(80, w-4),
+                # inner_cols=bw-2. Wrap a hair narrower so the cursor has
+                # room and the Textbox doesn't clip trailing glyphs.
+                try:
+                    _, term_w = stdscr.getmaxyx()
+                except AttributeError:
+                    term_w = 80
+                overlay_inner = max(10, min(80, term_w - 4) - 2)
+                seed = _answers_scaffold(questions, width=overlay_inner)
                 reply = _prompt_multiline(
                     stdscr,
                     "answer open questions (empty=cancel approve)",
@@ -617,8 +640,16 @@ def _build_detail_lines(
         if questions:
             out.append("")
             out.append("── open questions (answer on approve) ──")
+            # Wrap long questions so terminal-width clipping in
+            # `_show_item_screen` doesn't cut off the text. Leading "  1. "
+            # is 5 cols; continuation lines use 5 spaces so the numbered
+            # prefix and wrap indent align visually.
+            q_width = max(10, width - 6)
             for i, q in enumerate(questions, start=1):
-                out.append(f"  {i}. {q}")
+                wrapped = _wrap(q, q_width) or [""]
+                out.append(f"  {i}. {wrapped[0]}")
+                for cont in wrapped[1:]:
+                    out.append(f"     {cont}")
     if item.status == ItemStatus.AWAITING_REVIEW:
         files = data.get("files_changed") or []
         if files:

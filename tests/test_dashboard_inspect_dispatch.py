@@ -863,6 +863,128 @@ class TestAnswersScaffoldAndParse(unittest.TestCase):
             _parse_answers("just rambling text\n", 2), ["", ""],
         )
 
+    def test_scaffold_wraps_long_question(self):
+        """Long questions must soft-wrap onto indented continuation lines
+        so the overlay Textbox (which clips at inner_cols) can still show
+        the full prompt. Continuation lines use a 4-space indent so the
+        Q/A regex in `_parse_answers` does not false-match them."""
+        from agentor.dashboard.modes import _answers_scaffold, _parse_answers
+        long_q = (
+            "Should we keep the legacy authentication flag wired up for "
+            "downstream integrations that have not yet migrated to the "
+            "replacement middleware, or is it safe to rip it out now?"
+        )
+        out = _answers_scaffold([long_q], width=40)
+        lines = out.splitlines()
+        # First line starts with Q1:, at least one continuation, then A1:.
+        self.assertTrue(lines[0].startswith("Q1: "))
+        self.assertGreaterEqual(len(lines), 3)
+        cont_lines = [ln for ln in lines[1:] if not ln.startswith("A1:")]
+        self.assertTrue(cont_lines, "expected wrapped continuation lines")
+        for ln in cont_lines:
+            self.assertTrue(
+                ln.startswith("    "),
+                f"continuation must be indented: {ln!r}",
+            )
+            self.assertLessEqual(len(ln), 40)
+        # Continuation lines must not match the Q/A marker regex.
+        import re
+        marker = re.compile(r"^\s*[QA]\d+\s*:")
+        for ln in cont_lines:
+            self.assertIsNone(marker.match(ln))
+        # Reply still round-trips through _parse_answers.
+        reply = out + "some answer text"
+        self.assertEqual(_parse_answers(reply, 1), ["some answer text"])
+
+    def test_scaffold_short_questions_unchanged(self):
+        """Short questions that already fit must render exactly as before,
+        preserving the wire format pinned by test_scaffold_formats_*."""
+        from agentor.dashboard.modes import _answers_scaffold
+        out = _answers_scaffold(["short one?", "also short?"], width=80)
+        self.assertIn("Q1: short one?\nA1: ", out)
+        self.assertIn("Q2: also short?\nA2: ", out)
+
+
+class TestBuildDetailLinesQuestionWrap(unittest.TestCase):
+    """`_build_detail_lines` feeds the inspect view. Long plan-phase
+    questions must wrap so the row-level truncation in `_show_item_screen`
+    doesn't cut off the tail of the prompt."""
+
+    def _make_item_with_questions(self, tmp: Path, questions: list[str]):
+        import json
+        from agentor.dashboard.modes import _build_detail_lines
+        store = Store(tmp / "agentor.db")
+        item = Item(
+            id="plan-wrap",
+            title="long plan questions",
+            body="body",
+            source_file="backlog.md",
+            source_line=1,
+            tags={},
+        )
+        store.upsert_discovered(item)
+        store.transition("plan-wrap", ItemStatus.WORKING, note="t")
+        store.transition(
+            "plan-wrap", ItemStatus.AWAITING_PLAN_REVIEW,
+            result_json=json.dumps({
+                "phase": "plan",
+                "plan": "plan body",
+                "questions": questions,
+            }),
+            note="t",
+        )
+        stored = store.get("plan-wrap")
+        cfg = SimpleNamespace(
+            agent=SimpleNamespace(max_attempts=3),
+            git=SimpleNamespace(base_branch="main"),
+            project=SimpleNamespace(root=tmp),
+            project_root=tmp,
+        )
+        width = 60
+        lines = _build_detail_lines(cfg, store, stored, width=width)
+        return lines, width
+
+    def test_long_question_wraps_in_inspect_view(self):
+        long_q = (
+            "Should we keep the legacy authentication flag wired up for "
+            "downstream integrations that have not yet migrated to the "
+            "replacement middleware, or is it safe to rip it out now?"
+        )
+        with TemporaryDirectory() as tmp:
+            lines, width = self._make_item_with_questions(
+                Path(tmp), [long_q],
+            )
+        # Locate the open-questions section.
+        header_idx = next(
+            i for i, ln in enumerate(lines) if "open questions" in ln
+        )
+        q_lines: list[str] = []
+        for ln in lines[header_idx + 1:]:
+            if not ln or ln.startswith("──"):
+                break
+            q_lines.append(ln)
+        # First line is "  1. <first chunk>", followed by ≥1 continuation
+        # lines prefixed with 5 spaces so they align under the text.
+        self.assertGreaterEqual(len(q_lines), 2)
+        self.assertTrue(q_lines[0].startswith("  1. "))
+        for ln in q_lines[1:]:
+            self.assertTrue(
+                ln.startswith("     "),
+                f"continuation must be 5-space-indented: {ln!r}",
+            )
+        for ln in q_lines:
+            self.assertLessEqual(len(ln), width)
+
+    def test_short_question_renders_single_line(self):
+        with TemporaryDirectory() as tmp:
+            lines, _ = self._make_item_with_questions(
+                Path(tmp), ["short?"],
+            )
+        header_idx = next(
+            i for i, ln in enumerate(lines) if "open questions" in ln
+        )
+        self.assertEqual(lines[header_idx + 1], "  1. short?")
+
 
 if __name__ == "__main__":
     unittest.main()
