@@ -15,8 +15,8 @@ from agentor.config import (AgentConfig, Config, GitConfig, ParsingConfig,
                             ReviewConfig, SourcesConfig)
 from agentor.models import ItemStatus
 from agentor.recovery import recover_on_startup
+from agentor.providers import ClaudeProvider
 from agentor.runner import (ClaudeRunner, CodexRunner, StubRunner,
-                            _default_claude_command,
                             _extract_plan_questions,
                             _mark_done_instruction,
                             _parse_execute_tier,
@@ -2487,7 +2487,7 @@ class TestClaudeSettingsHookWiring(unittest.TestCase):
         self.assertEqual(set(by_matcher), {"Read", "Grep"})
 
     def test_default_claude_command_contains_settings_placeholder(self):
-        cmd = _default_claude_command()
+        cmd = ClaudeProvider.default_command()
         self.assertIn("--settings", cmd)
         self.assertIn("{settings_path}", cmd)
 
@@ -2496,7 +2496,7 @@ class TestClaudeSettingsHookWiring(unittest.TestCase):
         settings = write_claude_settings(cfg, "item-xyz")
         args = [
             a.format(prompt="hi", model="claude", settings_path=str(settings))
-            for a in _default_claude_command()
+            for a in ClaudeProvider.default_command()
         ]
         self.assertIn(str(settings), args)
 
