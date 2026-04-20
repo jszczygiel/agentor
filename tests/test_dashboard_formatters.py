@@ -12,6 +12,8 @@ from agentor.dashboard.formatters import (
     _fmt_token_compact,
     _fmt_token_row,
     _fmt_tokens,
+    _result_data,
+    _result_data_invalidate,
     _token_breakdown,
     _token_windows,
     _token_windows_invalidate,
@@ -20,10 +22,24 @@ from agentor.models import Item, ItemStatus
 from agentor.store import Store, StoredItem
 
 
-def _item(result_json: str | None) -> StoredItem:
-    """Build a minimal StoredItem with only the fields the formatters read."""
+_item_counter = 0
+
+
+def _item(result_json: str | None, *,
+          item_id: str = "abc12345",
+          updated_at: float | None = None) -> StoredItem:
+    """Build a minimal StoredItem with only the fields the formatters read.
+
+    Each call gets a unique synthetic `updated_at` by default so the
+    `_result_data` cache (keyed on `(id, updated_at)`) can't leak between
+    tests that reuse the same item id with different payloads. Tests that
+    want to exercise cache-hit behaviour pass an explicit `updated_at`."""
+    global _item_counter
+    if updated_at is None:
+        _item_counter += 1
+        updated_at = float(_item_counter)
     return StoredItem(
-        id="abc12345",
+        id=item_id,
         title="t",
         body="",
         source_file="src.md",
@@ -40,7 +56,7 @@ def _item(result_json: str | None) -> StoredItem:
         agentor_version=None,
         priority=0,
         created_at=0.0,
-        updated_at=0.0,
+        updated_at=updated_at,
     )
 
 
@@ -502,6 +518,66 @@ class TestTokenWindowsCache(unittest.TestCase):
         # week-since (now - 7*86400).
         self.assertEqual(store.calls[0], base - 5 * 3600)
         self.assertEqual(store.calls[1], base - 7 * 86400)
+
+
+class TestResultDataCache(unittest.TestCase):
+    def setUp(self):
+        _result_data_invalidate()
+
+    def tearDown(self):
+        _result_data_invalidate()
+
+    def test_same_updated_at_reuses_cached_parse(self):
+        item = _item(json.dumps({"phase": "plan"}),
+                     item_id="item-1", updated_at=1.0)
+        with mock.patch.object(formatters.json, "loads",
+                               wraps=json.loads) as spy:
+            first = _result_data(item)
+            second = _result_data(item)
+            self.assertEqual(spy.call_count, 1)
+        self.assertEqual(first, {"phase": "plan"})
+        self.assertIs(first, second)
+
+    def test_bumping_updated_at_evicts_prior_key(self):
+        item_v1 = _item(json.dumps({"phase": "plan"}),
+                        item_id="item-1", updated_at=1.0)
+        item_v2 = _item(json.dumps({"phase": "execute"}),
+                        item_id="item-1", updated_at=2.0)
+        _result_data(item_v1)
+        _result_data(item_v2)
+        # Exactly one entry retained for this id.
+        keys_for_item = [k for k in formatters._result_cache
+                         if k[0] == "item-1"]
+        self.assertEqual(keys_for_item, [("item-1", 2.0)])
+
+    def test_invalidate_clears_cache(self):
+        item = _item(json.dumps({"phase": "plan"}),
+                     item_id="item-1", updated_at=1.0)
+        _result_data(item)
+        self.assertEqual(len(formatters._result_cache), 1)
+        _result_data_invalidate()
+        self.assertEqual(len(formatters._result_cache), 0)
+
+    def test_invalid_json_not_cached(self):
+        bad = _item("{not json", item_id="item-1", updated_at=1.0)
+        self.assertIsNone(_result_data(bad))
+        self.assertEqual(len(formatters._result_cache), 0)
+        # A later call still returns None — no cache poisoning.
+        self.assertIsNone(_result_data(bad))
+
+    def test_empty_result_json_returns_none_without_caching(self):
+        empty = _item(None, item_id="item-1", updated_at=1.0)
+        self.assertIsNone(_result_data(empty))
+        self.assertEqual(len(formatters._result_cache), 0)
+
+    def test_distinct_items_retain_separate_entries(self):
+        a = _item(json.dumps({"phase": "plan"}),
+                  item_id="item-a", updated_at=1.0)
+        b = _item(json.dumps({"phase": "execute"}),
+                  item_id="item-b", updated_at=1.0)
+        _result_data(a)
+        _result_data(b)
+        self.assertEqual(len(formatters._result_cache), 2)
 
 
 if __name__ == "__main__":
