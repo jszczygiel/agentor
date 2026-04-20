@@ -71,8 +71,7 @@ FILTERS: list[tuple[str, list[ItemStatus] | None]] = [
     ("active", [ItemStatus.WORKING, ItemStatus.AWAITING_PLAN_REVIEW,
                 ItemStatus.AWAITING_REVIEW, ItemStatus.CONFLICTED,
                 ItemStatus.QUEUED, ItemStatus.APPROVED]),
-    ("errored", [ItemStatus.ERRORED]),
-    ("conflicted", [ItemStatus.CONFLICTED]),
+    ("needs attention", [ItemStatus.ERRORED, ItemStatus.CONFLICTED]),
     ("queued", [ItemStatus.QUEUED]),
     ("working", [ItemStatus.WORKING]),
     ("awaiting_plan", [ItemStatus.AWAITING_PLAN_REVIEW]),
@@ -348,8 +347,9 @@ def _build_status_line(tier: str, cfg, stats, counts: dict,
         return (
             f" {cfg.agent.runner}  pool={cfg.agent.pool_size}  "
             f"workers={worker_count}  "
-            f"done={stats.completed}  errored={counts[ItemStatus.ERRORED]}  "
-            f"conflicted={counts[ItemStatus.CONFLICTED]}  │  "
+            f"done={stats.completed}  "
+            f"needs_attention="
+            f"{counts[ItemStatus.ERRORED] + counts[ItemStatus.CONFLICTED]}  │  "
             f"queued={counts[ItemStatus.QUEUED]}  "
             f"working={counts[ItemStatus.WORKING]}  "
             f"plan?={counts[ItemStatus.AWAITING_PLAN_REVIEW]}  "
@@ -365,15 +365,15 @@ def _build_status_line(tier: str, cfg, stats, counts: dict,
         return (
             f" {cfg.agent.runner} p={cfg.agent.pool_size} "
             f"w={worker_count} d={stats.completed} "
-            f"e={counts[ItemStatus.ERRORED]} "
-            f"c={counts[ItemStatus.CONFLICTED]} │ "
+            f"!={counts[ItemStatus.ERRORED] + counts[ItemStatus.CONFLICTED]} │ "
             f"Q={counts[ItemStatus.QUEUED]} "
             f"W={counts[ItemStatus.WORKING]} R={review}"
         )
     # narrow
     return (
         f" p={cfg.agent.pool_size} w={worker_count} "
-        f"R={review} e={counts[ItemStatus.ERRORED]}"
+        f"R={review} "
+        f"!={counts[ItemStatus.ERRORED] + counts[ItemStatus.CONFLICTED]}"
     )
 
 
