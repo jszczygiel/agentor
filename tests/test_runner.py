@@ -156,15 +156,28 @@ class TestFrontmatterMarkDone(unittest.TestCase):
         claimed = self.store.claim_next_queued(str(wt), br)
         StubRunner(self.cfg, self.store).run(claimed)
         item = self.store.get(claimed.id)
+        merge_sha = git_ops.run(
+            self.root, "rev-parse", "refs/heads/main",
+        ).stdout.strip()
         approve_and_commit(self.cfg, self.store, item, "fix bug A")
-        # source file still exists on main (we only removed in worktree, then committed there)
-        self.assertTrue(self.src.exists())
-        # but on the agent branch, the file is gone
+        # The agent's branch removes the source file, the merge lands on
+        # main, and `advance_user_checkout` (default-on) syncs the user's
+        # primary checkout to the new tip — so `self.src` is gone here too.
+        self.assertFalse(self.src.exists())
+        # The deletion is recorded in the merge commit on main (cannot
+        # `git show` the file at any ref past the merge).
         cp = subprocess.run(
-            ["git", "show", f"{item.branch}:docs/backlog/bug-a.md"],
+            ["git", "show", f"main:docs/backlog/bug-a.md"],
             cwd=self.root, capture_output=True, text=True,
         )
         self.assertNotEqual(cp.returncode, 0)
+        # The pre-merge sha (captured above) is stable for forensics —
+        # the file existed at that point on main.
+        cp_pre = subprocess.run(
+            ["git", "show", f"{merge_sha}:docs/backlog/bug-a.md"],
+            cwd=self.root, capture_output=True, text=True,
+        )
+        self.assertEqual(cp_pre.returncode, 0)
 
 
 class TestMarkDoneInstruction(unittest.TestCase):

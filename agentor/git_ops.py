@@ -193,7 +193,14 @@ def advance_user_checkout_allowed(
     if current != base_branch:
         return False, "detached HEAD" if current == "HEAD" \
             else f"checkout on {current}"
-    if run(repo, "status", "--porcelain", check=False).stdout.strip():
+    # Only modifications to TRACKED files block — `git reset --hard` would
+    # clobber those. Untracked files (`??` lines) are preserved by reset, so
+    # ignoring them here matches the actual clobber risk and lets the gate
+    # coexist with `docs/backlog/*.md` and other intentionally-untracked
+    # work-item drops the daemon and operator both read from.
+    if run(
+        repo, "status", "--porcelain", "--untracked-files=no", check=False,
+    ).stdout.strip():
         return False, "dirty worktree"
     head = run(repo, "rev-parse", "HEAD", check=False).stdout.strip()
     if head != base_sha_before:

@@ -101,32 +101,56 @@ _AUTO_RESOLVE_NOTE = (
 )
 
 
-def _plan_checkout_advance(
+BLOCKED_DIRTY_CHECKOUT_REASON = "dirty base-branch checkout"
+_BLOCKED_DIRTY_CHECKOUT_MSG = (
+    "Refusing to merge: the user's base-branch checkout has uncommitted "
+    "changes. The merge gate requires a clean base checkout so the "
+    "post-merge invariant (clean before AND after fast-forward) holds. "
+    "Commit, stash, or discard the working-tree edits, then re-approve "
+    "via the dashboard `[m]` retry-merge action."
+)
+
+
+def _decide_checkout_advance(
     config: Config, repo: Path, base_sha_before: str, p: ProgressCb,
-) -> tuple[bool, str]:
-    """Decide whether the user's primary checkout should fast-forward
-    after a clean merge, and return the MERGED-note suffix capturing the
-    outcome. Called BEFORE `merge_feature_into_base` runs its CAS so the
-    guards read a meaningful pre-CAS state.
+) -> tuple[str, bool, str]:
+    """Three-way decision about the user's primary checkout state:
 
-    Returns `(will_advance, suffix)`:
-      - gate off             → (False, "")                    — silent
-      - gate on, allowed     → (True,  ", checkout advanced")
-      - gate on, skip reason → (False, ", checkout skipped: <reason>")
+      - `("block", False, "<git status --porcelain output>")` —
+        `git.advance_user_checkout` is on AND the checkout sits on
+        `base_branch` AND the working tree is dirty. Caller MUST refuse
+        the merge: transition CONFLICTED with `_BLOCKED_DIRTY_CHECKOUT_MSG`
+        and skip the auto-resolve chain (the agent can't fix the operator's
+        dirty checkout).
+      - `("advance", True, ", checkout advanced")` — guards pass; advance
+        the checkout to the new base tip post-CAS.
+      - `("skip", False, "" or ", checkout skipped: <reason>")` — gate off
+        OR a non-blocking skip reason (`detached HEAD`, `checkout on <other>`,
+        `HEAD diverged from pre-merge base`). The merge proceeds; the user's
+        deliberate setup is left alone.
 
-    Also emits a progress message so the curses progress dialog surfaces
-    the decision live during the merge."""
+    Called BEFORE `merge_feature_into_base` runs its CAS so the guards
+    read a meaningful pre-CAS state. Emits progress messages so the curses
+    progress dialog surfaces the decision live during the merge."""
     if not config.git.advance_user_checkout:
-        return False, ""
+        return "skip", False, ""
     allowed, reason = git_ops.advance_user_checkout_allowed(
         repo, config.git.base_branch, base_sha_before,
     )
     if allowed:
         p(f"user checkout will advance to new {config.git.base_branch} tip")
-        return True, ", checkout advanced"
+        return "advance", True, ", checkout advanced"
     assert reason is not None  # allowed=False always carries a reason
+    if reason == "dirty worktree":
+        dirty = git_ops.run(
+            repo, "status", "--porcelain", "--untracked-files=no",
+            check=False,
+        ).stdout.strip()
+        p(f"blocked: {config.git.base_branch} checkout is dirty — "
+          "refusing merge")
+        return "block", False, dirty
     p(f"checkout will not advance — {reason}")
-    return False, f", checkout skipped: {reason}"
+    return "skip", False, f", checkout skipped: {reason}"
 
 
 def _build_conflict_summary(
@@ -227,9 +251,19 @@ def approve_and_commit(
         base_sha_before = git_ops.run(
             repo, "rev-parse", f"refs/heads/{config.git.base_branch}",
         ).stdout.strip()
-        will_advance_checkout, checkout_suffix = _plan_checkout_advance(
-            config, repo, base_sha_before, p,
-        )
+        decision, will_advance_checkout, checkout_info = \
+            _decide_checkout_advance(config, repo, base_sha_before, p)
+        if decision == "block":
+            store.transition(
+                item.id, ItemStatus.CONFLICTED,
+                last_error=(
+                    f"{_BLOCKED_DIRTY_CHECKOUT_MSG}\n\n"
+                    f"git status --porcelain:\n{checkout_info[:3000]}"
+                ),
+                note=f"blocked: {BLOCKED_DIRTY_CHECKOUT_REASON}",
+            )
+            return sha
+        checkout_suffix = checkout_info if decision != "block" else ""
         p(f"{verb} {config.git.base_branch}")
         merge_sha, conflict = git_ops.merge_feature_into_base(
             repo, item.branch, config.git.base_branch,
@@ -308,9 +342,19 @@ def retry_merge(
         base_sha_before = git_ops.run(
             repo, "rev-parse", f"refs/heads/{config.git.base_branch}",
         ).stdout.strip()
-        will_advance_checkout, checkout_suffix = _plan_checkout_advance(
-            config, repo, base_sha_before, p,
-        )
+        decision, will_advance_checkout, checkout_info = \
+            _decide_checkout_advance(config, repo, base_sha_before, p)
+        if decision == "block":
+            store.transition(
+                item.id, ItemStatus.CONFLICTED,
+                last_error=(
+                    f"{_BLOCKED_DIRTY_CHECKOUT_MSG}\n\n"
+                    f"git status --porcelain:\n{checkout_info[:3000]}"
+                ),
+                note=f"retry blocked: {BLOCKED_DIRTY_CHECKOUT_REASON}",
+            )
+            return False, BLOCKED_DIRTY_CHECKOUT_REASON
+        checkout_suffix = checkout_info if decision != "block" else ""
         p(f"{verb} {config.git.base_branch} (retry)")
         merge_sha, conflict = git_ops.merge_feature_into_base(
             repo, item.branch, config.git.base_branch,

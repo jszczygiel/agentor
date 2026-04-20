@@ -1072,13 +1072,23 @@ class TestAdvanceUserCheckout(unittest.TestCase):
             git_ops.advance_user_checkout_allowed(self.root, "main", base),
             (True, None),
         )
-        # Dirty.
-        (self.root / "dirt.txt").write_text("x")
+        # Dirty TRACKED file modification — `git reset --hard` would clobber.
+        # Untracked files are intentionally NOT considered dirty here: reset
+        # preserves them, and the daemon's own backlog drops live as
+        # untracked files in `docs/backlog/`.
+        (self.root / "README.md").write_text("dirty edit\n")
         self.assertEqual(
             git_ops.advance_user_checkout_allowed(self.root, "main", base),
             (False, "dirty worktree"),
         )
-        (self.root / "dirt.txt").unlink()
+        _git(self.root, "checkout", "--", "README.md")
+        # Untracked file alone — does NOT trip the dirty guard.
+        (self.root / "scratch.txt").write_text("untracked\n")
+        self.assertEqual(
+            git_ops.advance_user_checkout_allowed(self.root, "main", base),
+            (True, None),
+        )
+        (self.root / "scratch.txt").unlink()
         # Wrong branch.
         _git(self.root, "checkout", "-b", "other")
         self.assertEqual(
@@ -1145,14 +1155,41 @@ class TestAdvanceUserCheckoutNoteSurfacing(unittest.TestCase):
 
         self.assertIn(", checkout advanced", self._last_note(item.id))
 
-    def test_dirty_worktree_note_records_skip_reason(self):
+    def test_dirty_tracked_worktree_blocks_merge(self):
+        # A modified TRACKED file in the user's base-branch checkout
+        # blocks the merge entirely — `git reset --hard` would clobber
+        # the operator's edits, so the gate refuses rather than silently
+        # skipping the advance. CONFLICTED is terminal here (no
+        # auto-resolve chain) since the agent can't fix the operator's
+        # dirty checkout.
+        (self.root / ".gitattributes").write_text("seed\n")
+        _git(self.root, "add", ".gitattributes")
+        _git(self.root, "commit", "-q", "-m", "track gitattributes")
+        (self.root / ".gitattributes").write_text("dirty edit\n")
+        item = self._claim_and_stub()
+
+        approve_and_commit(self.cfg, self.store, item, "stub note")
+
+        refreshed = self.store.get(item.id)
+        self.assertEqual(refreshed.status, ItemStatus.CONFLICTED)
+        self.assertIn("dirty base-branch checkout",
+                      self._last_note(item.id))
+        self.assertIn("Refusing to merge", refreshed.last_error or "")
+
+    def test_untracked_file_does_not_block_merge(self):
+        # Untracked files are preserved by `git reset --hard`, so the
+        # gate ignores them — operators routinely have untracked
+        # `docs/backlog/*.md` drops and other scratch files in the
+        # base-branch checkout while the daemon is running.
         (self.root / "scratch.txt").write_text("wip\n")
         item = self._claim_and_stub()
 
         approve_and_commit(self.cfg, self.store, item, "stub note")
 
-        self.assertIn(", checkout skipped: dirty worktree",
-                      self._last_note(item.id))
+        refreshed = self.store.get(item.id)
+        self.assertEqual(refreshed.status, ItemStatus.MERGED)
+        self.assertIn(", checkout advanced", self._last_note(item.id))
+        self.assertTrue((self.root / "scratch.txt").exists())
 
     def test_other_branch_note_records_skip_reason(self):
         _git(self.root, "checkout", "-b", "sidecar")
