@@ -22,6 +22,13 @@ class ParsingConfig:
     mode: str = "frontmatter"  # "checkbox" | "heading" | "frontmatter"
 
 
+_ALIAS_TO_MODEL: dict[str, str] = {
+    "haiku": "claude-haiku-4-5",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-7",
+}
+
+
 @dataclass
 class AgentConfig:
     model: str = "claude-opus-4-6"
@@ -81,7 +88,18 @@ class AgentConfig:
         "execution. When present, emit them AFTER the numbered list under "
         "a literal `## Open Questions` heading, one `?`-terminated bullet "
         "per question (`- ...?`). Omit the heading entirely if none.\n\n"
-        "A human reviews this plan before execution runs. Keep it tight."
+        "A human reviews this plan before execution runs. Keep it tight.\n\n"
+        "After Open Questions (or after the numbered list if there are "
+        "none), ALWAYS emit a final `## Execute tier` section nominating "
+        "the model tier the execute phase should run on. Cheap mechanical "
+        "edits (renames, typo fixes, deleting an obsolete file, adding a "
+        "one-line test) → `haiku`. Mid-complexity refactors touching "
+        "several files with clear intent → `sonnet`. Subtle bugs, "
+        "cross-cutting redesigns, anything requiring sustained reasoning "
+        "across many files → `opus`. Exact format (literal):\n\n"
+        "## Execute tier\n\n"
+        "suggested_model: haiku | sonnet | opus\n"
+        "reason: <one sentence>\n"
     )
     execute_prompt_template: str = (
         "The plan below was produced in a prior turn of this same session "
@@ -243,6 +261,25 @@ class AgentConfig:
     # stuck. Informational only — `timeout_seconds` still owns the kill
     # decision. 0 disables the check entirely.
     stale_session_alert_seconds: int = 300
+    # When true, the plan phase's `## Execute tier` trailer
+    # (`suggested_model: haiku|sonnet|opus`) is honoured on execute
+    # dispatch, overriding `agent.model` for that one run. Precedence at
+    # execute: item `@model:<alias>` tag > plan suggestion (this flag) >
+    # `agent.model`. Default false leaves existing installs unchanged. No
+    # effect with `agent.single_phase = true` (no plan → no suggestion).
+    # Requires the invoked CLI to pick the per-invocation model; custom
+    # `agent.command` overrides that drop the `{model}` placeholder
+    # silently skip the override, same pattern as `{settings_path}`.
+    auto_execute_model: bool = False
+    # Allow-list of model aliases the plan (or operator tag) may nominate
+    # for execute. Anything outside this set falls back to `agent.model`
+    # with a soft warning — prevents a prompt-injected plan or an
+    # operator typo like `@model: claude-haiku-4-5` (full ID) from
+    # sneaking through. Aliases only; the mapping to current best model
+    # id lives in `config._ALIAS_TO_MODEL` and rotates with releases.
+    execute_model_whitelist: list[str] = field(
+        default_factory=lambda: ["haiku", "sonnet", "opus"]
+    )
 
 
 @dataclass

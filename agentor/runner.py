@@ -15,7 +15,7 @@ from typing import Callable, TypeVar
 
 from . import git_ops
 from .checkpoint import CheckpointConfig, CheckpointEmitter
-from .config import Config
+from .config import _ALIAS_TO_MODEL, Config
 from .models import ItemStatus
 from .resume_primer import build_primer
 from .slug import slugify
@@ -562,6 +562,17 @@ class Runner:
                 prior = _parse_result_json(item.result_json)
                 if prior.get("plan"):
                     result["plan"] = prior["plan"]
+                # Record the resolved execute-tier + source so
+                # tools/analyze_transcripts.py can attribute token spend
+                # by chosen tier and operators can grep the fallback
+                # rate. Only populated when the runner subclass set the
+                # attrs (ClaudeRunner / CodexRunner do; StubRunner
+                # doesn't — execute_model stays absent there).
+                alias = getattr(self, "_last_execute_model", None)
+                source = getattr(self, "_last_execute_model_source", None)
+                if alias and source:
+                    result["execute_model"] = alias
+                    result["execute_model_source"] = source
             envelope = getattr(self, "_last_usage", None)
             if envelope:
                 # Surface turn/timing/usage fields at the top level of
@@ -805,6 +816,8 @@ class ClaudeRunner(Runner):
             title=item.title, body=item.body, source_file=item.source_file,
         )
         prompt = self._prepend_feedback(item, prompt, phase="plan")
+        self._last_execute_model = None
+        self._last_execute_model_source = None
         _, stdout = self._invoke_claude(item, worktree, prompt)
         # For plan phase, _derive_summary is misleading (no commits, no
         # AGENT_SUMMARY.md → falls back to the base branch commit message).
@@ -841,7 +854,13 @@ class ClaudeRunner(Runner):
             prompt = f"{primer}\n{prompt}"
         prompt = self._prepend_feedback(item, prompt, phase="execute")
         prompt = _prepend_plan_answers(item, prompt)
-        summary, stdout = self._invoke_claude(item, worktree, prompt)
+        alias, source = _resolve_execute_tier(self.config, item, plan)
+        self._last_execute_model = alias
+        self._last_execute_model_source = source
+        model_override = _ALIAS_TO_MODEL.get(alias)
+        summary, stdout = self._invoke_claude(
+            item, worktree, prompt, model_override=model_override,
+        )
         files = _list_changes(worktree, self.config.git.base_branch)
         summary = _derive_summary(worktree, stdout, item.title)
         self._last_phase = "execute"
@@ -889,6 +908,7 @@ class ClaudeRunner(Runner):
 
     def _invoke_claude(
         self, item: StoredItem, worktree: Path, prompt: str,
+        model_override: str | None = None,
     ) -> tuple[str, str]:
         """Run claude and stream its stream-json events live. Publishes
         partial usage/iterations to the DB on each assistant turn so the
@@ -896,14 +916,21 @@ class ClaudeRunner(Runner):
         blocking until exit. Returns (summary, raw_stdout).
 
         Legacy non-streaming commands (no stream-json) still work — we detect
-        the output format and fall back to blocking subprocess.run."""
+        the output format and fall back to blocking subprocess.run.
+
+        `model_override` replaces `agent.model` for this single invocation
+        so the execute phase can run on a different tier than the plan.
+        Custom `agent.command` templates that drop the `{model}`
+        placeholder silently skip the override — matches the existing
+        `{settings_path}` opt-out pattern."""
         template = self.config.agent.command or _default_claude_command()
         legacy_prompt_arg = _command_has_prompt_placeholder(template)
         settings_path = write_claude_settings(self.config, item.id)
+        model = model_override or self.config.agent.model
         args = [
             a.format(
                 prompt=prompt,
-                model=self.config.agent.model,
+                model=model,
                 settings_path=str(settings_path),
             )
             for a in template
@@ -1139,6 +1166,8 @@ class CodexRunner(Runner):
             title=item.title, body=item.body, source_file=item.source_file,
         )
         prompt = self._prepend_feedback(item, prompt, phase="plan")
+        self._last_execute_model = None
+        self._last_execute_model_source = None
         output_path = self._last_message_path(item, "plan")
         _, stdout = self._invoke_codex(item, worktree, prompt, output_path)
         plan_text = _read_output_message(output_path)
@@ -1160,8 +1189,15 @@ class CodexRunner(Runner):
         prompt += _mark_done_instruction(self.config, item.source_file)
         prompt = self._prepend_feedback(item, prompt, phase="execute")
         prompt = _prepend_plan_answers(item, prompt)
+        alias, source = _resolve_execute_tier(self.config, item, plan)
+        self._last_execute_model = alias
+        self._last_execute_model_source = source
+        model_override = _ALIAS_TO_MODEL.get(alias)
         output_path = self._last_message_path(item, "execute")
-        summary, stdout = self._invoke_codex(item, worktree, prompt, output_path)
+        summary, stdout = self._invoke_codex(
+            item, worktree, prompt, output_path,
+            model_override=model_override,
+        )
         files = _list_changes(worktree, self.config.git.base_branch)
         final_message = _read_output_message(output_path)
         if final_message:
@@ -1200,6 +1236,7 @@ class CodexRunner(Runner):
 
     def _invoke_codex(
         self, item: StoredItem, worktree: Path, prompt: str, output_path: Path,
+        model_override: str | None = None,
     ) -> tuple[str, str]:
         phase_tag = "execute" if item.session_id else "plan"
         transcript_path = (
@@ -1219,7 +1256,9 @@ class CodexRunner(Runner):
             # prior failed attempt flips us onto the resume template (and we
             # don't orphan the codex thread created mid-stream).
             fresh = self.store.get(item.id) or item
-            args = self._codex_args(fresh, prompt, output_path)
+            args = self._codex_args(
+                fresh, prompt, output_path, model_override=model_override,
+            )
             return self._invoke_codex_jsonl(
                 fresh, args, worktree, transcript_path, output_path, phase_tag,
             )
@@ -1232,10 +1271,11 @@ class CodexRunner(Runner):
 
     def _codex_args(
         self, item: StoredItem, prompt: str, output_path: Path,
+        model_override: str | None = None,
     ) -> list[str]:
         values = {
             "prompt": prompt,
-            "model": self.config.agent.model,
+            "model": model_override or self.config.agent.model,
             "session_id": item.session_id or "",
             "output_path": str(output_path),
         }
@@ -1629,6 +1669,98 @@ _QUESTIONS_HEADING_RE = re.compile(
 )
 _NEXT_HEADING_RE = re.compile(r"(?m)^\s*#{1,6}\s+\S")
 _BULLET_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+_EXECUTE_TIER_HEADING_RE = re.compile(
+    r"(?im)^\s*#{1,6}\s*execute\s+tier\s*$"
+)
+_SUGGESTED_MODEL_RE = re.compile(
+    r"(?im)^\s*suggested_model\s*:\s*([A-Za-z0-9_-]+)\s*$"
+)
+
+
+def _parse_execute_tier(
+    plan_text: str, whitelist: list[str] | None = None,
+) -> str | None:
+    """Extract the plan's nominated execute-phase model tier from the
+    `## Execute tier` trailer. Returns a lowercase alias (e.g. `"haiku"`)
+    when the trailer is present AND the suggestion is in `whitelist` (any
+    case). Returns None on missing heading, malformed body, or whitelist
+    miss — callers treat None as a soft fallback to the global default.
+    No raise."""
+    if not plan_text:
+        return None
+    m = _EXECUTE_TIER_HEADING_RE.search(plan_text)
+    if not m:
+        return None
+    rest = plan_text[m.end():]
+    nxt = _NEXT_HEADING_RE.search(rest)
+    block = rest[:nxt.start()] if nxt else rest
+    sm = _SUGGESTED_MODEL_RE.search(block)
+    if not sm:
+        return None
+    alias = sm.group(1).strip().lower()
+    allowed = whitelist if whitelist is not None else ["haiku", "sonnet", "opus"]
+    allowed_lower = {a.lower() for a in allowed}
+    if alias not in allowed_lower:
+        return None
+    return alias
+
+
+def _resolve_execute_tier(
+    config: Config, item: StoredItem, prior_plan: str,
+) -> tuple[str, str]:
+    """Resolve the alias + source for the execute-phase model dispatch.
+
+    Precedence:
+      1. `@model:<alias>` tag on the item (operator override, wins
+         unconditionally — but still whitelist-gated so typos like
+         `@model: claude-haiku-4-5` (full ID) fall through with a warning
+         rather than silently pinning an unintended value).
+      2. Plan's `## Execute tier` trailer — only when
+         `agent.auto_execute_model=True`.
+      3. Global default — the alias matching `agent.model`, else `opus`.
+
+    Returns `(alias, source)` where `source ∈ {"tag","plan","default"}`.
+    `alias` is always one of the configured whitelist entries — invalid
+    inputs at any level soft-fall through to the next level."""
+    whitelist = list(config.agent.execute_model_whitelist or [])
+    allowed = {a.lower() for a in whitelist}
+
+    tag_raw = (item.tags or {}).get("model")
+    if tag_raw:
+        tag = tag_raw.strip().lower()
+        if tag in allowed:
+            return tag, "tag"
+        print(
+            f"[runner] ignoring @model tag {tag_raw!r} on item {item.id} — "
+            f"not in execute_model_whitelist {whitelist!r}. "
+            "Use a short alias (haiku|sonnet|opus), not the full model id.",
+        )
+
+    if config.agent.auto_execute_model and prior_plan:
+        nominated = _parse_execute_tier(prior_plan, whitelist)
+        if nominated:
+            return nominated, "plan"
+
+    # Fallback: map agent.model back to an alias if possible so the
+    # recorded value matches the alias vocabulary used elsewhere.
+    default_alias = _model_to_alias(config.agent.model) or "opus"
+    if default_alias not in allowed:
+        # Whitelist narrower than the default — respect the operator's
+        # intent and report whatever they actually set.
+        default_alias = default_alias
+    return default_alias, "default"
+
+
+def _model_to_alias(model_id: str) -> str | None:
+    """Reverse lookup `_ALIAS_TO_MODEL`. Falls back to matching by the
+    `claude-(haiku|sonnet|opus)-...` prefix so e.g. `claude-opus-4-6`
+    still resolves to `opus` even when `_ALIAS_TO_MODEL["opus"]` has
+    rotated to a newer id."""
+    for alias, mid in _ALIAS_TO_MODEL.items():
+        if mid == model_id:
+            return alias
+    m = re.match(r"claude-(haiku|sonnet|opus)\b", model_id or "")
+    return m.group(1) if m else None
 
 
 def _extract_plan_questions(plan: str) -> list[str]:
@@ -1720,9 +1852,16 @@ def _default_claude_command() -> list[str]:
     # registers a PreToolUse hook blocking whole-file `Read` calls on
     # files above `agent.large_file_line_threshold`. Custom overrides that
     # drop this placeholder silently disable enforcement.
+    #
+    # `--model {model}` pins the invocation to `agent.model` (or the
+    # per-run override the execute phase passes when
+    # `agent.auto_execute_model=true`). Custom `agent.command` overrides
+    # that drop the placeholder silently fall back to whatever the claude
+    # CLI defaults to — same opt-out pattern as `{settings_path}`.
     return [
         "claude", "-p", "--dangerously-skip-permissions",
         "--settings", "{settings_path}",
+        "--model", "{model}",
         "--input-format", "stream-json",
         "--output-format", "stream-json", "--verbose",
     ]
