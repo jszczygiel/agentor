@@ -139,6 +139,7 @@ class TestStatusLineTier(unittest.TestCase):
             ItemStatus.WORKING: 1,
             ItemStatus.AWAITING_REVIEW: 4,
             ItemStatus.ERRORED: 1,
+            ItemStatus.CONFLICTED: 2,
         }
 
     def test_wide_has_full_fields(self):
@@ -192,6 +193,28 @@ class TestStatusLineTier(unittest.TestCase):
             token_compact="tok sess=1.2k  wk=3.4M",
         )
         self.assertLessEqual(len(line), 40)
+
+    def test_wide_collapses_errored_and_conflicted_into_needs_attention(self):
+        line = _build_status_line("wide", self._cfg(), self._stats(),
+                                  self._counts(), 1)
+        self.assertIn("needs_attention=3", line)
+        self.assertNotIn("errored=", line)
+        self.assertNotIn("conflicted=", line)
+
+    def test_mid_collapses_errored_and_conflicted_into_bang_token(self):
+        line = _build_status_line("mid", self._cfg(), self._stats(),
+                                  self._counts(), 1)
+        self.assertLessEqual(len(line), 60)
+        self.assertIn("!=3", line)
+        self.assertNotIn(" e=", line)
+        self.assertNotIn(" c=", line)
+
+    def test_narrow_collapses_errored_into_bang_token(self):
+        line = _build_status_line("narrow", self._cfg(), self._stats(),
+                                  self._counts(), 1)
+        self.assertLessEqual(len(line), 40)
+        self.assertIn("!=3", line)
+        self.assertNotIn(" e=", line)
         self.assertNotIn("tok sess=", line)
 
 
@@ -699,6 +722,39 @@ class TestDefaultFilter(unittest.TestCase):
             store.close()
         finally:
             td.cleanup()
+
+
+class TestNeedsAttentionFilter(unittest.TestCase):
+    """ERRORED and CONFLICTED tabs were merged into a single
+    `needs attention` filter — both statuses surface work the operator
+    must triage, so a split tab added only keystrokes with no signal.
+    Underlying `ItemStatus` distinction is preserved in the store and
+    per-status action key-maps — this is a UI-only consolidation."""
+
+    def test_needs_attention_entry_covers_both_failure_statuses(self):
+        matches = [e for e in FILTERS if e[0] == "needs attention"]
+        self.assertEqual(
+            len(matches), 1,
+            "FILTERS must expose exactly one 'needs attention' entry",
+        )
+        _, statuses = matches[0]
+        self.assertEqual(
+            set(statuses),
+            {ItemStatus.ERRORED, ItemStatus.CONFLICTED},
+        )
+
+    def test_legacy_split_tabs_are_gone(self):
+        names = {name for name, _ in FILTERS}
+        self.assertNotIn("errored", names)
+        self.assertNotIn("conflicted", names)
+
+    def test_filter_list_has_ten_entries(self):
+        self.assertEqual(len(FILTERS), 10)
+
+    def test_needs_attention_follows_active(self):
+        names = [n for n, _ in FILTERS]
+        self.assertEqual(names[0], "active")
+        self.assertEqual(names[1], "needs attention")
 
 
 if __name__ == "__main__":
