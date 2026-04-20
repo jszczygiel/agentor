@@ -67,8 +67,8 @@ Gather in parallel (cheap, read-only):
   Also check `git log --all --diff-filter=A --name-only -- 'docs/agent-logs/*.md'`
   for the complete historical inventory.
 - `docs/backlog/` — existing backlog filenames (to dedupe before filing).
-- `docs/IMPROVEMENTS.md` — running out-of-scope log (to dedupe and flag
-  stale entries against merged fixes).
+  Treat as the single living out-of-scope tracker; the former
+  `docs/IMPROVEMENTS.md` was retired in favour of per-item backlog files.
 
 ## Phase 3 — Analyse
 
@@ -159,8 +159,8 @@ Stop if** sections. Then surface:
 
 ### 3e. Candidate backlog items
 
-Diff "Follow-ups" across all reflect items against `docs/backlog/` and
-`docs/IMPROVEMENTS.md`. For each open follow-up, classify:
+Diff "Follow-ups" across all reflect items against `docs/backlog/`.
+For each open follow-up, classify:
 
 - **Fileable** — bug, UX, cleanup, or small feature with clear scope.
 - **Defer — wait-for-signal** — only matters under a condition that
@@ -210,8 +210,9 @@ For each approved item:
    ```
 2. Don't duplicate titles already in `docs/backlog/`. If a near-match
    exists, flag and ask before filing.
-3. Update stale `docs/IMPROVEMENTS.md` entries (mark resolved / remove)
-   only if the user approved that housekeeping separately.
+3. Sweep stale or phantom backlog markdown (already-shipped items whose
+   `git rm` never landed — detectable by cross-referencing the
+   `feat(...)` commit log). Only delete with explicit user approval.
 
 Then write the review record to `.agentor/analyses/YYYY-MM-DD-<slug>.md`
 using this structure:
@@ -236,7 +237,7 @@ using this structure:
 
 - Backlog items filed (list + reason).
 - Items rejected (list + reason — saves a future pass reconsidering them).
-- Housekeeping (IMPROVEMENTS.md edits, CLAUDE.md refinements).
+- Housekeeping (backlog pruning, CLAUDE.md refinements).
 
 ## Skip until
 
