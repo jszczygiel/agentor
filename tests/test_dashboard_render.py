@@ -754,5 +754,82 @@ class TestNeedsAttentionFilter(unittest.TestCase):
         self.assertEqual(names[1], "needs attention")
 
 
+class TestAutoResolveBadge(unittest.TestCase):
+    """Main-table rendering must flag QUEUED items re-enqueued via the
+    committer's auto-resolve chain so operators can distinguish them from
+    fresh human-approved resubmits without drilling into the inspect
+    view. Wide/mid tiers suffix the state label with `·auto`; narrow
+    flips the 3-char state cell's trailing space to `a`."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.store = Store(Path(self.td.name) / "state.db")
+        self.chained = Item(id="chained_id", title="ChainedTitle", body="",
+                            source_file="s.md", source_line=1, tags={})
+        self.plain = Item(id="plain_id", title="PlainTitle", body="",
+                          source_file="s.md", source_line=2, tags={})
+        self.store.upsert_discovered(self.chained)
+        self.store.upsert_discovered(self.plain)
+        # Drive `chained_id` through CONFLICTED → QUEUED with the
+        # auto-resolve note so `_is_auto_resolve_chain` fires.
+        from agentor.committer import AUTO_RESOLVE_NOTE_PREFIX
+        self.store.transition("chained_id", ItemStatus.WORKING, note="t")
+        self.store.transition("chained_id", ItemStatus.AWAITING_REVIEW,
+                              note="t")
+        self.store.transition("chained_id", ItemStatus.CONFLICTED,
+                              note="conflict")
+        self.store.transition(
+            "chained_id", ItemStatus.QUEUED,
+            note=f"{AUTO_RESOLVE_NOTE_PREFIX}: resubmitted from CONFLICTED",
+        )
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _render(self, width: int):
+        stdscr = _FakeStdscr(width=width)
+        with patch("agentor.dashboard.render.curses.color_pair",
+                   return_value=0):
+            _render_table(stdscr, self.store, top=0, height=10, w=width,
+                          statuses=[ItemStatus.QUEUED], context_window=200_000,
+                          selected_id=None)
+        return stdscr.lines
+
+    def test_wide_suffixes_state_label_with_auto(self):
+        lines = self._render(width=120)
+        chained_line = next(s for _, s in lines if "ChainedTitle" in s)
+        plain_line = next(s for _, s in lines if "PlainTitle" in s)
+        self.assertIn("queued·auto", chained_line)
+        self.assertNotIn("·auto", plain_line)
+
+    def test_mid_suffixes_state_label_with_auto(self):
+        lines = self._render(width=60)
+        chained_line = next(s for _, s in lines if "ChainedTitle" in s)
+        plain_line = next(s for _, s in lines if "PlainTitle" in s)
+        self.assertIn("queued·auto", chained_line)
+        self.assertNotIn("·auto", plain_line)
+
+    def test_narrow_flips_trailing_state_cell_to_a(self):
+        lines = self._render(width=40)
+        chained_line = next(s for _, s in lines if "ChainedTitle" in s)
+        plain_line = next(s for _, s in lines if "PlainTitle" in s)
+        # 3-char state cell `{marker}{glyph}{tail}` — chained carries `Qa`.
+        self.assertIn("Qa", chained_line)
+        self.assertNotIn("Qa", plain_line)
+        # Plain QUEUED keeps the `Q ` form (glyph + trailing space).
+        self.assertIn("Q ", plain_line)
+
+    def test_row_widths_fit_all_tiers(self):
+        # Mirror `TestTableRowFits.test_row_fits_at_each_tier` for the
+        # auto-resolve variant so the `·auto` suffix / narrow `a` never
+        # blow the layout budget.
+        for w in (40, 60, 80, 120):
+            lines = self._render(width=w)
+            for _, s in lines:
+                self.assertLessEqual(len(s), w,
+                                     f"w={w} line={s!r} len={len(s)}")
+
+
 if __name__ == "__main__":
     unittest.main()
