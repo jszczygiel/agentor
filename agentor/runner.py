@@ -17,6 +17,7 @@ from . import git_ops
 from .checkpoint import CheckpointConfig, CheckpointEmitter
 from .config import _ALIAS_TO_MODEL, Config
 from .models import ItemStatus
+from .providers import Provider, make_provider
 from .resume_primer import build_primer
 from .slug import slugify
 from .store import Store, StoredItem
@@ -181,7 +182,14 @@ def _is_infrastructure_error(msg: str) -> bool:
 
 
 def _is_dead_session_error(msg: str) -> bool:
-    """Detect CLI resume failures caused by a missing persisted session."""
+    """Union-needle predicate across every supported CLI.
+
+    Used only as a disqualifier inside `_is_transient_error` — the retry
+    wrapper has no `Provider` handy, so a cross-provider safety net here
+    is safer than skipping the gate (matches too broadly at worst; never
+    retries a dead session). The recovery sweep and the runner-level
+    session-kill demote both route through `Provider.is_dead_session_error`
+    instead, so a Claude item never trips on a Codex signature."""
     low = (msg or "").lower()
     needles = (
         "no conversation found with session id",
@@ -361,6 +369,11 @@ class Runner:
     def __init__(self, config: Config, store: Store):
         self.config = config
         self.store = store
+        # Per-CLI dead-session / wall-clock-expiry behaviour. Recovery and
+        # the runner-level session-kill demote both consult this instead of
+        # a hardcoded Claude substring — Codex thread expiries route through
+        # the same code path.
+        self.provider: Provider = make_provider(config)
         # Set by Daemon after construction. Allows in-flight subprocesses to
         # be killed on shutdown rather than orphaned.
         self.proc_registry: ProcRegistry | None = None
@@ -498,7 +511,7 @@ class Runner:
                     # state alone, refund the attempt, surface to user.
                     self.store.note_infra_failure(item.id, last_error)
                     raise InfrastructureError(last_error)
-                if _is_dead_session_error(last_error) and item.session_id:
+                if self.provider.is_dead_session_error(last_error) and item.session_id:
                     # The provider lost the session. Resuming with the same id
                     # will keep failing on every attempt until rejection —
                     # drop the session_id, refund the attempt, and bounce

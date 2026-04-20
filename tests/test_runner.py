@@ -1136,8 +1136,16 @@ class TestErrorClassifiers(unittest.TestCase):
 
     def test_dead_session_classifier(self):
         from agentor.runner import _is_dead_session_error
+        # Union needle set — covers both Claude and Codex so the retry
+        # wrapper never mis-retries a dead session regardless of CLI.
         self.assertTrue(_is_dead_session_error(
             "claude exited 1: No conversation found with session ID: abc"))
+        self.assertTrue(_is_dead_session_error(
+            "codex exited 1: thread not found"))
+        self.assertTrue(_is_dead_session_error(
+            "codex exited 1: thread/start failed"))
+        self.assertTrue(_is_dead_session_error(
+            "codex exited 1: session not found"))
         self.assertFalse(_is_dead_session_error("anything else"))
 
     def test_shutdown_classifier(self):
@@ -1228,6 +1236,116 @@ class TestTransientClassifier(unittest.TestCase):
         # Indexes past the table clamp to the final value
         self.assertGreaterEqual(d9, _RETRY_DELAYS[-1])
         self.assertLess(d9, _RETRY_DELAYS[-1] * 2)
+
+
+class TestProviders(unittest.TestCase):
+    """Per-CLI dead-session predicates and wall-clock expiry opt-out."""
+
+    def _cfg(self, runner: str, hours: float = 4.0) -> Config:
+        return Config(
+            project_name="t",
+            project_root=Path("/tmp"),
+            sources=SourcesConfig(),
+            parsing=ParsingConfig(),
+            agent=AgentConfig(runner=runner, session_max_age_hours=hours),
+            git=GitConfig(),
+            review=ReviewConfig(),
+        )
+
+    def test_claude_provider_matches_claude_needle_only(self):
+        from agentor.providers import ClaudeProvider
+        p = ClaudeProvider(self._cfg("claude"))
+        self.assertTrue(p.is_dead_session_error(
+            "claude exited 1: No conversation found with session ID abc"))
+        # Raw substring AND whitespace-stripped signature form both match.
+        self.assertTrue(p.is_dead_session_error(
+            "claudeexited:noconversationfoundwithsessionidabc"))
+        # Codex signatures must NOT match on a claude-configured project.
+        self.assertFalse(p.is_dead_session_error("codex: thread not found"))
+        self.assertFalse(p.is_dead_session_error("codex: thread/start failed"))
+        self.assertFalse(p.is_dead_session_error(""))
+
+    def test_codex_provider_matches_codex_needles_only(self):
+        from agentor.providers import CodexProvider
+        p = CodexProvider(self._cfg("codex"))
+        self.assertTrue(p.is_dead_session_error(
+            "codex exited 1: thread not found: thr-1"))
+        self.assertTrue(p.is_dead_session_error(
+            "codex exited 1: thread/start failed"))
+        self.assertTrue(p.is_dead_session_error(
+            "codex exited 1: session not found"))
+        # Signature (whitespace-stripped) form also matches.
+        self.assertTrue(p.is_dead_session_error("codexexited:threadnotfound"))
+        # Claude signature must NOT match on a codex-configured project.
+        self.assertFalse(p.is_dead_session_error(
+            "claude: no conversation found with session id abc"))
+        self.assertFalse(p.is_dead_session_error(""))
+
+    def test_claude_provider_honours_configured_hours(self):
+        from agentor.providers import ClaudeProvider
+        self.assertEqual(
+            ClaudeProvider(self._cfg("claude", hours=6.0)).session_max_age_hours(),
+            6.0,
+        )
+        # Zero/negative disables the age gate (returns None).
+        self.assertIsNone(
+            ClaudeProvider(self._cfg("claude", hours=0.0)).session_max_age_hours()
+        )
+
+    def test_codex_provider_honours_configured_hours(self):
+        from agentor.providers import CodexProvider
+        self.assertEqual(
+            CodexProvider(self._cfg("codex", hours=2.5)).session_max_age_hours(),
+            2.5,
+        )
+
+    def test_stub_provider_opts_out_of_age_gate(self):
+        from agentor.providers import StubProvider
+        p = StubProvider(self._cfg("stub"))
+        self.assertIsNone(p.session_max_age_hours())
+        self.assertFalse(p.is_dead_session_error("anything"))
+
+    def test_make_provider_dispatches_by_runner(self):
+        from agentor.providers import (ClaudeProvider, CodexProvider,
+                                       StubProvider, make_provider)
+        self.assertIsInstance(make_provider(self._cfg("claude")), ClaudeProvider)
+        self.assertIsInstance(make_provider(self._cfg("codex")), CodexProvider)
+        self.assertIsInstance(make_provider(self._cfg("stub")), StubProvider)
+
+    def test_make_provider_rejects_unknown_runner(self):
+        from agentor.providers import make_provider
+        with self.assertRaises(ValueError):
+            make_provider(self._cfg("nonsense"))
+
+    def test_runner_carries_matching_provider(self):
+        """`Runner.__init__` wires `self.provider` from `make_provider(config)`.
+        This is what makes the session-kill demote at `runner.run()` fire on
+        Codex `thread not found` errors instead of the hardcoded Claude
+        substring it used to check."""
+        from agentor.providers import (ClaudeProvider, CodexProvider,
+                                       StubProvider)
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            store = Store(root / ".agentor" / "state.db")
+            try:
+                claude = ClaudeRunner(self._cfg("claude"), store)
+                codex = CodexRunner(self._cfg("codex"), store)
+                stub = StubRunner(self._cfg("stub"), store)
+                self.assertIsInstance(claude.provider, ClaudeProvider)
+                self.assertIsInstance(codex.provider, CodexProvider)
+                self.assertIsInstance(stub.provider, StubProvider)
+                # Codex runner's predicate matches codex-shaped errors —
+                # this is the call path the `runner.py:507` session-kill
+                # demote uses, so Codex thread expiries now refresh the
+                # ref instead of looping.
+                self.assertTrue(codex.provider.is_dead_session_error(
+                    "codex exited 1: thread not found"))
+                self.assertFalse(codex.provider.is_dead_session_error(
+                    "claude: No conversation found with session ID abc"))
+                self.assertTrue(claude.provider.is_dead_session_error(
+                    "claude: No conversation found with session ID abc"))
+            finally:
+                store.close()
 
 
 class TestTransientRetry(unittest.TestCase):
