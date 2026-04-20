@@ -1,6 +1,6 @@
 import curses
-import subprocess
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -8,6 +8,7 @@ from ..config import Config
 from ..daemon import Daemon
 from ..git_ops import diff_vs_base
 from ..models import ItemStatus
+from ..providers import Provider, make_provider
 from ..slug import slugify
 from ..store import Store, StoredItem
 from ..watcher import scan_once
@@ -865,32 +866,20 @@ def _new_issue_target(cfg: Config) -> tuple[Path, str] | None:
     return full, "file"
 
 
-def _expand_note_via_claude(
-    note: str, cfg: Config, kind: str, timeout: float,
+def _expand_note(
+    note: str, provider: Provider, kind: str, timeout: float,
 ) -> str:
-    """One-shot claude call. `kind` is 'frontmatter' or 'checkbox' and
-    selects the output-format prompt. Runs with `cwd=project_root` so
-    the model can Read/Grep the repo for grounding. Returns the raw
-    text; raises RuntimeError on any failure."""
+    """One-shot provider call. `kind` is 'frontmatter' or 'checkbox' and
+    selects the output-format prompt. The provider's `invoke_one_shot`
+    runs with `cwd=project_root` so the model can Read/Grep the repo
+    for grounding. Returns the raw text; raises RuntimeError on any
+    failure."""
     tmpl = (_NEW_ISSUE_PROMPT_FRONTMATTER if kind == "frontmatter"
             else _NEW_ISSUE_PROMPT_CHECKBOX)
     prompt = tmpl.format(note=note)
-    cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
-    try:
-        cp = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            cwd=str(cfg.project_root),
-        )
-    except FileNotFoundError:
-        raise RuntimeError("claude CLI not found on PATH")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"claude timed out after {timeout:.0f}s")
-    if cp.returncode != 0:
-        err = (cp.stderr or cp.stdout).strip() or "claude exited nonzero"
-        raise RuntimeError(err.splitlines()[-1][:200])
-    out = (cp.stdout or "").strip()
+    out = provider.invoke_one_shot(prompt, timeout=timeout).strip()
     if not out:
-        raise RuntimeError("claude returned empty output")
+        raise RuntimeError("provider returned empty output")
     if out.startswith("```"):
         lines = out.splitlines()
         if lines[0].lstrip("`").strip() in ("", "markdown", "md"):
@@ -967,15 +956,27 @@ def _new_issue_mode(
     note = _prompt_multiline(stdscr, "bug/idea note")
     if not note:
         return
+    # Snapshot `daemon.provider_override` now so a mid-capture flip via
+    # [M] doesn't swap providers partway through the one-shot call. Same
+    # `replace` pattern as `daemon._make_runner` — shadow `agent.runner`
+    # without mutating the shared Config.
+    effective_cfg = cfg
+    override = getattr(daemon, "provider_override", None)
+    if override and override != cfg.agent.runner:
+        effective_cfg = replace(
+            cfg, agent=replace(cfg.agent, runner=override)
+        )
+    provider = make_provider(effective_cfg)
+    provider_name = effective_cfg.agent.runner
     def _expand_work(p: Callable[[str], None]) -> str:
-        p("calling claude to expand note")
-        return _expand_note_via_claude(
-            note, cfg, expand_kind, timeout=180.0)
+        p(f"calling {provider_name} to expand note")
+        return _expand_note(
+            note, provider, expand_kind, timeout=180.0)
     try:
         content = _run_with_progress(
             stdscr, f"  expanding note → {dest.name}…",
             _expand_work,
-            hint="one-shot claude call; may take 10-60s.",
+            hint=f"one-shot {provider_name} call; may take 10-60s.",
         )
     except Exception as e:
         _flash(stdscr, f"expand failed: {e}")

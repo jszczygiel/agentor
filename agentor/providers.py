@@ -25,7 +25,11 @@ top without a cycle.
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
@@ -71,6 +75,12 @@ class Provider:
                 return alias
         return None
 
+    def invoke_one_shot(self, prompt: str, timeout: float) -> str:
+        """Run provider, return final message. No session, no worktree,
+        no transcript — used for ephemeral tasks like note expansion
+        from the dashboard. Raises RuntimeError on any failure."""
+        raise NotImplementedError
+
 
 class ClaudeProvider(Provider):
     """Claude CLI. Sessions live ~5h and produce `No conversation found
@@ -114,6 +124,27 @@ class ClaudeProvider(Provider):
         m = self._ALIAS_PREFIX_RE.match(model_id or "")
         return m.group(1) if m else None
 
+    def invoke_one_shot(self, prompt: str, timeout: float) -> str:
+        cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
+        try:
+            cp = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+                cwd=str(self._config.project_root),
+            )
+        except FileNotFoundError as e:
+            raise RuntimeError("claude CLI not found on PATH") from e
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"claude timed out after {timeout:.0f}s"
+            ) from e
+        if cp.returncode != 0:
+            err = (cp.stderr or cp.stdout).strip() or "claude exited nonzero"
+            raise RuntimeError(err.splitlines()[-1][:200])
+        out = (cp.stdout or "").strip()
+        if not out:
+            raise RuntimeError("claude returned empty output")
+        return out
+
 
 class CodexProvider(Provider):
     """Codex CLI. Threads aren't immortal either — the CLI returns
@@ -152,6 +183,52 @@ class CodexProvider(Provider):
         hours = float(self._config.agent.session_max_age_hours)
         return hours if hours > 0 else None
 
+    def invoke_one_shot(self, prompt: str, timeout: float) -> str:
+        # Codex has no stdout "final message" channel for non-JSON runs —
+        # route the result through `-o <path>` and read the file. Parsing
+        # `--json` JSONL for a one-shot call is overkill (dashboard note
+        # expansion), and omitting `-m` lets the CLI default pick.
+        tmp_root = self._config.project_root / ".agentor" / "tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        fd, raw_path = tempfile.mkstemp(
+            prefix="one-shot-", suffix=".txt", dir=str(tmp_root),
+        )
+        output_path = Path(raw_path)
+        # mkstemp creates the file; unlink it so codex doesn't see a
+        # stale empty file and refuse to overwrite.
+        os.close(fd)
+        output_path.unlink(missing_ok=True)
+        cmd = [
+            "codex", "exec", "--dangerously-bypass-approvals-and-sandbox",
+            "-o", str(output_path), prompt,
+        ]
+        try:
+            try:
+                cp = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout,
+                    cwd=str(self._config.project_root),
+                )
+            except FileNotFoundError as e:
+                raise RuntimeError("codex CLI not found on PATH") from e
+            except subprocess.TimeoutExpired as e:
+                raise RuntimeError(
+                    f"codex timed out after {timeout:.0f}s"
+                ) from e
+            if cp.returncode != 0:
+                err = (cp.stderr or cp.stdout).strip() or "codex exited nonzero"
+                raise RuntimeError(err.splitlines()[-1][:200])
+            try:
+                out = output_path.read_text().strip()
+            except FileNotFoundError as e:
+                raise RuntimeError(
+                    "codex produced no output file"
+                ) from e
+            if not out:
+                raise RuntimeError("codex returned empty output")
+            return out
+        finally:
+            output_path.unlink(missing_ok=True)
+
 
 class StubProvider(Provider):
     """Test runner — no real sessions, no wall-clock expiry, no dead-
@@ -170,6 +247,9 @@ class StubProvider(Provider):
 
     def session_max_age_hours(self) -> float | None:
         return None
+
+    def invoke_one_shot(self, prompt: str, timeout: float) -> str:
+        raise NotImplementedError("stub provider has no one-shot")
 
 
 def make_provider(config: "Config") -> Provider:
