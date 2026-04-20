@@ -6,7 +6,6 @@ header bar) off-screen. The fix forces a full `clear()` +
 
 import curses
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from agentor.dashboard.render import _handle_resize
@@ -171,7 +170,7 @@ class TestInspectResize(unittest.TestCase):
         from pathlib import Path
         from tempfile import TemporaryDirectory
         from agentor.dashboard.modes import _inspect_render
-        from agentor.models import Item, ItemStatus
+        from agentor.models import Item
         from agentor.store import Store
 
         td = TemporaryDirectory()
