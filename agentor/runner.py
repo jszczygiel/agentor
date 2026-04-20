@@ -1626,43 +1626,15 @@ class _StreamState:
 
     def envelope(self) -> dict:
         """Produce the same envelope shape _parse_usage would build off the
-        blocking JSON path, so dashboard code stays agnostic of mode."""
-        flat_usage = {
-            "input_tokens": sum(i["input_tokens"] for i in self.iterations),
-            "output_tokens": sum(i["output_tokens"] for i in self.iterations),
-            "cache_read_input_tokens": sum(
-                i["cache_read_input_tokens"] for i in self.iterations),
-            "cache_creation_input_tokens": sum(
-                i["cache_creation_input_tokens"] for i in self.iterations),
-        }
-        out: dict = {
-            "usage": flat_usage,
-            "iterations": self.iterations,
-            "modelUsage": self.model_usage,
-            "num_turns": self.num_turns,
-        }
-        if self.stop_reason:
-            out["stop_reason"] = self.stop_reason
-        if self.duration_ms is not None:
-            out["duration_ms"] = self.duration_ms
-        if self.duration_api_ms is not None:
-            out["duration_api_ms"] = self.duration_api_ms
-        if self.session_id:
-            out["session_id"] = self.session_id
-        if self.result_text:
-            out["result"] = self.result_text
-        if self.rate_limits:
-            out["rate_limits"] = self.rate_limits
-        progress: dict[str, object] = {}
-        if self.last_event_at is not None:
-            progress["last_event_at"] = self.last_event_at
-        if self.last_event_type:
-            progress["last_event_type"] = self.last_event_type
-        if self.activity:
-            progress["activity"] = self.activity
-        if progress:
-            out["progress"] = progress
-        return out
+        blocking JSON path, so dashboard code stays agnostic of mode.
+
+        Delegates through `Envelope.from_claude(self).to_legacy_dict()`
+        so the provider-neutral schema owns the shape; return type
+        stays `dict` because every downstream consumer (`_last_usage`,
+        `update_result_json` via `_publish_live`, dashboard
+        formatters' `_result_data` cache) expects a dict."""
+        from .envelope import Envelope
+        return Envelope.from_claude(self).to_legacy_dict()
 
 
 class _CodexStreamState:
@@ -1705,28 +1677,14 @@ class _CodexStreamState:
                 self.activity = f"message received: {snippet[:120]}"
 
     def envelope(self, result_text: str | None = None) -> dict:
-        out: dict = {
-            "usage": {},
-            "iterations": [],
-            "modelUsage": {},
-            "num_turns": self.num_turns,
-        }
-        if self.session_id:
-            out["session_id"] = self.session_id
-        if result_text or self.result_text:
-            out["result"] = result_text or self.result_text
-        if self.last_error:
-            out["stop_reason"] = self.last_error
-        progress: dict[str, object] = {}
-        if self.last_event_at is not None:
-            progress["last_event_at"] = self.last_event_at
-        if self.last_event_type:
-            progress["last_event_type"] = self.last_event_type
-        if self.activity:
-            progress["activity"] = self.activity
-        if progress:
-            out["progress"] = progress
-        return out
+        """Legacy on-disk shape for codex runs. Delegates through
+        `Envelope.from_codex(...).to_legacy_dict()` so the
+        provider-neutral schema is the single source of truth;
+        `result_text` override is forwarded (the caller in
+        `_invoke_codex_jsonl` reads the final message from the
+        `--output-path` file at shutdown and passes it in)."""
+        from .envelope import Envelope
+        return Envelope.from_codex(self, result_text=result_text).to_legacy_dict()
 
 
 def _extract_result_field(stdout: str) -> str | None:
