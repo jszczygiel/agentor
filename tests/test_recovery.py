@@ -365,6 +365,23 @@ class TestRecoveryStaleSession(unittest.TestCase):
         self.assertEqual(len(result.resumable), 1)
         self.assertEqual(self.store.get("a").session_id, "sess-1")
 
+    def test_stale_session_removes_worktree_dir(self):
+        """Stale-session demote must nuke the worktree dir on disk so a
+        re-dispatch with a fresh slug doesn't collide with the old one."""
+        wt = self.root / "wt-stale"
+        wt.mkdir()
+        self._seed_working("a", session_id="sess-1", worktree_path=str(wt))
+        self.store.record_failure(
+            item_id="a", attempt=1, phase="execute",
+            error="claude exited 1: No conversation found with session ID sess-1",
+            error_sig="claudeexited:noconversationfoundwithsessionidsess-",
+        )
+
+        recover_on_startup(self.config, self.store)
+
+        self.assertFalse(wt.exists())
+        self.mock_wt_remove.assert_called_once()
+
     def test_marker_clears_on_next_sweep(self):
         """The single-tick marker must be in `_AUTO_RECOVERABLE_PATTERNS`
         so the next startup wipes it without operator intervention."""

@@ -142,6 +142,10 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
             stale = (max_age_seconds > 0 and age > max_age_seconds)
             stale = stale or _has_dead_session_failure(store, item.id)
             if stale:
+                if wt is not None and wt.exists():
+                    git_ops.worktree_remove(repo, wt, force=True)
+                    if wt.exists():
+                        shutil.rmtree(wt, ignore_errors=True)
                 store.transition(
                     item.id, ItemStatus.QUEUED,
                     attempts=0,
