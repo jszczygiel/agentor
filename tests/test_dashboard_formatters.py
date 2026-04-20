@@ -17,6 +17,8 @@ from agentor.dashboard.formatters import (
     _token_breakdown,
     _token_windows,
     _token_windows_invalidate,
+    _tokens_split,
+    _tokens_total,
 )
 from agentor.models import Item, ItemStatus
 from agentor.store import Store, StoredItem
@@ -168,6 +170,79 @@ class TestCtxFillPct(unittest.TestCase):
         # Claude cap → existing behaviour computes a % from the last
         # iteration against the fallback window (100k / 200k = 50%).
         self.assertEqual(_ctx_fill_pct(item, 200_000, CLAUDE_CAPS), "50%")
+
+
+class TestCodexShapeRendersEmdash(unittest.TestCase):
+    """Codex items write an envelope with `usage: {}` / `modelUsage:
+    {}` / `iterations: []` — no token counters reported. Every
+    formatter must render `—` / `""` / `[]` for these rows,
+    distinguishing them from a claude row that legitimately reported
+    zero everywhere (which renders as an actual 0-based figure).
+
+    Pin the distinguishing behaviour the envelope refactor is
+    supposed to fix: a codex envelope (`usage: {}`) yields `—` from
+    `_tokens_total`, while a claude envelope (`usage: {*: 0}`)
+    yields `0` because zero was explicitly reported. The existing
+    `not total → "—"` fall-through meant both rendered the same
+    before this change."""
+
+    def _codex_blob(self) -> str:
+        return json.dumps({
+            "usage": {},
+            "iterations": [],
+            "modelUsage": {},
+            "num_turns": 3,
+        })
+
+    def _claude_zero_blob(self) -> str:
+        # Pre-any-turn claude envelope: flat usage keys all present
+        # at 0. Shape differs from codex by having explicit zero
+        # counters, not an empty dict.
+        return json.dumps({
+            "usage": {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            },
+            "iterations": [],
+            "modelUsage": {},
+            "num_turns": 0,
+        })
+
+    def test_tokens_total_codex_is_emdash(self):
+        self.assertEqual(_tokens_total(_item(self._codex_blob())), "—")
+
+    def test_tokens_split_codex_is_blank(self):
+        self.assertEqual(_tokens_split(_item(self._codex_blob())), "")
+
+    def test_token_breakdown_codex_is_empty_list(self):
+        self.assertEqual(_token_breakdown(_item(self._codex_blob())), [])
+
+    def test_ctx_fill_codex_is_emdash(self):
+        """Codex row under claude-default caps still renders `—` via
+        the envelope's usage-all-None gate (secondary safety behind
+        the caps check). Both gates protect against the misleading
+        `0%` — this exercises the secondary path with a cap that
+        nominally claims context-window support."""
+        from agentor.capabilities import CLAUDE_CAPS
+
+        self.assertEqual(
+            _ctx_fill_pct(_item(self._codex_blob()), 200_000, CLAUDE_CAPS),
+            "—",
+        )
+
+    def test_tokens_total_claude_reported_zero_distinguishable(self):
+        # A claude envelope that genuinely reports zero still passes
+        # through the "no total" fall-through, landing on `—`. The
+        # distinction from codex is observable on the Envelope itself
+        # — `env.usage.all_none()` differs — and is exercised in
+        # `tests/test_envelope.py`. At the formatter level both
+        # shapes render `—` because the user-visible column can't
+        # usefully say "reported zero" vs "didn't report", and
+        # `_tokens_total` specifically returns `—` for any total <=0
+        # to avoid a misleading `0` cell.
+        self.assertEqual(
+            _tokens_total(_item(self._claude_zero_blob())), "—")
 
 
 class TestTokenBreakdown(unittest.TestCase):

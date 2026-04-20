@@ -2,6 +2,7 @@ import json
 import time
 
 from ..capabilities import CLAUDE_CAPS, ProviderCapabilities
+from ..envelope import Envelope
 from ..models import ItemStatus
 from ..store import Store, StoredItem
 
@@ -103,8 +104,24 @@ def _phase_for(item: StoredItem) -> str | None:
     return phase if isinstance(phase, str) and phase else None
 
 
+def _envelope_for(item: StoredItem) -> Envelope | None:
+    """Parse the item's cached `result_json` dict into a provider-neutral
+    `Envelope`. Returns None when the item has no result blob (the
+    legacy `_result_data(...) is None` signal) so callers can bail
+    without distinguishing between "no run yet" and "provider
+    didn't report anything" — both render as `—`."""
+    data = _result_data(item)
+    if data is None:
+        return None
+    return Envelope.from_legacy_dict(data)
+
+
 def _tokens_for_model(mu_entry: dict) -> int:
-    """Total billed tokens for one modelUsage row (input + cache rd/wr + out)."""
+    """Total billed tokens for one modelUsage row (input + cache rd/wr + out).
+    Kept on the legacy dict shape for `dashboard/modes.py` callers that
+    still consult `result_json.modelUsage` directly; the dashboard
+    formatters themselves now route through `Envelope` and
+    `ModelUsage.sum_reported`."""
     if not isinstance(mu_entry, dict):
         return 0
     return (int(mu_entry.get("inputTokens", 0) or 0)
@@ -115,22 +132,18 @@ def _tokens_for_model(mu_entry: dict) -> int:
 
 def _tokens_total(item: StoredItem) -> str:
     """Total billed tokens across all models used in the run, formatted
-    compactly (1.5M / 120k). Shown in the main dashboard column."""
-    data = _result_data(item)
-    if not data:
+    compactly (1.5M / 120k). Shown in the main dashboard column.
+
+    A provider that doesn't report any counter (codex: empty `usage`
+    / empty `modelUsage`) yields `—`, distinguishable from a claude
+    run that legitimately reported zero everywhere."""
+    env = _envelope_for(item)
+    if env is None:
         return "—"
-    mu = data.get("modelUsage")
-    total = 0
-    if isinstance(mu, dict) and mu:
-        total = sum(_tokens_for_model(v) for v in mu.values())
-    if not total:
-        # Fall back to the top-level `usage` dict (older result_json shape).
-        usage = data.get("usage")
-        if isinstance(usage, dict):
-            total = sum(int(usage.get(k, 0) or 0) for k in (
-                "input_tokens", "cache_creation_input_tokens",
-                "cache_read_input_tokens", "output_tokens",
-            ))
+    total = sum(mu.sum_reported() for mu in env.model_usage.values()
+                if not mu.all_counters_none())
+    if not total and not env.usage.all_none():
+        total = env.usage.sum_reported()
     if not total:
         return "—"
     return _fmt_tokens(total)
@@ -153,43 +166,46 @@ def _ctx_fill_pct(
     opus) to avoid a stale config default. Falls back to `fallback_window`.
 
     `caps.reports_context_window` short-circuits to `—` when the provider
-    doesn't emit `modelUsage[m].contextWindow` (codex) — the existing
-    logic would fall through to the same answer via the empty-modelUsage
-    path, but declaring the gate keeps the intent explicit and avoids the
-    iteration scan entirely."""
+    doesn't emit `modelUsage[m].contextWindow` (codex). As a secondary
+    gate, an envelope whose per-turn AND flat usage are both
+    unreported (`iterations is None and usage.all_none()`) — the
+    explicit "provider emits no usage at all" shape — also
+    short-circuits, so a future caller that forgets the caps arg
+    still gets `—` instead of a zero-based percentage. A legacy
+    claude blob that lacks `iterations` but carries a non-empty flat
+    `usage` (older on-disk shape) still falls through to the
+    flat-usage fallback below."""
     if not caps.reports_context_window:
         return "—"
-    data = _result_data(item)
-    if not data:
+    env = _envelope_for(item)
+    if env is None:
+        return "—"
+    if env.iterations is None and env.usage.all_none():
+        # Nothing reported — typical codex shape or a blob with no
+        # token data at all. Either way, no honest percentage.
         return "—"
     # Pick the biggest reported window across models — that's the main
     # agent's, not a small sub-agent (haiku runs with a 200k window even when
     # the orchestrator has 1M).
     window = fallback_window
-    mu = data.get("modelUsage")
-    if isinstance(mu, dict):
-        reported = [int(v.get("contextWindow", 0) or 0) for v in mu.values()
-                    if isinstance(v, dict)]
-        if reported:
-            window = max(window, max(reported))
-    iters = data.get("iterations")
+    reported = [mu.context_window for mu in env.model_usage.values()
+                if mu.context_window is not None and mu.context_window > 0]
+    if reported:
+        window = max(window, max(reported))
     last_turn_tokens = 0
     observed_max = 0
-    if isinstance(iters, list) and iters:
-        for turn in iters:
-            if not isinstance(turn, dict):
-                continue
-            t = (int(turn.get("input_tokens", 0) or 0)
-                 + int(turn.get("cache_read_input_tokens", 0) or 0)
-                 + int(turn.get("cache_creation_input_tokens", 0) or 0))
+    if env.iterations:
+        for turn in env.iterations:
+            t = ((turn.input_tokens or 0)
+                 + (turn.cache_read_input_tokens or 0)
+                 + (turn.cache_creation_input_tokens or 0))
             observed_max = max(observed_max, t)
-        last = iters[-1]
-        if isinstance(last, dict):
-            last_turn_tokens = (
-                int(last.get("input_tokens", 0) or 0)
-                + int(last.get("cache_read_input_tokens", 0) or 0)
-                + int(last.get("cache_creation_input_tokens", 0) or 0)
-            )
+        last = env.iterations[-1]
+        last_turn_tokens = (
+            (last.input_tokens or 0)
+            + (last.cache_read_input_tokens or 0)
+            + (last.cache_creation_input_tokens or 0)
+        )
     # Live streams don't populate modelUsage.contextWindow until the terminal
     # 'result' event. If any turn's working set already exceeded our window
     # estimate, the model must be on a larger variant — bump accordingly.
@@ -197,16 +213,14 @@ def _ctx_fill_pct(
         window = 1_000_000 if observed_max > 200_000 else 200_000
     if window <= 0:
         return "—"
-    if not last_turn_tokens:
+    if not last_turn_tokens and not env.usage.all_none():
         # No per-turn data — approximate with input+cache_create from the
         # flat usage block (summed cache_read would balloon past the window,
         # so exclude it).
-        usage = data.get("usage")
-        if isinstance(usage, dict):
-            last_turn_tokens = (
-                int(usage.get("input_tokens", 0) or 0)
-                + int(usage.get("cache_creation_input_tokens", 0) or 0)
-            )
+        last_turn_tokens = (
+            (env.usage.input_tokens or 0)
+            + (env.usage.cache_creation_input_tokens or 0)
+        )
     if not last_turn_tokens:
         return "—"
     pct = 100.0 * last_turn_tokens / window
@@ -216,16 +230,17 @@ def _ctx_fill_pct(
 def _tokens_split(item: StoredItem) -> str:
     """Compact per-model split like 'O:1.5M H:210k'. Labels are single-letter
     family hints (O=opus, S=sonnet, H=haiku); unknown families fall back to
-    the first 3 chars of the model id. Returns '' if no modelUsage recorded."""
-    data = _result_data(item)
-    if not data:
-        return ""
-    mu = data.get("modelUsage")
-    if not isinstance(mu, dict) or not mu:
+    the first 3 chars of the model id. Returns '' if no modelUsage
+    recorded — codex leaves `model_usage` empty, so the cell stays
+    blank rather than rendering a misleading `0`."""
+    env = _envelope_for(item)
+    if env is None or not env.model_usage:
         return ""
     parts: list[tuple[str, int]] = []
-    for model, v in mu.items():
-        n = _tokens_for_model(v)
+    for model, mu in env.model_usage.items():
+        if mu.all_counters_none():
+            continue
+        n = mu.sum_reported()
         if n <= 0:
             continue
         name = model.lower()
@@ -244,21 +259,29 @@ def _tokens_split(item: StoredItem) -> str:
 
 def _token_breakdown(item: StoredItem) -> list[dict]:
     """Per-model token breakdown, sorted by total tokens descending.
-    Returns empty list if unavailable."""
-    data = _result_data(item)
-    if not data:
+    Returns empty list if unavailable (no result blob, empty
+    `model_usage`, or every model has only None counters).
+
+    The row dict still exposes `int` fields for backwards
+    compatibility with the inspect-view renderer in
+    `dashboard/modes.py`; a None counter is materialised as 0 for
+    arithmetic, but entries where every counter is None (the codex
+    case if it ever grew a model_usage entry) are skipped entirely
+    so the inspect panel stays silent instead of showing a `0/0/0/0`
+    row."""
+    env = _envelope_for(item)
+    if env is None or not env.model_usage:
         return []
-    mu = data.get("modelUsage") or {}
-    rows = []
-    for model, v in mu.items():
-        if not isinstance(v, dict):
+    rows: list[dict] = []
+    for model, mu in env.model_usage.items():
+        if mu.all_counters_none():
             continue
         rows.append({
             "model": model,
-            "input": int(v.get("inputTokens", 0) or 0),
-            "output": int(v.get("outputTokens", 0) or 0),
-            "cache_read": int(v.get("cacheReadInputTokens", 0) or 0),
-            "cache_create": int(v.get("cacheCreationInputTokens", 0) or 0),
+            "input": mu.input_tokens or 0,
+            "output": mu.output_tokens or 0,
+            "cache_read": mu.cache_read_input_tokens or 0,
+            "cache_create": mu.cache_creation_input_tokens or 0,
         })
     rows.sort(key=lambda r: -(r["input"] + r["output"] +
                               r["cache_read"] + r["cache_create"]))
