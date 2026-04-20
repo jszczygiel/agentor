@@ -4,7 +4,25 @@ import unittest
 import uuid
 from pathlib import Path
 
-from agentor.resume_primer import build_primer
+from agentor.config import (
+    AgentConfig, Config, GitConfig, ParsingConfig, ReviewConfig, SourcesConfig,
+)
+from agentor.providers import ClaudeProvider
+
+
+def _cfg() -> Config:
+    return Config(
+        project_name="p", project_root=Path("/tmp/never"),
+        sources=SourcesConfig(watch=[], exclude=[]),
+        parsing=ParsingConfig(mode="checkbox"),
+        agent=AgentConfig(runner="claude"),
+        git=GitConfig(base_branch="main", branch_prefix="agent/"),
+        review=ReviewConfig(),
+    )
+
+
+def _build_primer(path: Path) -> str | None:
+    return ClaudeProvider(_cfg()).build_primer(path)
 
 
 def _assistant_text(text: str) -> dict:
@@ -59,7 +77,7 @@ def _write_transcript(events: list[dict]) -> Path:
 class TestBuildPrimer(unittest.TestCase):
     def test_missing_file_returns_none(self):
         missing = Path(tempfile.gettempdir()) / f"nope-{uuid.uuid4()}.log"
-        self.assertIsNone(build_primer(missing))
+        self.assertIsNone(_build_primer(missing))
 
     def test_below_turn_threshold_returns_none(self):
         path = _write_transcript([
@@ -67,7 +85,7 @@ class TestBuildPrimer(unittest.TestCase):
             _tool_call("Read", {"file_path": "b.py"}),
         ])
         # 2 assistant turns < min_turns=3.
-        self.assertIsNone(build_primer(path))
+        self.assertIsNone(_build_primer(path))
 
     def test_ten_reads_and_five_greps_listed(self):
         events: list[dict] = []
@@ -86,7 +104,7 @@ class TestBuildPrimer(unittest.TestCase):
                 f"g{i}", f"scripts/hit_{pat}_a.gd\nscripts/hit_{pat}_b.gd\n",
             ))
         path = _write_transcript(events)
-        primer = build_primer(path)
+        primer = _build_primer(path)
         self.assertIsNotNone(primer)
         for i in range(10):
             self.assertIn(f"scripts/file_{i}.gd", primer)
@@ -111,7 +129,7 @@ class TestBuildPrimer(unittest.TestCase):
             _tool_result("r3", "..."),
         ]
         path = _write_transcript(events)
-        primer = build_primer(path)
+        primer = _build_primer(path)
         self.assertIsNotNone(primer)
         self.assertIn("scripts/ui/hud.gd:120-180", primer)
         self.assertIn("Files read end-to-end:", primer)
@@ -128,7 +146,7 @@ class TestBuildPrimer(unittest.TestCase):
             _tool_result("r1", "import os"),
         ]
         path = _write_transcript(events)
-        primer = build_primer(path)
+        primer = _build_primer(path)
         self.assertIsNotNone(primer)
         self.assertNotIn("ls -la", primer)
         self.assertNotIn("secret.key", primer)
@@ -150,7 +168,7 @@ class TestBuildPrimer(unittest.TestCase):
             _tool_result("w1", "ok"),
         ]
         path = _write_transcript(events)
-        primer = build_primer(path)
+        primer = _build_primer(path)
         self.assertIsNotNone(primer)
         self.assertIn("Files edited:", primer)
         self.assertIn("- a.py", primer)
@@ -164,7 +182,7 @@ class TestBuildPrimer(unittest.TestCase):
             _assistant_text("done"),
         ]
         path = _write_transcript(events)
-        self.assertIsNone(build_primer(path))
+        self.assertIsNone(_build_primer(path))
 
     def test_grep_without_path_lines_falls_back_to_no_hits(self):
         events = [
@@ -176,7 +194,7 @@ class TestBuildPrimer(unittest.TestCase):
             _tool_result("r1", "ok"),
         ]
         path = _write_transcript(events)
-        primer = build_primer(path)
+        primer = _build_primer(path)
         self.assertIsNotNone(primer)
         self.assertIn('"foo" -> (no parsed hits)', primer)
         self.assertIn('"bar" -> lib/x.py, lib/y.py', primer)

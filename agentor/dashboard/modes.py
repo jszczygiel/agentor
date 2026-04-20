@@ -595,7 +595,7 @@ def _build_detail_lines(
         if not is_review:
             out.append("")
             out.append("(no agent result yet — no token data)")
-            activity = _session_activity(transcript_path)
+            activity = _session_activity(cfg, transcript_path)
             if activity:
                 out.append("")
                 out.append("── session activity ──")
@@ -723,7 +723,7 @@ def _build_detail_lines(
                 out.append(f"  {ln[:300]}")
             if f.get("transcript_path"):
                 out.append(f"  transcript: {f['transcript_path']}")
-    activity = _session_activity(transcript_path)
+    activity = _session_activity(cfg, transcript_path)
     if activity:
         out.append("")
         out.append("── session activity ──")

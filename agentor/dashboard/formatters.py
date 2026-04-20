@@ -58,13 +58,37 @@ def _elapsed_for(store: Store, item_id: str) -> float | None:
     return max(0.0, time.time() - at)
 
 
+# Per-item `json.loads(result_json)` cache. WORKING rows carry envelopes up
+# to 30-40 KB (the `iterations` array grows per turn), and `_result_data` is
+# called 6+ times per visible row per 500ms render tick — one entry per item
+# is bounded by `len(items)`, and `updated_at` changing on every
+# `update_result_json` replaces stale entries automatically.
+_result_cache: dict[tuple[str, float], dict] = {}
+
+
+def _result_data_invalidate() -> None:
+    """Clear the parsed-result cache so the next call re-decodes. Exposed for
+    tests that mutate `result_json` on a reused item id without bumping
+    `updated_at`."""
+    _result_cache.clear()
+
+
 def _result_data(item: StoredItem) -> dict | None:
     if not item.result_json:
         return None
+    key = (item.id, item.updated_at)
+    hit = _result_cache.get(key)
+    if hit is not None:
+        return hit
     try:
-        return json.loads(item.result_json)
+        data = json.loads(item.result_json)
     except json.JSONDecodeError:
         return None
+    for k in list(_result_cache):
+        if k[0] == item.id:
+            del _result_cache[k]
+    _result_cache[key] = data
+    return data
 
 
 def _progress_data(item: StoredItem) -> dict:
