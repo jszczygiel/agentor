@@ -3097,12 +3097,14 @@ class TestResultJsonRecordsExecuteModel(unittest.TestCase):
         self.assertNotIn("execute_model_source", data)
 
 
-class TestDaemonModelOverrideThreading(unittest.TestCase):
-    """The dashboard [M] picker writes a model id onto `daemon.model_override`.
-    `_make_runner` must snapshot that onto the runner so a mid-flight flip
-    never re-targets an already-dispatched worker. Separately, the runner
-    must consult it on FRESH plan + single_phase execute dispatches, and
-    leave resumed executes alone (those carry a pre-existing session_id)."""
+class TestDaemonProviderOverrideThreading(unittest.TestCase):
+    """The dashboard [M] picker writes a runner kind onto
+    `daemon.provider_override`. `_make_runner` must honour that by
+    constructing the override-typed runner, AND must snapshot the
+    override at construction so a mid-flight flip never re-targets an
+    already-dispatched worker. Also asserts that the `@model:` tag path
+    still resolves the correct model id — the picker removal must not
+    regress tier selection."""
 
     def setUp(self):
         self.td = TemporaryDirectory()
@@ -3121,112 +3123,81 @@ class TestDaemonModelOverrideThreading(unittest.TestCase):
         wt, br = plan_worktree(cfg, item)
         return self.store.claim_next_queued(str(wt), br)
 
-    def _cfg(self, single_phase: bool = False) -> Config:
+    def _cfg(self, runner: str = "claude") -> Config:
         return Config(
             project_name=self.root.name, project_root=self.root,
             sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
             parsing=ParsingConfig(mode="checkbox"),
             agent=AgentConfig(
-                runner="claude", pool_size=1,
-                single_phase=single_phase,
+                runner=runner, pool_size=1,
                 model="claude-opus-4-7",
             ),
             git=GitConfig(base_branch="main", branch_prefix="agent/"),
             review=ReviewConfig(),
         )
 
-    def test_make_runner_snapshots_daemon_override(self):
+    def test_make_runner_honours_provider_override(self):
         from agentor.daemon import Daemon
-        cfg = self._cfg()
+        from agentor.runner import ClaudeRunner, CodexRunner
+        cfg = self._cfg(runner="claude")
         d = Daemon(cfg, self.store, runner_factory=make_runner,
                    install_signals=False)
-        d.model_override = "claude-sonnet-4-6"
+        # No override → baseline runner from config.
+        self.assertIsInstance(d._make_runner(), ClaudeRunner)
+
+        # Override flips the constructed runner type.
+        d.provider_override = "codex"
+        self.assertIsInstance(d._make_runner(), CodexRunner)
+
+        # Clearing restores the baseline.
+        d.provider_override = None
+        self.assertIsInstance(d._make_runner(), ClaudeRunner)
+
+    def test_make_runner_does_not_mutate_shared_config(self):
+        from agentor.daemon import Daemon
+        cfg = self._cfg(runner="claude")
+        d = Daemon(cfg, self.store, runner_factory=make_runner,
+                   install_signals=False)
+        d.provider_override = "codex"
+        d._make_runner()
+        # The Config instance other threads read (e.g. dashboard status
+        # line) must still reflect the user's toml choice.
+        self.assertEqual(cfg.agent.runner, "claude")
+
+    def test_mid_flight_flip_does_not_retarget_live_runner(self):
+        # Once _make_runner returns, the runner instance's type is
+        # frozen. A subsequent flip only affects the NEXT dispatch.
+        from agentor.daemon import Daemon
+        from agentor.runner import ClaudeRunner, CodexRunner
+        cfg = self._cfg(runner="claude")
+        d = Daemon(cfg, self.store, runner_factory=make_runner,
+                   install_signals=False)
         r = d._make_runner()
-        self.assertEqual(r._model_override_fresh, "claude-sonnet-4-6")
+        self.assertIsInstance(r, ClaudeRunner)
+        d.provider_override = "codex"
+        # Same runner handed to the worker — still Claude.
+        self.assertIsInstance(r, ClaudeRunner)
+        # But next dispatch picks up the override.
+        self.assertIsInstance(d._make_runner(), CodexRunner)
 
-        # Mid-flight flip must not mutate an already-handed-off runner —
-        # the snapshot lives on the runner instance.
-        d.model_override = "claude-haiku-4-5"
-        self.assertEqual(r._model_override_fresh, "claude-sonnet-4-6")
-        r2 = d._make_runner()
-        self.assertEqual(r2._model_override_fresh, "claude-haiku-4-5")
-
-    def test_do_plan_passes_override_to_invoke(self):
+    def test_model_tag_still_resolves_tier_after_switcher_rework(self):
+        # Regression guard: removing the model-override plumbing must
+        # leave `@model:` tag → model id resolution intact.
+        from agentor.config import _ALIAS_TO_MODEL
+        from agentor.runner import _resolve_execute_tier
         cfg = self._cfg()
         claimed = self._claim(cfg)
-        runner = ClaudeRunner(cfg, self.store)
-        runner._model_override_fresh = "claude-sonnet-4-6"
-        wt = Path(claimed.worktree_path)
-        wt.mkdir(parents=True, exist_ok=True)
-        with patch.object(ClaudeRunner, "_invoke_claude",
-                          return_value=("s", "")) as m:
-            runner._do_plan(claimed, wt)
-        _, kwargs = m.call_args
-        self.assertEqual(kwargs.get("model_override"),
-                         "claude-sonnet-4-6")
-
-    def test_do_plan_without_override_passes_none(self):
-        cfg = self._cfg()
-        claimed = self._claim(cfg)
-        runner = ClaudeRunner(cfg, self.store)
-        wt = Path(claimed.worktree_path)
-        wt.mkdir(parents=True, exist_ok=True)
-        with patch.object(ClaudeRunner, "_invoke_claude",
-                          return_value=("s", "")) as m:
-            runner._do_plan(claimed, wt)
-        _, kwargs = m.call_args
-        self.assertIsNone(kwargs.get("model_override"))
-
-    def test_single_phase_execute_applies_override_on_default_source(self):
-        # Fresh single-phase executes hit `_do_execute` with an empty-ish
-        # plan → `_resolve_execute_tier` returns ("opus","default"). The
-        # dashboard override should win over the tier-mapped model id
-        # because source is "default" and the item has no session yet.
-        cfg = self._cfg(single_phase=True)
-        claimed = self._claim(cfg)
-        runner = ClaudeRunner(cfg, self.store)
-        runner._model_override_fresh = "claude-haiku-4-5"
-        wt = Path(claimed.worktree_path)
-        wt.mkdir(parents=True, exist_ok=True)
-        with patch.object(ClaudeRunner, "_invoke_claude",
-                          return_value=("s", "")) as m, \
-             patch("agentor.runner._list_changes", return_value=[]), \
-             patch("agentor.runner._derive_summary", return_value="s"):
-            runner._do_execute(claimed, wt, "(no plan; spec is in the task body)")
-        _, kwargs = m.call_args
-        self.assertEqual(kwargs.get("model_override"),
-                         "claude-haiku-4-5")
-        # Source attribution points at the dashboard for post-hoc cost
-        # analysis — distinguishes an operator's in-dashboard flip from a
-        # plain `agent.model` run.
-        self.assertEqual(runner._last_execute_model_source, "dashboard")
-
-    def test_execute_resume_ignores_override(self):
-        # Resume path: session_id set → the dashboard override must NOT
-        # re-target the in-flight session. Reviewer ruled resumable items
-        # out of scope.
-        cfg = self._cfg()
-        claimed = self._claim(cfg)
-        self.store.transition(
-            claimed.id, ItemStatus.WORKING,
-            session_id="resumed-session-123",
-            note="fake resume",
+        # Stamp the @model tag on the persisted row and re-read.
+        self.store.conn.execute(
+            "UPDATE items SET tags_json = ? WHERE id = ?",
+            (json.dumps({"model": "haiku"}), claimed.id),
         )
-        fresh = self.store.get(claimed.id)
-        runner = ClaudeRunner(cfg, self.store)
-        runner._model_override_fresh = "claude-haiku-4-5"
-        wt = Path(fresh.worktree_path)
-        wt.mkdir(parents=True, exist_ok=True)
-        with patch.object(ClaudeRunner, "_invoke_claude",
-                          return_value=("s", "")) as m, \
-             patch("agentor.runner._list_changes", return_value=[]), \
-             patch("agentor.runner._derive_summary", return_value="s"):
-            runner._do_execute(fresh, wt, "approved plan body")
-        _, kwargs = m.call_args
-        # Expect the tier-resolved opus mapping, not the dashboard flip.
-        self.assertEqual(kwargs.get("model_override"),
-                         "claude-opus-4-7")
-        self.assertNotEqual(runner._last_execute_model_source, "dashboard")
+        self.store.conn.commit()
+        tagged = self.store.get(claimed.id)
+        alias, source = _resolve_execute_tier(cfg, tagged, "")
+        self.assertEqual(alias, "haiku")
+        self.assertEqual(source, "tag")
+        self.assertEqual(_ALIAS_TO_MODEL[alias], "claude-haiku-4-5")
 
 
 class TestPlanPromptIncludesExecuteTierSection(unittest.TestCase):

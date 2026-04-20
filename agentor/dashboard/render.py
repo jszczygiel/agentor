@@ -24,7 +24,7 @@ from .formatters import (
 
 
 ACTIONS_WIDE = ("[↑/↓/j/k]nav  [enter]open  [n]ew  [r]eview  "
-                "[d]eferred  [i]nspect  [M]odel  [tab]filter  [+/-]pool  "
+                "[d]eferred  [i]nspect  [M]provider  [tab]filter  [+/-]pool  "
                 "[⇧↑/⇧↓]pri  [q]uit")
 ACTIONS_MID = "[↑↓][⏎][n][r][d][i][M][tab][+/-][?]help [q]uit"
 ACTIONS_NARROW = "↑↓ ⏎ tab q  [?]help"
@@ -202,9 +202,9 @@ def _render(stdscr, cfg, store, daemon, log_ring, filter_idx,
     token_row = " " + _fmt_token_row(token_windows, cfg.agent, tier)
     _safe_addstr(stdscr, row, 0, token_row.ljust(w), w, curses.A_DIM)
     row += 1
-    override = getattr(daemon, "model_override", None)
+    override = getattr(daemon, "provider_override", None)
     if override:
-        strip = f" model override: {cfg.agent.runner}/{override} (session-only) "
+        strip = f" provider override: {override} (session-only) "
         _safe_addstr(stdscr, row, 0, strip[:w].ljust(w), w,
                      curses.color_pair(5) | curses.A_BOLD)
         row += 1
@@ -927,40 +927,44 @@ def _prompt_multiline(
     return text.rstrip()
 
 
-def _prompt_model_switcher(
+def _prompt_provider_switcher(
     stdscr, rows: list[tuple[str, str]], current: str | None,
-    runner: str,
+    configured: str,
 ) -> str | None | object:
-    """Centered overlay for picking the active model. `rows` is a list of
-    `(alias, model_id)` pairs offered by the current runner. `current` is
-    the model id that should land selected (matches a row's model_id, or
-    None when no override is active). `runner` is shown in the header so
-    operators know the picker only affects the already-configured runner.
+    """Centered overlay for picking the active provider (`agent.runner`).
+    `rows` is a list of `(kind, label)` pairs offered. `current` is the
+    runner kind currently selected by the in-memory override (or None
+    when no override is active). `configured` is the kind set in
+    `agentor.toml` — shown in the header and tagged on the matching row
+    so operators can see which choice is the baseline.
 
-    Returns the chosen model id, `None` on cancel (esc/q), or the sentinel
-    `_MODEL_OVERRIDE_CLEAR` when the operator picks the "clear override
-    (use agentor.toml)" row. Falls back to a flash message and returns
-    None when the runner has no selectable models (e.g. stub).
+    Returns the chosen provider kind, `None` on cancel (esc/q), or the
+    sentinel `_PROVIDER_OVERRIDE_CLEAR` when the operator picks the
+    "clear override" row. Falls back to a flash message and returns None
+    when no providers are registered.
 
     Note: `curses.color_pair` is invoked while rendering — headless tests
     must patch `agentor.dashboard.render.curses.color_pair` (not the
     caller's module)."""
     if not rows:
-        _flash(stdscr, f"no runtime model switching for runner={runner!r}")
+        _flash(stdscr, "no providers available")
         return None
 
     # Prepend the clear-override row so operators can revert to the
     # config default without restarting the daemon.
     entries: list[tuple[str, str, str]] = [
-        ("default", "", f"(clear override — use agentor.toml agent.model)"),
-    ] + [(alias, mid, f"{alias:<8} {mid}") for alias, mid in rows]
+        ("default", "", "(clear override — use agentor.toml agent.runner)"),
+    ]
+    for kind, label in rows:
+        suffix = "  (configured)" if kind == configured else ""
+        entries.append((kind, kind, f"{kind:<8} {label}{suffix}"))
 
     # Land the cursor on the row that matches `current`. When no override
     # is active, that's the first (clear) row.
     sel = 0
     if current:
-        for i, (_, mid, _label) in enumerate(entries):
-            if mid == current:
+        for i, (_, kind, _label) in enumerate(entries):
+            if kind == current:
                 sel = i
                 break
 
@@ -979,14 +983,14 @@ def _prompt_model_switcher(
             for y in range(h):
                 _safe_addstr(stdscr, y, 0, " " * w, w, curses.A_DIM)
 
-            header = f" model switcher · runner={runner} "[: box_w]
+            header = f" provider switcher · configured={configured} "[: box_w]
             _safe_addstr(stdscr, top, left, header.ljust(box_w), box_w,
                          curses.A_BOLD | curses.A_REVERSE)
             _safe_addstr(stdscr, top + 1, left,
-                         " choose a model for newly-dispatched items "
+                         " choose a provider for newly-dispatched items "
                          .ljust(box_w)[:box_w],
                          box_w, curses.A_DIM)
-            for i, (_, _mid, label) in enumerate(entries):
+            for i, (_, _kind, label) in enumerate(entries):
                 y = top + 3 + i
                 if y >= top + box_h - 2:
                     break
@@ -1001,7 +1005,7 @@ def _prompt_model_switcher(
             _safe_addstr(stdscr, top + box_h - 1, left, footer, box_w,
                          curses.A_DIM)
             scope = (" applies only to newly-dispatched items; already-"
-                     "working items keep their original model ")
+                     "working items keep their original provider ")
             _safe_addstr(stdscr, top + box_h, left, scope[:box_w], box_w,
                          curses.A_DIM)
             stdscr.refresh()
@@ -1016,10 +1020,10 @@ def _prompt_model_switcher(
                 sel = max(0, sel - 1)
                 continue
             if ch in (10, 13, curses.KEY_ENTER):
-                alias, mid, _label = entries[sel]
-                if alias == "default":
-                    return _MODEL_OVERRIDE_CLEAR
-                return mid
+                marker, kind, _label = entries[sel]
+                if marker == "default":
+                    return _PROVIDER_OVERRIDE_CLEAR
+                return kind
             k = chr(ch).lower() if 0 < ch < 256 else ""
             if k == "q" or ch == 27:
                 return None
@@ -1027,10 +1031,10 @@ def _prompt_model_switcher(
         stdscr.nodelay(True)
 
 
-# Sentinel returned by `_prompt_model_switcher` when the operator picks
-# "clear override" — distinguishes from None (cancel) so the caller can
-# unset the daemon override rather than leaving it unchanged.
-_MODEL_OVERRIDE_CLEAR = object()
+# Sentinel returned by `_prompt_provider_switcher` when the operator
+# picks "clear override" — distinguishes from None (cancel) so the
+# caller can unset the daemon override rather than leaving it unchanged.
+_PROVIDER_OVERRIDE_CLEAR = object()
 
 
 def _wrap(text: str, width: int) -> list[str]:

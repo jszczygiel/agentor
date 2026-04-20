@@ -23,12 +23,12 @@ from .formatters import (
     _token_breakdown,
 )
 from .render import (
-    _MODEL_OVERRIDE_CLEAR,
+    _PROVIDER_OVERRIDE_CLEAR,
     REFRESH_MS,
     _flash,
     _handle_resize,
-    _prompt_model_switcher,
     _prompt_multiline,
+    _prompt_provider_switcher,
     _prompt_text,
     _prompt_yn,
     _run_with_progress,
@@ -216,24 +216,28 @@ def _deferred_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:
         stdscr.nodelay(True)
 
 
-def _model_switcher_mode(stdscr, cfg: Config, daemon: Daemon) -> None:
-    """Open the model-picker overlay and apply the operator's choice to
-    `daemon.model_override`. The choice is in-memory only — it's read at
-    FRESH dispatch time (plan-phase start, single_phase first execute),
-    cleared on daemon restart, and never written back to `agentor.toml`.
-    Resumed executes keep their original tier via `_resolve_execute_tier`."""
-    from ..config import KNOWN_MODELS
-    rows = KNOWN_MODELS.get(cfg.agent.runner, [])
-    current = daemon.model_override
-    result = _prompt_model_switcher(stdscr, rows, current, cfg.agent.runner)
+def _provider_switcher_mode(stdscr, cfg: Config, daemon: Daemon) -> None:
+    """Open the provider-picker overlay and apply the operator's choice
+    to `daemon.provider_override`. The choice is in-memory only — it's
+    read at FRESH dispatch time (plan-phase start, single_phase first
+    execute, AWAITING_PLAN_REVIEW items re-queued for their execute
+    phase), cleared on daemon restart, and never written back to
+    `agentor.toml`. Already-dispatched workers are unaffected because
+    `_make_runner` snapshots the override at construction time."""
+    from ..config import PROVIDERS
+    rows = list(PROVIDERS)
+    current = daemon.provider_override
+    result = _prompt_provider_switcher(stdscr, rows, current,
+                                       cfg.agent.runner)
     if result is None:
         return
-    if result is _MODEL_OVERRIDE_CLEAR:
-        daemon.model_override = None
-        _flash(stdscr, "model override cleared — using agent.model")
+    if result is _PROVIDER_OVERRIDE_CLEAR:
+        daemon.provider_override = None
+        _flash(stdscr, "provider override cleared — using agent.runner")
         return
-    daemon.model_override = result
-    _flash(stdscr, f"model override set: {result} (newly-dispatched items)")
+    daemon.provider_override = result
+    _flash(stdscr,
+           f"provider override set: {result} (newly-dispatched items)")
 
 
 def _inspect_mode(stdscr, cfg: Config, store: Store, daemon: Daemon) -> None:

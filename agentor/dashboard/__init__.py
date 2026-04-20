@@ -18,8 +18,8 @@ from .modes import (
     _deferred_mode,
     _enter_action,
     _inspect_mode,
-    _model_switcher_mode,
     _new_issue_mode,
+    _provider_switcher_mode,
     _review_mode,
 )
 
@@ -167,10 +167,10 @@ def _loop(stdscr, cfg: Config, store: Store, daemon: Daemon, log_ring: deque):
                 daemon.clear_alert()
             elif ch == ord("M"):
                 # Shift-M only — avoid colliding with `m` (retry merge in
-                # the inspect view). Picker lists the current runner's
-                # known models and stores the choice on `daemon` in-memory
-                # for FRESH dispatches.
-                _model_switcher_mode(stdscr, cfg, daemon)
+                # the inspect view). Picker lists available providers and
+                # stores the choice on `daemon` in-memory for FRESH
+                # dispatches.
+                _provider_switcher_mode(stdscr, cfg, daemon)
             elif ch in (curses.KEY_SR, ord("P")) and selected_id:
                 # Shift+Up (KEY_SR) bumps priority on the selected row.
                 # `P` is the portable fallback — KEY_SR isn't emitted by

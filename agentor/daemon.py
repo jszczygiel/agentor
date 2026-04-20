@@ -1,7 +1,7 @@
 import signal
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from .config import Config
@@ -63,13 +63,15 @@ class Daemon:
         # until its transcript actually advances.
         self.stale_session_alerts: dict[str, int] = {}
         self._stale_session_seen: dict[str, int] = {}
-        # Runtime-only model override set from the dashboard [M] picker.
-        # Applies to FRESH dispatches of newly-claimed QUEUED items (both
-        # plan-phase starts and single_phase executes). Resumed executes
-        # keep their original tier — the execute-tier resolution flow
-        # already honours @model tags and plan nominations there. Cleared
-        # on daemon restart; never written to `agentor.toml`.
-        self.model_override: str | None = None
+        # Runtime-only provider override set from the dashboard [M] picker.
+        # A runner kind string ("claude" | "codex") that shadows
+        # `config.agent.runner` on the next FRESH dispatch. Resumed
+        # AWAITING_PLAN_REVIEW items re-enter via QUEUED, so a mid-session
+        # flip DOES re-target their execute phase — the snapshot in
+        # `_make_runner` only guarantees an already-dispatched worker
+        # won't change provider mid-flight. Cleared on daemon restart;
+        # never written to `agentor.toml`.
+        self.provider_override: str | None = None
         self._heartbeat_last: float = 0.0
         self._heartbeat_dispatched: int = 0
         # Epoch set when run() starts; used as the "since-daemon-start" cutoff
@@ -111,13 +113,19 @@ class Daemon:
         self.log("alert cleared; dispatch resumed")
 
     def _make_runner(self) -> Runner:
-        r = self.runner_factory(self.config, self.store)
+        # Snapshot the provider override at dispatch time so a mid-flight
+        # flip via the dashboard [M] picker only affects the NEXT
+        # dispatch, not a runner already handed off to its worker thread.
+        # Shadow `agent.runner` via a shallow dataclass replace rather
+        # than mutating the shared Config — other threads read the same
+        # object (e.g. the dashboard's status line).
+        cfg = self.config
+        override = self.provider_override
+        if override and override != cfg.agent.runner:
+            cfg = replace(cfg, agent=replace(cfg.agent, runner=override))
+        r = self.runner_factory(cfg, self.store)
         r.proc_registry = self.proc_registry
         r.stop_event = self.stop_event
-        # Snapshot the override at dispatch time so a mid-flight flip via
-        # the dashboard [M] picker only affects the NEXT dispatch, not a
-        # runner that's already been handed off to its worker thread.
-        r._model_override_fresh = self.model_override
         return r
 
     def dispatch_specific(self, item_id: str) -> bool:
