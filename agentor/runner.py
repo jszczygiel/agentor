@@ -365,6 +365,12 @@ class Runner:
         # be killed on shutdown rather than orphaned.
         self.proc_registry: ProcRegistry | None = None
         self.stop_event: threading.Event | None = None
+        # Runtime model override set by the Daemon from the dashboard [M]
+        # picker. A bare model id string (e.g. `"claude-haiku-4-5"`). Only
+        # applied on FRESH dispatch paths (plan-phase start, single_phase
+        # first execute) — resumed executes keep their tier-resolved model
+        # via `_resolve_execute_tier`.
+        self._model_override_fresh: str | None = None
 
     def do_work(self, item: StoredItem, worktree: Path) -> tuple[str, list[str]]:
         """Perform the agent's work inside the worktree. Return (summary, files_changed).
@@ -818,7 +824,10 @@ class ClaudeRunner(Runner):
         prompt = self._prepend_feedback(item, prompt, phase="plan")
         self._last_execute_model = None
         self._last_execute_model_source = None
-        _, stdout = self._invoke_claude(item, worktree, prompt)
+        _, stdout = self._invoke_claude(
+            item, worktree, prompt,
+            model_override=self._model_override_fresh,
+        )
         # For plan phase, _derive_summary is misleading (no commits, no
         # AGENT_SUMMARY.md → falls back to the base branch commit message).
         # Pull the real plan text from the envelope's `result` field;
@@ -858,6 +867,14 @@ class ClaudeRunner(Runner):
         self._last_execute_model = alias
         self._last_execute_model_source = source
         model_override = _ALIAS_TO_MODEL.get(alias)
+        # Dashboard [M] picker wins for FRESH dispatches where the tier
+        # fell through to the global default. Keeps `@model:` tags and
+        # plan nominations authoritative; leaves resumed executes (those
+        # whose session_id was already assigned during plan) untouched.
+        if (source == "default" and not item.session_id
+                and self._model_override_fresh):
+            model_override = self._model_override_fresh
+            self._last_execute_model_source = "dashboard"
         summary, stdout = self._invoke_claude(
             item, worktree, prompt, model_override=model_override,
         )
@@ -1169,7 +1186,10 @@ class CodexRunner(Runner):
         self._last_execute_model = None
         self._last_execute_model_source = None
         output_path = self._last_message_path(item, "plan")
-        _, stdout = self._invoke_codex(item, worktree, prompt, output_path)
+        _, stdout = self._invoke_codex(
+            item, worktree, prompt, output_path,
+            model_override=self._model_override_fresh,
+        )
         plan_text = _read_output_message(output_path)
         if not plan_text:
             plan_text = (
@@ -1193,6 +1213,10 @@ class CodexRunner(Runner):
         self._last_execute_model = alias
         self._last_execute_model_source = source
         model_override = _ALIAS_TO_MODEL.get(alias)
+        if (source == "default" and not item.session_id
+                and self._model_override_fresh):
+            model_override = self._model_override_fresh
+            self._last_execute_model_source = "dashboard"
         output_path = self._last_message_path(item, "execute")
         summary, stdout = self._invoke_codex(
             item, worktree, prompt, output_path,

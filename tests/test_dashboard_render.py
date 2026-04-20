@@ -55,8 +55,13 @@ class TestActionsHint(unittest.TestCase):
 
     def test_core_actions_present(self):
         for key in ("[r]eview", "[d]eferred", "[i]nspect",
-                    "[tab]filter", "[+/-]pool", "[q]uit"):
+                    "[tab]filter", "[+/-]pool", "[q]uit", "[M]odel"):
             self.assertIn(key, ACTIONS)
+
+    def test_mid_advertises_model_switcher(self):
+        # The shift-M model picker must show up in the mid tier too so
+        # operators on narrower terminals still discover it.
+        self.assertIn("[M]", ACTIONS_MID)
 
     def test_removed_pickup_mode_actions_gone(self):
         self.assertNotIn("[p]ickup", ACTIONS)
@@ -829,6 +834,135 @@ class TestAutoResolveBadge(unittest.TestCase):
             for _, s in lines:
                 self.assertLessEqual(len(s), w,
                                      f"w={w} line={s!r} len={len(s)}")
+
+
+class TestModelOverrideFooterStrip(unittest.TestCase):
+    """When `daemon.model_override` is set, the renderer should emit a
+    single dim strip naming the runner + override so operators see the
+    deviation at a glance. Off by default (no strip row)."""
+
+    def _render(self, override: str | None):
+        scr = _StubScreen(24, 120)
+        daemon = _FakeDaemon()
+        daemon.model_override = override
+        with patch("agentor.dashboard.render.curses.color_pair",
+                   return_value=0), \
+             patch("agentor.dashboard.render._set_terminal_title"):
+            _render(scr, _FakeCfg(), _FakeStore(), daemon, deque(), 0)
+        return scr.lines
+
+    def test_no_strip_when_override_unset(self):
+        lines = self._render(None)
+        joined = "\n".join(lines)
+        self.assertNotIn("model override", joined)
+
+    def test_strip_names_override_and_runner(self):
+        lines = self._render("claude-haiku-4-5")
+        joined = "\n".join(lines)
+        self.assertIn("model override", joined)
+        self.assertIn("claude-haiku-4-5", joined)
+        self.assertIn("claude/", joined)  # runner prefix
+
+
+class TestModelSwitcherOverlay(unittest.TestCase):
+    """`_prompt_model_switcher` centers a picker over the main view and
+    returns the selected model id, None on cancel, or the clear sentinel.
+    Tests drive it with a fake stdscr whose `getch` returns a scripted
+    keystroke sequence."""
+
+    def _rows(self):
+        return [
+            ("haiku", "claude-haiku-4-5"),
+            ("sonnet", "claude-sonnet-4-6"),
+            ("opus", "claude-opus-4-7"),
+        ]
+
+    def _stdscr(self, keys: list[int]):
+        seq = iter(keys)
+
+        class FakeStd:
+            def __init__(self):
+                self.lines: list[str] = []
+
+            def getmaxyx(self):
+                return (24, 100)
+
+            def erase(self):
+                self.lines.clear()
+
+            def refresh(self):
+                pass
+
+            def addnstr(self, y, x, s, n, attr=0):
+                self.lines.append(s[: max(0, n - x)])
+
+            def clear(self):
+                self.lines.clear()
+
+            def nodelay(self, *a, **k):
+                pass
+
+            def getch(self):
+                return next(seq)
+
+        return FakeStd()
+
+    def test_enter_returns_current_model_when_preselected(self):
+        from agentor.dashboard.render import _prompt_model_switcher
+        stdscr = self._stdscr([10])  # enter — no nav
+        with patch("agentor.dashboard.render.curses.color_pair",
+                   return_value=0):
+            result = _prompt_model_switcher(
+                stdscr, self._rows(), "claude-sonnet-4-6", "claude",
+            )
+        self.assertEqual(result, "claude-sonnet-4-6")
+
+    def test_down_then_enter_moves_selection(self):
+        from agentor.dashboard.render import _prompt_model_switcher
+        # Start with no override → selection lands on the clear-row
+        # (index 0). Two Downs land on haiku (index 1), wait no — clear
+        # is entry 0, haiku is entry 1, sonnet is 2. Two Downs from 0 →
+        # sonnet.
+        stdscr = self._stdscr([curses.KEY_DOWN, curses.KEY_DOWN, 10])
+        with patch("agentor.dashboard.render.curses.color_pair",
+                   return_value=0):
+            result = _prompt_model_switcher(
+                stdscr, self._rows(), None, "claude",
+            )
+        self.assertEqual(result, "claude-sonnet-4-6")
+
+    def test_esc_returns_none(self):
+        from agentor.dashboard.render import _prompt_model_switcher
+        stdscr = self._stdscr([27])  # ESC
+        with patch("agentor.dashboard.render.curses.color_pair",
+                   return_value=0):
+            result = _prompt_model_switcher(
+                stdscr, self._rows(), None, "claude",
+            )
+        self.assertIsNone(result)
+
+    def test_clear_row_returns_sentinel(self):
+        from agentor.dashboard.render import (_MODEL_OVERRIDE_CLEAR,
+                                              _prompt_model_switcher)
+        # No nav needed — `current=None` lands the cursor on the clear row.
+        stdscr = self._stdscr([10])
+        with patch("agentor.dashboard.render.curses.color_pair",
+                   return_value=0):
+            result = _prompt_model_switcher(
+                stdscr, self._rows(), None, "claude",
+            )
+        self.assertIs(result, _MODEL_OVERRIDE_CLEAR)
+
+    def test_empty_rows_flashes_and_returns_none(self):
+        from agentor.dashboard.render import _prompt_model_switcher
+        # `_flash` calls `curses.napms`; patch that too so we don't trip
+        # the headless-curses gotcha.
+        stdscr = self._stdscr([])
+        with patch("agentor.dashboard.render.curses.color_pair",
+                   return_value=0), \
+             patch("agentor.dashboard.render.curses.napms"):
+            result = _prompt_model_switcher(stdscr, [], None, "stub")
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
