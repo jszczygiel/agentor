@@ -3493,6 +3493,46 @@ class TestResultJsonRecordsExecuteModel(unittest.TestCase):
         self.assertNotIn("execute_model", data)
         self.assertNotIn("execute_model_source", data)
 
+    def test_execute_records_plan_suggestion_even_when_ignored(self):
+        # Plan nominated a tier but operator didn't enable
+        # auto_execute_model; the resolved source is "default" yet we
+        # still want the raw nomination persisted so cost analysis can
+        # compare counterfactual picks against actual spend.
+        class ExecStub(StubRunner):
+            def do_work(self, item, worktree):
+                self._last_phase = "execute"
+                self._last_execute_model = "opus"
+                self._last_execute_model_source = "default"
+                self._last_plan_suggestion = "haiku"
+                return super().do_work(item, worktree)
+
+        cfg = _mk_config(self.root)
+        claimed = self._claim_one(cfg)
+        ExecStub(cfg, self.store).run(claimed)
+        refreshed = self.store.get(claimed.id)
+        data = json.loads(refreshed.result_json)
+        self.assertEqual(data["execute_model"], "opus")
+        self.assertEqual(data["execute_model_source"], "default")
+        self.assertEqual(data["plan_suggested_execute_model"], "haiku")
+
+    def test_plan_suggestion_absent_when_plan_omits_trailer(self):
+        # No nomination from plan → field stays out of result_json (no
+        # null noise).
+        class ExecStub(StubRunner):
+            def do_work(self, item, worktree):
+                self._last_phase = "execute"
+                self._last_execute_model = "opus"
+                self._last_execute_model_source = "default"
+                self._last_plan_suggestion = None
+                return super().do_work(item, worktree)
+
+        cfg = _mk_config(self.root)
+        claimed = self._claim_one(cfg)
+        ExecStub(cfg, self.store).run(claimed)
+        refreshed = self.store.get(claimed.id)
+        data = json.loads(refreshed.result_json)
+        self.assertNotIn("plan_suggested_execute_model", data)
+
 
 class TestDaemonProviderOverrideThreading(unittest.TestCase):
     """The dashboard [M] picker writes a runner kind onto

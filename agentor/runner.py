@@ -623,6 +623,12 @@ class Runner:
                 if alias and source:
                     result["execute_model"] = alias
                     result["execute_model_source"] = source
+                # Plan's raw tier nomination, recorded whether or not it
+                # was applied (gate off, whitelist miss, tag override).
+                # Lets operators measure counterfactual tier picks.
+                suggestion = getattr(self, "_last_plan_suggestion", None)
+                if suggestion:
+                    result["plan_suggested_execute_model"] = suggestion
             envelope = getattr(self, "_last_usage", None)
             if envelope:
                 # Surface turn/timing/usage fields at the top level of
@@ -896,6 +902,7 @@ class ClaudeRunner(Runner):
         prompt = self._prepend_feedback(item, prompt, phase="plan")
         self._last_execute_model = None
         self._last_execute_model_source = None
+        self._last_plan_suggestion = None
         _, stdout = self._invoke_claude(
             item, worktree, prompt,
         )
@@ -941,6 +948,10 @@ class ClaudeRunner(Runner):
         )
         self._last_execute_model = alias
         self._last_execute_model_source = source
+        # Record plan's raw nomination independent of resolution so we
+        # can measure "would the plan have picked a smaller tier?" even
+        # when `agent.auto_execute_model=false` ignores it.
+        self._last_plan_suggestion = _parse_execute_tier(plan, whitelist=None)
         model_override = self.provider.model_aliases.get(alias)
         summary, stdout = self._invoke_claude(
             item, worktree, prompt, model_override=model_override,
@@ -1294,6 +1305,7 @@ class CodexRunner(Runner):
         prompt = self._prepend_feedback(item, prompt, phase="plan")
         self._last_execute_model = None
         self._last_execute_model_source = None
+        self._last_plan_suggestion = None
         output_path = self._last_message_path(item, "plan")
         _, stdout = self._invoke_codex(
             item, worktree, prompt, output_path,
@@ -1322,6 +1334,7 @@ class CodexRunner(Runner):
         )
         self._last_execute_model = alias
         self._last_execute_model_source = source
+        self._last_plan_suggestion = _parse_execute_tier(plan, whitelist=None)
         model_override = self.provider.model_aliases.get(alias)
         output_path = self._last_message_path(item, "execute")
         summary, stdout = self._invoke_codex(
