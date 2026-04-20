@@ -756,6 +756,27 @@ def _run_stream_json_subprocess(
     return stdout_text, stderr_text, p.returncode, timed_out.is_set(), cap_reason
 
 
+def _write_checkpoint_marker(
+    transcript_path: Path, num_turns: int, output_tokens: int, nudge: str,
+    injected: bool,
+) -> None:
+    """Append a human-readable marker to the transcript so post-hoc analysis
+    can see where a checkpoint nudge landed. The marker sits outside the JSONL
+    event stream (line doesn't start with `{`) so the stream walker skips it.
+    Shared by ClaudeRunner (inject via stdin) and CodexRunner (dry-run only —
+    codex has no open stdin, output_tokens always 0)."""
+    tag = "injected" if injected else "observed-dry-run"
+    marker = (
+        f"\n[checkpoint-{tag} @ turn {num_turns} "
+        f"output_tokens={output_tokens}]\n{nudge}\n"
+    )
+    try:
+        with transcript_path.open("a") as fh:
+            fh.write(marker)
+    except Exception:
+        pass
+
+
 class ClaudeRunner(Runner):
     """Spawns a headless `claude -p` subprocess inside the worktree. Runs in
     two phases tied together by session_id:
@@ -1023,8 +1044,11 @@ class ClaudeRunner(Runner):
                     state.num_turns, state.total_output_tokens,
                 )
                 for nudge in nudges:
-                    self._note_checkpoint(transcript_path, state, nudge,
-                                          injected=stdin_holder is not None)
+                    _write_checkpoint_marker(
+                        transcript_path, state.num_turns,
+                        state.total_output_tokens, nudge,
+                        injected=stdin_holder is not None,
+                    )
                     if stdin_holder is not None:
                         line = json.dumps({
                             "type": "user",
@@ -1089,26 +1113,6 @@ class ClaudeRunner(Runner):
             # A publish failure shouldn't crash the run. Dashboard just
             # stays on the previous snapshot.
             pass
-
-    def _note_checkpoint(
-        self, transcript_path: Path, state: "_StreamState", nudge: str,
-        injected: bool,
-    ) -> None:
-        """Append a human-readable marker to the transcript so post-hoc
-        analysis can see where a checkpoint nudge landed. The marker sits
-        outside the JSONL event stream (line doesn't start with `{`) so the
-        stream walker skips it."""
-        tag = "injected" if injected else "observed-dry-run"
-        marker = (
-            f"\n[checkpoint-{tag} @ turn {state.num_turns} "
-            f"output_tokens={state.total_output_tokens}]\n{nudge}\n"
-        )
-        try:
-            with transcript_path.open("a") as fh:
-                fh.write(marker)
-        except Exception:
-            pass
-
 
 class CodexRunner(Runner):
     """Spawns a headless `codex exec` subprocess inside the worktree. Keeps
@@ -1242,6 +1246,23 @@ class CodexRunner(Runner):
         transcript_path: Path, output_path: Path, phase_tag: str,
     ) -> tuple[str, str]:
         state = _CodexStreamState(item_id=item.id, phase=phase_tag)
+        # Codex CLI has no stream-json stdin mode — the prompt is baked into
+        # argv at spawn — so mid-run injection isn't possible. We still run
+        # the emitter as a passive observer: when a threshold crosses, a
+        # `checkpoint-observed-dry-run` marker is appended to the transcript
+        # so post-hoc analysis can see where a nudge would have landed.
+        # Token threshold is dormant on codex (output_tokens always 0 —
+        # codex JSONL exposes no per-turn output_tokens); turn thresholds
+        # are the minimum-viable gate.
+        ckpt_cfg = CheckpointConfig(
+            soft_turns=int(self.config.agent.turn_checkpoint_soft or 0),
+            hard_turns=int(self.config.agent.turn_checkpoint_hard or 0),
+            output_tokens=int(self.config.agent.output_token_checkpoint or 0),
+            soft_template=self.config.agent.checkpoint_soft_template,
+            hard_template=self.config.agent.checkpoint_hard_template,
+            tokens_template=self.config.agent.checkpoint_tokens_template,
+        )
+        emitter = None if ckpt_cfg.all_disabled() else CheckpointEmitter(ckpt_cfg)
         # Mutable holder so the callback can swap in a refreshed StoredItem
         # after persisting the thread_id mid-stream.
         item_ref = [item]
@@ -1259,6 +1280,12 @@ class CodexRunner(Runner):
                 assert refreshed is not None
                 item_ref[0] = refreshed
             self._publish_live(item_ref[0].id, state)
+            if emitter is not None and ev.get("type") == "turn.started":
+                for nudge in emitter.observe(state.num_turns, 0):
+                    _write_checkpoint_marker(
+                        transcript_path, state.num_turns, 0, nudge,
+                        injected=False,
+                    )
             return None
 
         stdout_text, stderr_text, returncode, timed_out, _ = (
