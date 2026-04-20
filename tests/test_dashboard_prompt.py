@@ -299,5 +299,175 @@ class TestNewIssueNoteIsMultiline(unittest.TestCase):
         self.assertFalse(called["expand"])
 
 
+class _ResizingStdscr(_FakeStdscr):
+    """Stdscr stub whose `getmaxyx()` shrinks once `_handle_resize` has fired,
+    so `_prompt_multiline._rebuild` re-computes geometry against new dims.
+    `clear`/`refresh` are no-ops the validator may call mid-edit."""
+
+    def __init__(self, h: int = 30, w: int = 100,
+                 resized: tuple[int, int] | None = None):
+        super().__init__(h=h, w=w)
+        self._resized = resized
+        self.clear_calls = 0
+
+    def getmaxyx(self):
+        if self._post_resize:
+            return self._resized or (self._h, self._w)
+        return (self._h, self._w)
+
+    def clear(self):
+        self.clear_calls += 1
+        if self._resized is not None:
+            self._post_resize = True
+
+    @property
+    def _post_resize(self) -> bool:
+        return getattr(self, "_flag", False)
+
+    @_post_resize.setter
+    def _post_resize(self, v: bool) -> None:
+        self._flag = v
+
+
+class _RecordingWin(_FakeWin):
+    """FakeWin that records `addnstr` paints so resize tests can assert the
+    saved text was restored into the rebuilt edit window."""
+
+    def __init__(self):
+        super().__init__()
+        self.addnstr_calls: list[tuple[int, int, str, int]] = []
+
+    def addnstr(self, y, x, s, n, attr=0):
+        self.addnstr_calls.append((y, x, s, n))
+
+
+class TestPromptMultilineResize(unittest.TestCase):
+    """KEY_RESIZE inside the Textbox validator must rebuild the overlay at
+    the new dims rather than leaking the keycode into the gathered buffer."""
+
+    def setUp(self):
+        self.ctx = _Ctx()
+
+    def tearDown(self):
+        self.ctx.close()
+
+    def test_key_resize_swallowed_by_validator(self):
+        """Validator returns 0 for KEY_RESIZE so `Textbox.edit` keeps looping;
+        the literal `chr(410)` must never reach `gather()`."""
+        returns: list[int] = []
+
+        class FakeTextbox:
+            def __init__(self, win):
+                self.win = win
+                self.stripspaces = True
+
+            def edit(self, validator):
+                returns.append(validator(curses.KEY_RESIZE))
+                returns.append(validator(ord("a")))
+
+            def gather(self):
+                # Real Textbox.gather reads cells via inch — we mimic the
+                # contract that only on-screen text is returned, with the
+                # KEY_RESIZE never landing in the buffer.
+                return "a"
+
+        _install_fakes(self.ctx, FakeTextbox)
+        with patch.object(curses, "update_lines_cols"):
+            out = render._prompt_multiline(_ResizingStdscr(), "label")
+        self.assertEqual(returns[0], 0)
+        self.assertEqual(returns[1], ord("a"))
+        self.assertNotIn(chr(curses.KEY_RESIZE), out)
+        self.assertEqual(out, "a")
+
+    def test_key_resize_rebuilds_overlay(self):
+        """One synthetic KEY_RESIZE must cause two extra `curses.newwin`
+        calls (frame + edit) and swap `box.win` to the new edit window."""
+        newwin_calls: list[tuple] = []
+        seen: dict[str, object] = {}
+
+        class FakeTextbox:
+            def __init__(self, win):
+                self.win = win
+                self.stripspaces = True
+                seen["initial_win"] = win
+
+            def edit(self, validator):
+                validator(curses.KEY_RESIZE)
+                seen["post_resize_win"] = self.win
+
+            def gather(self):
+                return ""
+
+        _install_fakes(self.ctx, FakeTextbox, newwin_calls=newwin_calls)
+        with patch.object(curses, "update_lines_cols"):
+            render._prompt_multiline(
+                _ResizingStdscr(h=30, w=100, resized=(28, 90)), "label")
+        # 2 initial (frame, edit) + 2 rebuild (frame, edit) = 4 newwin calls.
+        self.assertEqual(len(newwin_calls), 4)
+        # Edit window swapped — pre-resize identity must differ from post.
+        self.assertIsNot(seen["initial_win"], seen["post_resize_win"])
+
+    def test_key_resize_restores_text(self):
+        """Pre-existing text in the editor must be re-painted into the
+        rebuilt edit window so the operator doesn't lose what they typed."""
+        newwin_calls: list[tuple] = []
+        edit_wins: list[_RecordingWin] = []
+
+        def _newwin(*a, **_kw):
+            newwin_calls.append(a)
+            win = _RecordingWin()
+            edit_wins.append(win)
+            return win
+
+        class FakeTextbox:
+            def __init__(self, win):
+                self.win = win
+                self.stripspaces = True
+
+            def edit(self, validator):
+                validator(curses.KEY_RESIZE)
+
+            def gather(self):
+                # Pre-seed: simulates the operator having typed two lines
+                # before the resize fires.
+                return "draft line one\nsecond line\n"
+
+        with patch.object(curses, "newwin", _newwin), \
+             patch.object(curses, "curs_set", lambda *_a: 0), \
+             patch("curses.textpad.Textbox", FakeTextbox), \
+             patch.object(curses, "update_lines_cols"):
+            render._prompt_multiline(
+                _ResizingStdscr(h=30, w=100, resized=(28, 90)), "label")
+        # newwin order: frame, edit, new_frame, new_edit. The rebuilt edit
+        # window is the 4th; assert it received both lines via addnstr.
+        self.assertEqual(len(edit_wins), 4)
+        rebuilt_edit = edit_wins[3]
+        painted = [s for (_y, _x, s, _n) in rebuilt_edit.addnstr_calls]
+        self.assertIn("draft line one", painted)
+        self.assertIn("second line", painted)
+
+    def test_key_resize_to_tiny_terminal_cancels(self):
+        """If the resized terminal drops below the 10×40 floor the rebuild
+        bails out and the edit cancels rather than crashing."""
+        class FakeTextbox:
+            def __init__(self, win):
+                self.win = win
+                self.stripspaces = True
+
+            def edit(self, validator):
+                # Cancel signal returned (7 == Ctrl-G); real Textbox would
+                # then exit edit().
+                self._last = validator(curses.KEY_RESIZE)
+
+            def gather(self):
+                return "should be discarded"
+
+        _install_fakes(self.ctx, FakeTextbox)
+        with patch.object(curses, "update_lines_cols"):
+            out = render._prompt_multiline(
+                _ResizingStdscr(h=30, w=100, resized=(5, 20)), "label")
+        self.assertEqual(out, "")  # cancelled
+
+
 if __name__ == "__main__":
     unittest.main()
