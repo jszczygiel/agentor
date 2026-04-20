@@ -20,13 +20,13 @@ def _mk_item(id: str, title: str = "T", body: str = "B") -> Item:
     )
 
 
-def _mk_config(root: Path) -> Config:
+def _mk_config(root: Path, runner: str = "claude") -> Config:
     return Config(
         project_name="t",
         project_root=root,
         sources=SourcesConfig(),
         parsing=ParsingConfig(),
-        agent=AgentConfig(),
+        agent=AgentConfig(runner=runner),
         git=GitConfig(),
         review=ReviewConfig(),
     )
@@ -386,6 +386,141 @@ class TestRecoveryStaleSession(unittest.TestCase):
         """The single-tick marker must be in `_AUTO_RECOVERABLE_PATTERNS`
         so the next startup wipes it without operator intervention."""
         self.assertTrue(_is_auto_recoverable_error(_STALE_SESSION_MARKER))
+
+
+class TestRecoveryStaleSessionCodex(unittest.TestCase):
+    """Codex threads DO expire, and the CLI surfaces that with
+    `thread not found` / `thread/start failed` / `session not found`.
+    Routing dead-session detection through the active `Provider` means
+    a Codex failure row refreshes the ref on next restart instead of
+    looping forever against a dead thread_id."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        self.config = _mk_config(self.root, runner="codex")
+        self.patcher = patch("agentor.recovery.git_ops.worktree_remove")
+        self.mock_wt_remove = self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        self.store.close()
+        self.td.cleanup()
+
+    def _seed_working(self, id: str, session_id: str, worktree_path: str) -> None:
+        self.store.upsert_discovered(_mk_item(id))
+        self.store.transition(id, ItemStatus.QUEUED, note="promote")
+        self.store.transition(
+            id, ItemStatus.WORKING,
+            worktree_path=worktree_path, branch="br",
+            session_id=session_id, note="claim",
+        )
+
+    def test_thread_not_found_failure_demotes(self):
+        wt = self.root / "wt-codex-dead"
+        wt.mkdir()
+        self._seed_working("a", session_id="thr-1", worktree_path=str(wt))
+        self.store.record_failure(
+            item_id="a", attempt=1, phase="execute",
+            error="codex exited 1: thread not found: thr-1",
+            error_sig="codexexited:threadnotfound:thr-",
+        )
+
+        result = recover_on_startup(self.config, self.store)
+
+        item = self.store.get("a")
+        self.assertEqual(item.status, ItemStatus.QUEUED)
+        self.assertIsNone(item.session_id)
+        self.assertEqual(item.last_error, _STALE_SESSION_MARKER)
+        self.assertEqual(result.stale_sessions, ["a"])
+
+    def test_thread_start_failed_failure_demotes(self):
+        wt = self.root / "wt-codex-start"
+        wt.mkdir()
+        self._seed_working("a", session_id="thr-1", worktree_path=str(wt))
+        self.store.record_failure(
+            item_id="a", attempt=1, phase="execute",
+            error="codex exited 1: thread/start failed",
+            error_sig="codexexited:thread/startfailed",
+        )
+
+        result = recover_on_startup(self.config, self.store)
+
+        self.assertEqual(result.stale_sessions, ["a"])
+        self.assertIsNone(self.store.get("a").session_id)
+
+    def test_claude_signature_does_not_demote_codex_item(self):
+        """Cross-provider safety: a Claude-shaped dead-session row on a
+        codex-configured project must NOT trigger the stale-path (the
+        signature is Claude-only; the codex provider ignores it)."""
+        wt = self.root / "wt-codex-claudesig"
+        wt.mkdir()
+        self._seed_working("a", session_id="thr-1", worktree_path=str(wt))
+        self.store.record_failure(
+            item_id="a", attempt=1, phase="execute",
+            error="claude exited 1: No conversation found with session ID sess-1",
+            error_sig="claudeexited:noconversationfoundwithsessionidsess-",
+        )
+
+        result = recover_on_startup(self.config, self.store)
+
+        self.assertEqual(result.stale_sessions, [])
+        self.assertEqual(len(result.resumable), 1)
+        self.assertEqual(self.store.get("a").session_id, "thr-1")
+
+
+class TestRecoveryStubProviderOptsOut(unittest.TestCase):
+    """`StubProvider.session_max_age_hours()` returns `None`, so a stub
+    project skips the age gate entirely even when the operator tuned
+    `agent.session_max_age_hours` below the current claim age."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.store = Store(self.root / ".agentor" / "state.db")
+        self.config = _mk_config(self.root, runner="stub")
+        self.patcher = patch("agentor.recovery.git_ops.worktree_remove")
+        self.mock_wt_remove = self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        self.store.close()
+        self.td.cleanup()
+
+    def _seed_working(self, id: str, session_id: str, worktree_path: str) -> None:
+        self.store.upsert_discovered(_mk_item(id))
+        self.store.transition(id, ItemStatus.QUEUED, note="promote")
+        self.store.transition(
+            id, ItemStatus.WORKING,
+            worktree_path=worktree_path, branch="br",
+            session_id=session_id, note="claim",
+        )
+
+    def _backdate_working_transition(self, id: str, seconds_ago: float) -> None:
+        target = time.time() - seconds_ago
+        self.store.conn.execute(
+            """UPDATE transitions SET at = ? WHERE id = (
+                   SELECT id FROM transitions
+                   WHERE item_id = ? AND to_status = ?
+                   ORDER BY id DESC LIMIT 1
+               )""",
+            (target, id, ItemStatus.WORKING.value),
+        )
+
+    def test_stub_skips_age_gate(self):
+        wt = self.root / "wt-stub-old"
+        wt.mkdir()
+        self._seed_working("a", session_id="sess-1", worktree_path=str(wt))
+        # Tight threshold + backdated claim would demote under claude.
+        self.config.agent.session_max_age_hours = 0.0001
+        self._backdate_working_transition("a", seconds_ago=10)
+
+        result = recover_on_startup(self.config, self.store)
+
+        self.assertEqual(result.stale_sessions, [])
+        self.assertEqual(len(result.resumable), 1)
+        self.assertEqual(self.store.get("a").session_id, "sess-1")
 
 
 if __name__ == "__main__":

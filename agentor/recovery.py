@@ -6,15 +6,9 @@ from pathlib import Path
 from . import git_ops
 from .config import Config
 from .models import ItemStatus
+from .providers import Provider, make_provider
 from .store import Store, StoredItem
 
-
-# Substring (lowercased) identifying a Claude CLI failure caused by a
-# resume against an expired/missing session. Matched against the most
-# recent `failures` row's `error` field — the runtime `_error_signature`
-# strips digits but leaves the surrounding words intact, so the same
-# substring matches both raw error and signature forms.
-_DEAD_SESSION_NEEDLE = "no conversation found with session id"
 
 # Marker placed on `last_error` when the recovery sweep demotes a stale
 # session. Operators should see it for one tick to understand why the
@@ -27,14 +21,17 @@ _STALE_SESSION_MARKER = "session expired; restarting plan"
 # alone. Reasons:
 #   - "agentor shutdown"  — operator ^C, not the item's fault
 #   - "max_cost_usd"      — obsolete runaway cap (removed)
-#   - "no conversation found with session id" — already handled at runtime,
-#     safe to clear stale traces
+#   - dead-session signatures (claude + codex) — already handled at runtime,
+#     safe to clear stale traces regardless of which CLI produced the row
 #   - "no agent result yet — no token data" — dashboard placeholder that
 #     occasionally gets stored; no diagnostic value
 _AUTO_RECOVERABLE_PATTERNS = (
     "agentor shutdown",
     "max_cost_usd",
     "no conversation found with session id",
+    "thread not found",
+    "thread/start failed",
+    "session not found",
     "no agent result yet",
     "no token data",
     # Infrastructure-class: the slot was broken at dispatch time. We
@@ -69,26 +66,28 @@ class RecoveryResult:
     resumable: list[StoredItem]  # WORKING items with session_id + live worktree
     auto_recovered: list[str] = field(default_factory=list)  # errors cleared
     # WORKING items whose persisted session_id is presumed dead (age over
-    # `agent.session_max_age_hours` or a prior failure row matching the
-    # claude "No conversation found …" signature). Demoted to QUEUED with
-    # session_id cleared so the next dispatch starts a fresh plan run
-    # instead of paying for a doomed `claude --resume`.
+    # the active provider's `session_max_age_hours`, or a prior failure
+    # row matching the provider's dead-session signature). Demoted to
+    # QUEUED with session_id cleared so the next dispatch starts a fresh
+    # plan run instead of paying for a doomed `--resume` round-trip.
     stale_sessions: list[str] = field(default_factory=list)
 
 
-def _has_dead_session_failure(store: Store, item_id: str) -> bool:
-    """True when the item's most recent failure row matches the dead-
-    session signature. We only inspect the latest failure to avoid
-    re-acting on errors the operator has already moved past."""
+def _has_dead_session_failure(
+    store: Store, item_id: str, provider: Provider,
+) -> bool:
+    """True when the item's most recent failure row matches the active
+    provider's dead-session signature. We only inspect the latest failure
+    to avoid re-acting on errors the operator has already moved past. Both
+    the raw `error` and the whitespace-stripped `error_sig` fields are
+    tested — `ClaudeProvider` / `CodexProvider` each handle both forms."""
     rows = store.list_failures(item_id, limit=1)
     if not rows:
         return False
     last = rows[0]
-    err = (last.get("error") or "").lower()
-    sig = (last.get("error_sig") or "").lower()
-    needle = _DEAD_SESSION_NEEDLE
-    sig_needle = needle.replace(" ", "")
-    return needle in err or sig_needle in sig
+    err = last.get("error") or ""
+    sig = last.get("error_sig") or ""
+    return provider.is_dead_session_error(err) or provider.is_dead_session_error(sig)
 
 
 def _session_age_seconds(store: Store, item: StoredItem, now: float) -> float:
@@ -123,24 +122,32 @@ def recover_on_startup(config: Config, store: Store) -> RecoveryResult:
     Returns the list of demoted resumable items for logging — the daemon
     no longer needs a separate startup dispatch loop; `_dispatch_one`
     handles everything uniformly."""
+    provider = make_provider(config)
     stuck = store.list_by_status(ItemStatus.WORKING)
     requeued: list[str] = []
     resumable: list[StoredItem] = []
     stale_sessions: list[str] = []
     repo = config.project_root
     now = time.time()
-    max_age_seconds = max(0.0, float(config.agent.session_max_age_hours)) * 3600.0
+    max_age_hours = provider.session_max_age_hours()
+    # `None` means the provider has no wall-clock expiry (stub, or any
+    # future provider whose sessions don't age out) — leave max_age_seconds
+    # at 0 so the age gate is skipped; the per-failure predicate still
+    # runs, so a genuine dead-session error row still demotes.
+    max_age_seconds = (
+        max(0.0, float(max_age_hours)) * 3600.0 if max_age_hours is not None else 0.0
+    )
     for item in stuck:
         wt = Path(item.worktree_path) if item.worktree_path else None
         # Stale-session check runs before the resumable check. An item with
-        # a session_id whose age exceeds the configured threshold, or whose
-        # last failure was a dead-session error, is demoted to a fresh plan
-        # run — `claude --resume` against an expired session always exits 1
-        # and burns ~$0.50 per attempt.
+        # a session_id whose age exceeds the provider's threshold, or whose
+        # last failure was a dead-session error per the provider, is demoted
+        # to a fresh plan run — `--resume` against an expired session
+        # always exits 1 and burns tokens per attempt.
         if item.session_id:
             age = _session_age_seconds(store, item, now)
             stale = (max_age_seconds > 0 and age > max_age_seconds)
-            stale = stale or _has_dead_session_failure(store, item.id)
+            stale = stale or _has_dead_session_failure(store, item.id, provider)
             if stale:
                 if wt is not None and wt.exists():
                     git_ops.worktree_remove(repo, wt, force=True)

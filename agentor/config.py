@@ -240,12 +240,14 @@ class AgentConfig:
     # agent can't dump hundreds of match lines into context. Content-mode
     # is the only gated mode — `count` and `files_with_matches` stay free.
     enforce_grep_head_limit: bool = True
-    # Max age (hours) for a persisted Claude session_id to still be
+    # Max age (hours) for a persisted session_id / thread_id to still be
     # considered resumable on the recovery sweep. Claude CLI sessions
     # expire after ~5h; default 4h leaves a safety cushion. Items past
     # the threshold (or carrying a prior dead-session failure row) are
     # demoted to a fresh plan run instead of paying for a doomed
-    # `claude --resume` round-trip.
+    # `--resume` round-trip. Generic knob — each `Provider` decides
+    # whether to honour it (`StubProvider` returns `None` and the age
+    # gate is skipped; `ClaudeProvider` / `CodexProvider` honour it).
     session_max_age_hours: float = 4.0
     # When `docs/agent-logs/` has accumulated at least this many files,
     # the daemon auto-queues a "Fold agent log lessons" backlog item so
