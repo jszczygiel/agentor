@@ -767,35 +767,37 @@ def _prompt_multiline(stdscr, label: str, *, rows: int | None = None) -> str:
     if h < 10 or w < 40:
         return _prompt_text(stdscr, label + " (empty=cancel): ")
 
-    if rows is None:
-        # Adaptive: fill most of the terminal, floor=8 (matches old default
-        # so sub-14-row terminals keep the prior behavior), cap=30 so very
-        # tall terminals don't render a single gigantic box.
-        rows = max(8, min(30, h - 6))
+    def _geom(h: int, w: int) -> tuple[int, int, int, int, int, int]:
+        # Adaptive default: fill most of the terminal, floor=8 (matches old
+        # default so sub-14-row terminals keep prior behavior), cap=30 so
+        # very tall terminals don't render a single gigantic box.
+        r = rows if rows is not None else max(8, min(30, h - 6))
+        bh = min(r + 4, h - 2)
+        bw = min(80, w - 4)
+        return bh, bw, bh - 4, bw - 2, (h - bh) // 2, (w - bw) // 2
 
-    box_h = min(rows + 4, h - 2)
-    box_w = min(80, w - 4)
-    inner_rows = box_h - 4
-    inner_cols = box_w - 2
-    top = (h - box_h) // 2
-    left = (w - box_w) // 2
+    def _paint_frame(frame, box_h: int, box_w: int) -> None:
+        frame.bkgd(" ", curses.A_NORMAL)
+        frame.box()
+        header = f" {label} "[: box_w - 2]
+        try:
+            frame.addnstr(0, max(1, (box_w - len(header)) // 2),
+                          header, box_w - 2,
+                          curses.A_BOLD | curses.A_REVERSE)
+        except curses.error:
+            pass
+        footer = " Ctrl-G/X submit · Ctrl-C cancel · empty=cancel "[: box_w - 2]
+        try:
+            frame.addnstr(box_h - 1, max(1, (box_w - len(footer)) // 2),
+                          footer, box_w - 2, curses.A_DIM)
+        except curses.error:
+            pass
+        frame.refresh()
+
+    box_h, box_w, inner_rows, inner_cols, top, left = _geom(h, w)
 
     frame = curses.newwin(box_h, box_w, top, left)
-    frame.bkgd(" ", curses.A_NORMAL)
-    frame.box()
-    header = f" {label} "[: box_w - 2]
-    try:
-        frame.addnstr(0, max(1, (box_w - len(header)) // 2),
-                      header, box_w - 2, curses.A_BOLD | curses.A_REVERSE)
-    except curses.error:
-        pass
-    footer = " Ctrl-G/X submit · Ctrl-C cancel · empty=cancel "[: box_w - 2]
-    try:
-        frame.addnstr(box_h - 1, max(1, (box_w - len(footer)) // 2),
-                      footer, box_w - 2, curses.A_DIM)
-    except curses.error:
-        pass
-    frame.refresh()
+    _paint_frame(frame, box_h, box_w)
 
     edit_win = curses.newwin(inner_rows, inner_cols, top + 2, left + 1)
     edit_win.keypad(True)
@@ -805,8 +807,59 @@ def _prompt_multiline(stdscr, label: str, *, rows: int | None = None) -> str:
     box.stripspaces = False
 
     cancelled = {"flag": False}
+    # Mutable holder so the validator closure can swap the live windows on
+    # KEY_RESIZE without needing nonlocal rebinding.
+    live = {"frame": frame, "edit_win": edit_win}
+
+    def _rebuild() -> bool:
+        # Capture text BEFORE tearing down the old window — once we drop the
+        # reference the gather() source is gone. Returns False when the
+        # resized terminal is too small to host the overlay; caller then
+        # cancels the edit.
+        try:
+            saved = box.gather()
+        except curses.error:
+            saved = ""
+        if hasattr(curses, "update_lines_cols"):
+            curses.update_lines_cols()
+        stdscr.clear()
+        stdscr.refresh()
+        nh, nw = stdscr.getmaxyx()
+        if nh < 10 or nw < 40:
+            return False
+        nbh, nbw, nir, nic, ntop, nleft = _geom(nh, nw)
+        if nir <= 0 or nic <= 0:
+            return False
+        new_frame = curses.newwin(nbh, nbw, ntop, nleft)
+        _paint_frame(new_frame, nbh, nbw)
+        new_edit = curses.newwin(nir, nic, ntop + 2, nleft + 1)
+        new_edit.keypad(True)
+        # Restore prior text. Long lines are clipped if the terminal is now
+        # narrower — acceptable since the operator chose the smaller size.
+        for i, line in enumerate(saved.splitlines() or [""]):
+            if i >= nir:
+                break
+            try:
+                new_edit.addnstr(i, 0, line, nic - 1)
+            except curses.error:
+                pass
+        new_edit.refresh()
+        # Swap the Textbox onto the new window. maxy/maxx mirror what
+        # Textbox.__init__ caches via _update_max_yx (a private helper); set
+        # them directly so edit() keeps using correct bounds.
+        box.win = new_edit
+        box.maxy = nir - 1
+        box.maxx = nic - 1
+        live["frame"] = new_frame
+        live["edit_win"] = new_edit
+        return True
 
     def validator(ch: int) -> int:
+        if ch == curses.KEY_RESIZE:
+            if _rebuild():
+                return 0  # swallow — Textbox.edit keeps looping on new win
+            cancelled["flag"] = True
+            return 7  # terminal too small post-resize — cancel cleanly
         if ch in (3, 27):  # Ctrl-C, Esc
             cancelled["flag"] = True
             return 7  # Ctrl-G — terminate edit()
@@ -826,6 +879,8 @@ def _prompt_multiline(stdscr, label: str, *, rows: int | None = None) -> str:
         text = ""
     finally:
         curses.curs_set(0)
+        live["edit_win"] = None
+        live["frame"] = None
         del edit_win
         del frame
         stdscr.touchwin()
