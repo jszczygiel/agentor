@@ -23,7 +23,7 @@ from .capabilities import (
 from .checkpoint import CheckpointConfig, CheckpointEmitter
 from .config import AgentConfig, Config
 from .models import ItemStatus
-from .providers import Provider, make_provider
+from .providers import ClaudeProvider, CodexProvider, Provider, make_provider
 from .slug import slugify
 from .store import Store, StoredItem
 
@@ -1018,7 +1018,7 @@ class ClaudeRunner(Runner):
         Custom `agent.command` templates that drop the `{model}`
         placeholder silently skip the override — matches the existing
         `{settings_path}` opt-out pattern."""
-        template = self.config.agent.command or _default_claude_command()
+        template = self.config.agent.command or ClaudeProvider.default_command()
         legacy_prompt_arg = _command_has_prompt_placeholder(template)
         guardrails = self.write_tool_guardrails(self.config, item.id)
         model = model_override or self.config.agent.model
@@ -1428,10 +1428,10 @@ class CodexRunner(Runner):
         if item.agent_ref:
             tmpl = (
                 self.config.agent.resume_command
-                or _default_codex_resume_command()
+                or CodexProvider.default_resume_command()
             )
         else:
-            tmpl = self.config.agent.command or _default_codex_command()
+            tmpl = self.config.agent.command or CodexProvider.default_command()
         return [a.format(**values) for a in tmpl]
 
     def _invoke_codex_jsonl(
@@ -1995,44 +1995,6 @@ def _read_output_message(path: Path) -> str | None:
     return text or None
 
 
-def _default_codex_command() -> list[str]:
-    return [
-        "codex", "exec", "--json",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "-m", "{model}",
-        "-o", "{output_path}",
-        "{prompt}",
-    ]
-
-
-def _default_claude_command() -> list[str]:
-    # The `-p` without a prompt argument + `--input-format stream-json` puts
-    # claude into a session where user messages are fed via stdin as JSONL
-    # lines. The runner streams the initial prompt in on start, then can
-    # inject mid-run checkpoint nudges on the same channel. Legacy configs
-    # that still set `agent.command = [..., "-p", "{prompt}", ...]` keep
-    # working — the runner detects the placeholder and falls back to the
-    # single-shot invocation (no mid-run injection).
-    #
-    # `--settings {settings_path}` points Claude at a per-run JSON that
-    # registers a PreToolUse hook blocking whole-file `Read` calls on
-    # files above `agent.large_file_line_threshold`. Custom overrides that
-    # drop this placeholder silently disable enforcement.
-    #
-    # `--model {model}` pins the invocation to `agent.model` (or the
-    # per-run override the execute phase passes when
-    # `agent.auto_execute_model=true`). Custom `agent.command` overrides
-    # that drop the placeholder silently fall back to whatever the claude
-    # CLI defaults to — same opt-out pattern as `{settings_path}`.
-    return [
-        "claude", "-p", "--dangerously-skip-permissions",
-        "--settings", "{settings_path}",
-        "--model", "{model}",
-        "--input-format", "stream-json",
-        "--output-format", "stream-json", "--verbose",
-    ]
-
-
 def _claude_initial_stdin_payload(prompt: str) -> str:
     """Frame the initial prompt as a single `user` stream-json line.
     Trailing newline included — the runner writes this verbatim to claude's
@@ -2096,16 +2058,6 @@ def write_claude_settings(
     settings: dict = {"hooks": {"PreToolUse": pretool} if pretool else {}}
     settings_path.write_text(json.dumps(settings, indent=2))
     return settings_path
-
-
-def _default_codex_resume_command() -> list[str]:
-    return [
-        "codex", "exec", "resume", "{session_id}", "--json",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "-m", "{model}",
-        "-o", "{output_path}",
-        "{prompt}",
-    ]
 
 
 def _mark_done_instruction(config: Config, source_file: str) -> str:
