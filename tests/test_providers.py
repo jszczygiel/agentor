@@ -80,7 +80,7 @@ class TestModelToAlias(unittest.TestCase):
         p = ClaudeProvider(_cfg())
         self.assertEqual(p.model_to_alias("claude-opus-4-6"), "opus")
         self.assertEqual(p.model_to_alias("claude-haiku-9-9"), "haiku")
-        self.assertIsNone(p.model_to_alias("gpt-5"))
+        self.assertIsNone(p.model_to_alias("gpt-5.4"))
 
     def test_claude_exact_match_wins_over_prefix(self):
         p = ClaudeProvider(_cfg())
@@ -92,7 +92,7 @@ class TestModelToAlias(unittest.TestCase):
 
     def test_codex_exact_match_only(self):
         # No prefix fallback — Codex has no well-known family-name
-        # shape in its model ids (gpt-5, gpt-5-mini, o4-mini, …).
+        # shape in its model ids (`gpt-5.4`, `gpt-5.4-mini`, `o4-mini`, …).
         p = CodexProvider(_cfg())
         for alias, mid in CodexProvider.model_aliases.items():
             self.assertEqual(p.model_to_alias(mid), alias)

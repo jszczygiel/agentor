@@ -9,7 +9,7 @@
 - `agent.execute_model_whitelist = []` is a sentinel for "full active-provider map", not a hard gate — `_resolve_execute_tier` substitutes `list(provider.model_aliases.keys())` when the config list is empty. Keep this in mind when adding a new provider with no aliases declared: the default path then disables the `@model:` channel entirely (by design — the base class ships `{}`).
 
 ## Follow-ups
-- Codex's concrete `model_aliases = {"mini": "gpt-5-mini", "full": "gpt-5"}` was picked from the backlog example + a reasonable size tier. Worth a second pass from someone with operational Codex CLI experience — the exact ids rotate with OpenAI releases and should eventually be codified with the same shape-regex test Claude gets.
+- Codex's concrete `model_aliases = {"mini": "gpt-5.4-mini", "full": "gpt-5.4"}` still needs periodic verification against current Codex CLI availability. The ids rotate with OpenAI releases and should eventually be codified with the same shape-regex test Claude gets.
 - `_last_execute_model` / `_last_execute_model_source` are typed as `None` at `__init__` then reassigned `str` later — the pre-existing mypy errors would clear with a `str | None` annotation. Out of scope here; worth a dedicated ticket.
 
 ## Outcome

@@ -636,8 +636,8 @@ class CodexProvider(Provider):
     # Codex-routed item correctly falls through to the default with a
     # soft warning instead of silently pinning a Claude id.
     model_aliases: ClassVar[dict[str, str]] = {
-        "mini": "gpt-5-mini",
-        "full": "gpt-5",
+        "mini": "gpt-5.4-mini",
+        "full": "gpt-5.4",
     }
 
     # Codex takes the prompt via argv (no stream-json stdin), so `{prompt}`

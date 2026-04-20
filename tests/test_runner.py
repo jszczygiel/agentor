@@ -3361,17 +3361,17 @@ class TestResolveExecuteTier(unittest.TestCase):
         # Codex ships `{mini, full}` — a `@model:haiku` tag is a legacy
         # Claude value under a Codex-routed item and MUST fall through
         # with a soft warning rather than silently pinning a Claude id.
-        cfg = self._mk_cfg(auto=False, model="gpt-5")
+        cfg = self._mk_cfg(auto=False, model="gpt-5.4")
         provider = self._mk_provider(cfg, kind="codex")
         item = self._mk_item({"model": "haiku"})
         alias, source = _resolve_execute_tier(cfg, provider, item, "")
         self.assertNotEqual(source, "tag")
         # Default falls through to agent.model → codex's own reverse
-        # lookup returns "full" (gpt-5).
+        # lookup returns "full" (`gpt-5.4`).
         self.assertEqual((alias, source), ("full", "default"))
 
     def test_codex_plan_nomination_scoped_to_codex_aliases(self):
-        cfg = self._mk_cfg(auto=True, model="gpt-5")
+        cfg = self._mk_cfg(auto=True, model="gpt-5.4")
         provider = self._mk_provider(cfg, kind="codex")
         item = self._mk_item()
         # A Claude-shaped plan nominating `sonnet` must NOT leak into a
@@ -3488,7 +3488,7 @@ class TestResolvePlanTier(unittest.TestCase):
         )
 
     def test_codex_rejects_claude_alias_tag(self):
-        cfg = self._mk_cfg(model="gpt-5")
+        cfg = self._mk_cfg(model="gpt-5.4")
         provider = self._mk_provider(cfg, kind="codex")
         item = self._mk_item({"plan_model": "haiku"})
         alias, source = _resolve_plan_tier(cfg, provider, item)
