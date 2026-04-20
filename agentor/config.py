@@ -293,6 +293,19 @@ class AgentConfig:
     # (`ClaudeProvider` owns `haiku/sonnet/opus`, `CodexProvider` owns
     # its own `mini/full` set) and rotates with each vendor's releases.
     execute_model_whitelist: list[str] = field(default_factory=list)
+    # Model alias to use for the plan phase. Empty/unset → falls back to
+    # `agent.model`. Precedence at plan dispatch: `@plan_model:<alias>` tag
+    # > this knob > `agent.model`. No effect when `agent.single_phase=true`
+    # (plan phase is skipped entirely). Custom `agent.command` overrides
+    # that drop `{model}` silently skip the per-invocation override, same
+    # opt-out pattern as `{settings_path}`.
+    plan_model: str | None = None
+    # Allow-list of model aliases the `@plan_model` tag (or `agent.plan_model`
+    # config knob) may use. Anything outside this set falls back to `agent.model`
+    # with a soft warning. Empty list (default) means "the active provider's
+    # full alias map". Per-provider vocab: `ClaudeProvider` owns
+    # `haiku/sonnet/opus`; `CodexProvider` owns `mini/full`.
+    plan_model_whitelist: list[str] = field(default_factory=list)
 
 
 @dataclass

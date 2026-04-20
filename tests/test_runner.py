@@ -22,6 +22,7 @@ from agentor.runner import (ClaudeRunner, CodexRunner, StubRunner,
                             _parse_execute_tier,
                             _prepend_plan_answers,
                             _resolve_execute_tier,
+                            _resolve_plan_tier,
                             make_runner, plan_worktree,
                             write_claude_settings)
 from agentor.store import Store
@@ -3391,6 +3392,259 @@ class TestResolveExecuteTier(unittest.TestCase):
             _resolve_execute_tier(cfg, provider, item, ""),
             ("haiku", "tag"),
         )
+
+
+class TestResolvePlanTier(unittest.TestCase):
+    """`_resolve_plan_tier` applies `tag > config > default` precedence
+    with whitelist-gating and soft warnings on invalid aliases."""
+
+    def _mk_cfg(self, *, whitelist: list[str] | None = None,
+                plan_model: str | None = None,
+                model: str = "claude-opus-4-6") -> Config:
+        return Config(
+            project_name="p", project_root=Path("/tmp/never"),
+            sources=SourcesConfig(watch=[], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(
+                model=model,
+                plan_model=plan_model,
+                plan_model_whitelist=(
+                    whitelist if whitelist is not None else []
+                ),
+            ),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+
+    def _mk_provider(self, cfg: Config, kind: str = "claude"):
+        from agentor.providers import ClaudeProvider, CodexProvider, StubProvider
+        cls = {"claude": ClaudeProvider, "codex": CodexProvider,
+               "stub": StubProvider}[kind]
+        return cls(cfg)
+
+    def _mk_item(self, tags: dict[str, str] | None = None):
+        from agentor.store import StoredItem
+        return StoredItem(
+            id="x", title="t", body="b", source_file="docs/backlog/x.md",
+            source_line=1, tags=tags or {}, status=ItemStatus.QUEUED,
+            worktree_path=None, branch=None, attempts=0,
+            last_error=None, feedback=None,
+            result_json=None, agent_ref=None,
+            agentor_version=None, priority=0,
+            created_at=0.0, updated_at=0.0,
+        )
+
+    def test_tag_beats_config(self):
+        cfg = self._mk_cfg(plan_model="sonnet")
+        provider = self._mk_provider(cfg)
+        item = self._mk_item({"plan_model": "haiku"})
+        self.assertEqual(
+            _resolve_plan_tier(cfg, provider, item),
+            ("haiku", "tag"),
+        )
+
+    def test_config_beats_default(self):
+        cfg = self._mk_cfg(plan_model="sonnet", model="claude-opus-4-6")
+        provider = self._mk_provider(cfg)
+        item = self._mk_item()
+        self.assertEqual(
+            _resolve_plan_tier(cfg, provider, item),
+            ("sonnet", "config"),
+        )
+
+    def test_default_when_unset(self):
+        cfg = self._mk_cfg(model="claude-opus-4-6")
+        provider = self._mk_provider(cfg)
+        item = self._mk_item()
+        self.assertEqual(
+            _resolve_plan_tier(cfg, provider, item),
+            ("opus", "default"),
+        )
+
+    def test_invalid_tag_falls_through_with_warning(self):
+        cfg = self._mk_cfg()
+        provider = self._mk_provider(cfg)
+        item = self._mk_item({"plan_model": "claude-haiku-4-5"})
+        alias, source = _resolve_plan_tier(cfg, provider, item)
+        self.assertNotEqual(source, "tag")
+        # No plan_model config → falls to default.
+        self.assertEqual(source, "default")
+
+    def test_invalid_tag_falls_to_config_if_set(self):
+        cfg = self._mk_cfg(plan_model="sonnet")
+        provider = self._mk_provider(cfg)
+        item = self._mk_item({"plan_model": "claude-haiku-4-5"})
+        alias, source = _resolve_plan_tier(cfg, provider, item)
+        self.assertNotEqual(source, "tag")
+        self.assertEqual((alias, source), ("sonnet", "config"))
+
+    def test_tag_case_normalised(self):
+        cfg = self._mk_cfg()
+        provider = self._mk_provider(cfg)
+        item = self._mk_item({"plan_model": "Opus"})
+        self.assertEqual(
+            _resolve_plan_tier(cfg, provider, item),
+            ("opus", "tag"),
+        )
+
+    def test_codex_rejects_claude_alias_tag(self):
+        cfg = self._mk_cfg(model="gpt-5")
+        provider = self._mk_provider(cfg, kind="codex")
+        item = self._mk_item({"plan_model": "haiku"})
+        alias, source = _resolve_plan_tier(cfg, provider, item)
+        self.assertNotEqual(source, "tag")
+        self.assertEqual((alias, source), ("full", "default"))
+
+    def test_empty_whitelist_falls_through_to_provider_map(self):
+        cfg = self._mk_cfg(whitelist=[], plan_model=None)
+        provider = self._mk_provider(cfg)
+        item = self._mk_item({"plan_model": "haiku"})
+        self.assertEqual(
+            _resolve_plan_tier(cfg, provider, item),
+            ("haiku", "tag"),
+        )
+
+    def test_explicit_whitelist_gates_config(self):
+        # plan_model_whitelist=["sonnet"] means agent.plan_model="haiku"
+        # misses the gate and falls to default.
+        cfg = self._mk_cfg(whitelist=["sonnet"], plan_model="haiku",
+                           model="claude-opus-4-6")
+        provider = self._mk_provider(cfg)
+        item = self._mk_item()
+        alias, source = _resolve_plan_tier(cfg, provider, item)
+        # "haiku" not in ["sonnet"] → falls to default.
+        self.assertEqual(source, "default")
+        self.assertEqual(alias, "opus")
+
+    def test_explicit_whitelist_allows_matching_config(self):
+        cfg = self._mk_cfg(whitelist=["sonnet"], plan_model="sonnet",
+                           model="claude-opus-4-6")
+        provider = self._mk_provider(cfg)
+        item = self._mk_item()
+        self.assertEqual(
+            _resolve_plan_tier(cfg, provider, item),
+            ("sonnet", "config"),
+        )
+
+
+class TestPlanTierDispatchSmoke(unittest.TestCase):
+    """Verify that ClaudeRunner._do_plan passes model_override derived
+    from @plan_model tag through to _invoke_claude."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] Task @plan_model:haiku\n")
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def test_do_plan_passes_model_override_to_invoke_claude(self):
+        captured = {}
+
+        class CapturingRunner(ClaudeRunner):
+            def _invoke_claude(self, item, worktree, prompt,
+                               model_override=None):
+                captured["model_override"] = model_override
+                # Return fake stdout; skip actual subprocess.
+                self._last_usage = {"result": "# Plan\nDone."}
+                return "# Plan\nDone.", ""
+
+        cfg = Config(
+            project_name=self.root.name,
+            project_root=self.root,
+            sources=SourcesConfig(watch=["backlog.md"], exclude=[]),
+            parsing=ParsingConfig(mode="checkbox"),
+            agent=AgentConfig(pool_size=1),
+            git=GitConfig(base_branch="main", branch_prefix="agent/"),
+            review=ReviewConfig(),
+        )
+        scan_once(cfg, self.store)
+        items = self.store.list_by_status(ItemStatus.QUEUED)
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        wt, br = plan_worktree(cfg, item)
+        claimed = self.store.claim_next_queued(str(wt), br)
+
+        runner = CapturingRunner(cfg, self.store)
+        runner._do_plan(claimed, wt)
+
+        expected_id = ClaudeProvider.model_aliases["haiku"]
+        self.assertEqual(captured.get("model_override"), expected_id)
+        self.assertEqual(runner._last_plan_model, "haiku")
+        self.assertEqual(runner._last_plan_model_source, "tag")
+
+
+class TestResultJsonRecordsPlanModel(unittest.TestCase):
+    """Plan-phase runs land plan_model + plan_model_source in result_json;
+    execute-phase runs leave them absent."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.root = Path(self.td.name)
+        _init_project(self.root)
+        (self.root / "backlog.md").write_text("- [ ] Demo item\n")
+        self.store = Store(self.root / ".agentor" / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.td.cleanup()
+
+    def _claim_one(self, cfg: Config):
+        scan_once(cfg, self.store)
+        item = self.store.list_by_status(ItemStatus.QUEUED)[0]
+        wt, br = plan_worktree(cfg, item)
+        return self.store.claim_next_queued(str(wt), br)
+
+    def test_plan_records_plan_model_and_source(self):
+        class PlanStub(StubRunner):
+            def do_work(self, item, worktree):
+                self._last_phase = "plan"
+                self._last_plan_model = "haiku"
+                self._last_plan_model_source = "tag"
+                return super().do_work(item, worktree)
+
+        cfg = _mk_config(self.root)
+        claimed = self._claim_one(cfg)
+        PlanStub(cfg, self.store).run(claimed)
+        refreshed = self.store.get(claimed.id)
+        self.assertEqual(refreshed.status, ItemStatus.AWAITING_PLAN_REVIEW)
+        data = json.loads(refreshed.result_json)
+        self.assertEqual(data["plan_model"], "haiku")
+        self.assertEqual(data["plan_model_source"], "tag")
+
+    def test_plan_omits_fields_when_attrs_absent(self):
+        # StubRunner doesn't set _last_plan_model; attrs absent → fields
+        # omitted from result_json.
+        cfg = _mk_config(self.root)
+        claimed = self._claim_one(cfg)
+        StubRunner(cfg, self.store).run(claimed)
+        refreshed = self.store.get(claimed.id)
+        data = json.loads(refreshed.result_json)
+        self.assertNotIn("plan_model", data)
+        self.assertNotIn("plan_model_source", data)
+
+    def test_execute_phase_omits_plan_model_fields(self):
+        class ExecStub(StubRunner):
+            def do_work(self, item, worktree):
+                self._last_phase = "execute"
+                self._last_execute_model = "opus"
+                self._last_execute_model_source = "default"
+                self._last_plan_model = "haiku"
+                self._last_plan_model_source = "tag"
+                return super().do_work(item, worktree)
+
+        cfg = _mk_config(self.root)
+        claimed = self._claim_one(cfg)
+        ExecStub(cfg, self.store).run(claimed)
+        refreshed = self.store.get(claimed.id)
+        data = json.loads(refreshed.result_json)
+        # Execute phase must NOT bleed plan_model into result_json.
+        self.assertNotIn("plan_model", data)
+        self.assertNotIn("plan_model_source", data)
 
 
 class TestAliasMapShape(unittest.TestCase):
