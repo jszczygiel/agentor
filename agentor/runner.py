@@ -21,7 +21,7 @@ from .capabilities import (
     ProviderCapabilities,
 )
 from .checkpoint import CheckpointConfig, CheckpointEmitter
-from .config import _ALIAS_TO_MODEL, AgentConfig, Config
+from .config import AgentConfig, Config
 from .models import ItemStatus
 from .providers import Provider, make_provider
 from .resume_primer import build_primer
@@ -918,10 +918,12 @@ class ClaudeRunner(Runner):
             prompt = f"{primer}\n{prompt}"
         prompt = self._prepend_feedback(item, prompt, phase="execute")
         prompt = _prepend_plan_answers(item, prompt)
-        alias, source = _resolve_execute_tier(self.config, item, plan)
+        alias, source = _resolve_execute_tier(
+            self.config, self.provider, item, plan,
+        )
         self._last_execute_model = alias
         self._last_execute_model_source = source
-        model_override = _ALIAS_TO_MODEL.get(alias)
+        model_override = self.provider.model_aliases.get(alias)
         summary, stdout = self._invoke_claude(
             item, worktree, prompt, model_override=model_override,
         )
@@ -1287,10 +1289,12 @@ class CodexRunner(Runner):
         prompt += _mark_done_instruction(self.config, item.source_file)
         prompt = self._prepend_feedback(item, prompt, phase="execute")
         prompt = _prepend_plan_answers(item, prompt)
-        alias, source = _resolve_execute_tier(self.config, item, plan)
+        alias, source = _resolve_execute_tier(
+            self.config, self.provider, item, plan,
+        )
         self._last_execute_model = alias
         self._last_execute_model_source = source
-        model_override = _ALIAS_TO_MODEL.get(alias)
+        model_override = self.provider.model_aliases.get(alias)
         output_path = self._last_message_path(item, "execute")
         summary, stdout = self._invoke_codex(
             item, worktree, prompt, output_path,
@@ -1783,7 +1787,11 @@ def _parse_execute_tier(
     when the trailer is present AND the suggestion is in `whitelist` (any
     case). Returns None on missing heading, malformed body, or whitelist
     miss — callers treat None as a soft fallback to the global default.
-    No raise."""
+    No raise.
+
+    `whitelist=None` disables the gate (any well-formed alias is
+    returned). Callers that want a hard gate pass the active provider's
+    `model_aliases.keys()` — `_resolve_execute_tier` does this."""
     if not plan_text:
         return None
     m = _EXECUTE_TIER_HEADING_RE.search(plan_text)
@@ -1796,15 +1804,16 @@ def _parse_execute_tier(
     if not sm:
         return None
     alias = sm.group(1).strip().lower()
-    allowed = whitelist if whitelist is not None else ["haiku", "sonnet", "opus"]
-    allowed_lower = {a.lower() for a in allowed}
+    if whitelist is None:
+        return alias
+    allowed_lower = {a.lower() for a in whitelist}
     if alias not in allowed_lower:
         return None
     return alias
 
 
 def _resolve_execute_tier(
-    config: Config, item: StoredItem, prior_plan: str,
+    config: Config, provider: Provider, item: StoredItem, prior_plan: str,
 ) -> tuple[str, str]:
     """Resolve the alias + source for the execute-phase model dispatch.
 
@@ -1815,12 +1824,19 @@ def _resolve_execute_tier(
          rather than silently pinning an unintended value).
       2. Plan's `## Execute tier` trailer — only when
          `agent.auto_execute_model=True`.
-      3. Global default — the alias matching `agent.model`, else `opus`.
+      3. Global default — the alias matching `agent.model` per the
+         provider's reverse lookup, else the first alias in
+         `provider.model_aliases`, else the raw `agent.model` string.
+
+    The whitelist is `agent.execute_model_whitelist` when non-empty,
+    else the active provider's full `model_aliases.keys()`. Alias
+    vocabulary is per-provider — `@model:haiku` on a Codex-routed item
+    falls through with a warning because Codex ships `mini/full`.
 
     Returns `(alias, source)` where `source ∈ {"tag","plan","default"}`.
-    `alias` is always one of the configured whitelist entries — invalid
-    inputs at any level soft-fall through to the next level."""
-    whitelist = list(config.agent.execute_model_whitelist or [])
+    """
+    configured = list(config.agent.execute_model_whitelist or [])
+    whitelist = configured or list(provider.model_aliases.keys())
     allowed = {a.lower() for a in whitelist}
 
     tag_raw = (item.tags or {}).get("model")
@@ -1830,8 +1846,8 @@ def _resolve_execute_tier(
             return tag, "tag"
         print(
             f"[runner] ignoring @model tag {tag_raw!r} on item {item.id} — "
-            f"not in execute_model_whitelist {whitelist!r}. "
-            "Use a short alias (haiku|sonnet|opus), not the full model id.",
+            f"not in {provider.__class__.__name__} alias whitelist {sorted(allowed)!r}. "
+            "Use a short alias, not the full model id.",
         )
 
     if config.agent.auto_execute_model and prior_plan:
@@ -1839,26 +1855,18 @@ def _resolve_execute_tier(
         if nominated:
             return nominated, "plan"
 
-    # Fallback: map agent.model back to an alias if possible so the
-    # recorded value matches the alias vocabulary used elsewhere.
-    default_alias = _model_to_alias(config.agent.model) or "opus"
-    if default_alias not in allowed:
-        # Whitelist narrower than the default — respect the operator's
-        # intent and report whatever they actually set.
-        default_alias = default_alias
+    # Fallback: map agent.model back to an alias via the provider's
+    # reverse lookup so the recorded value matches the alias vocabulary
+    # used elsewhere. If the model id isn't known to this provider, fall
+    # through to its first-listed alias rather than a hardcoded "opus"
+    # (which would be wrong under any non-Claude provider).
+    default_alias = provider.model_to_alias(config.agent.model)
+    if default_alias is None:
+        default_alias = (
+            next(iter(provider.model_aliases)) if provider.model_aliases
+            else config.agent.model
+        )
     return default_alias, "default"
-
-
-def _model_to_alias(model_id: str) -> str | None:
-    """Reverse lookup `_ALIAS_TO_MODEL`. Falls back to matching by the
-    `claude-(haiku|sonnet|opus)-...` prefix so e.g. `claude-opus-4-6`
-    still resolves to `opus` even when `_ALIAS_TO_MODEL["opus"]` has
-    rotated to a newer id."""
-    for alias, mid in _ALIAS_TO_MODEL.items():
-        if mid == model_id:
-            return alias
-    m = re.match(r"claude-(haiku|sonnet|opus)\b", model_id or "")
-    return m.group(1) if m else None
 
 
 def _extract_plan_questions(plan: str) -> list[str]:

@@ -22,13 +22,6 @@ class ParsingConfig:
     mode: str = "frontmatter"  # "checkbox" | "heading" | "frontmatter"
 
 
-_ALIAS_TO_MODEL: dict[str, str] = {
-    "haiku": "claude-haiku-4-5",
-    "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-7",
-}
-
-
 # Providers the dashboard [M] switcher offers at runtime. The picker
 # flips `agent.runner` in-memory for the next FRESH dispatch; model tier
 # selection remains driven by `@model:` tags, plan nominations, and
@@ -288,11 +281,12 @@ class AgentConfig:
     # for execute. Anything outside this set falls back to `agent.model`
     # with a soft warning — prevents a prompt-injected plan or an
     # operator typo like `@model: claude-haiku-4-5` (full ID) from
-    # sneaking through. Aliases only; the mapping to current best model
-    # id lives in `config._ALIAS_TO_MODEL` and rotates with releases.
-    execute_model_whitelist: list[str] = field(
-        default_factory=lambda: ["haiku", "sonnet", "opus"]
-    )
+    # sneaking through. Empty list (default) means "the active provider's
+    # full alias map" — see `Provider.model_aliases` on each subclass in
+    # `agentor/providers.py`; vocabulary is per-provider
+    # (`ClaudeProvider` owns `haiku/sonnet/opus`, `CodexProvider` owns
+    # its own `mini/full` set) and rotates with each vendor's releases.
+    execute_model_whitelist: list[str] = field(default_factory=list)
 
 
 @dataclass
