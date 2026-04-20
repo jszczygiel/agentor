@@ -127,7 +127,7 @@ class _FakeStore:
     def latest_transition_at(self, *a, **k):
         return None
 
-    def aggregate_token_usage(self, *, since=None):
+    def aggregate_token_usage(self, *, since=None, classifier=None):
         return {"input": 0, "output": 0, "cache_read": 0,
                 "cache_create": 0, "total": 0}
 

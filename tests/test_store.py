@@ -806,6 +806,91 @@ class TestAggregateTokenUsage(unittest.TestCase):
         buckets = self.store.aggregate_token_usage()
         self.assertEqual(buckets["input"], 4)
 
+    def test_classifier_produces_by_tier(self):
+        import json as _json
+        blob = _json.dumps({
+            "modelUsage": {
+                "claude-haiku-4-5": {
+                    "inputTokens": 10, "outputTokens": 5,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+                },
+                "claude-sonnet-4-6": {
+                    "inputTokens": 100, "outputTokens": 50,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+                },
+                "claude-opus-4-7": {
+                    "inputTokens": 1000, "outputTokens": 500,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+                },
+                "unknown-model-x": {
+                    "inputTokens": 7, "outputTokens": 3,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+                },
+            },
+        })
+        self._seed("a", blob)
+        alias_map = {
+            "claude-haiku-4-5": "haiku",
+            "claude-sonnet-4-6": "sonnet",
+            "claude-opus-4-7": "opus",
+        }
+
+        def classifier(model_id: str):
+            return alias_map.get(model_id)
+
+        buckets = self.store.aggregate_token_usage(classifier=classifier)
+        # Flat totals unchanged
+        self.assertEqual(buckets["input"], 10 + 100 + 1000 + 7)
+        self.assertEqual(buckets["total"], (10 + 5) + (100 + 50) + (1000 + 500) + (7 + 3))
+        # by_tier present
+        self.assertIn("by_tier", buckets)
+        bt = buckets["by_tier"]
+        self.assertEqual(bt["haiku"]["input"], 10)
+        self.assertEqual(bt["haiku"]["output"], 5)
+        self.assertEqual(bt["haiku"]["total"], 15)
+        self.assertEqual(bt["sonnet"]["input"], 100)
+        self.assertEqual(bt["sonnet"]["total"], 150)
+        self.assertEqual(bt["opus"]["total"], 1500)
+        # unknown model lands in "other"
+        self.assertIn("other", bt)
+        self.assertEqual(bt["other"]["input"], 7)
+        self.assertEqual(bt["other"]["total"], 10)
+
+    def test_classifier_by_tier_totals_sum_to_flat_total(self):
+        import json as _json
+        blob = _json.dumps({
+            "modelUsage": {
+                "model-a": {"inputTokens": 100, "outputTokens": 50,
+                             "cacheReadInputTokens": 10, "cacheCreationInputTokens": 5},
+                "model-b": {"inputTokens": 200, "outputTokens": 80,
+                             "cacheReadInputTokens": 20, "cacheCreationInputTokens": 0},
+            },
+        })
+        self._seed("a", blob)
+        classifier = lambda mid: "tier1" if mid == "model-a" else None
+        buckets = self.store.aggregate_token_usage(classifier=classifier)
+        by_tier = buckets["by_tier"]
+        tier_total = sum(t["total"] for t in by_tier.values())
+        self.assertEqual(tier_total, buckets["total"])
+
+    def test_classifier_flat_usage_routes_to_other(self):
+        import json as _json
+        blob = _json.dumps({
+            "usage": {"input_tokens": 42, "output_tokens": 8,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+        })
+        self._seed("a", blob)
+        buckets = self.store.aggregate_token_usage(classifier=lambda _: "haiku")
+        # flat usage has no model_id so always routes to "other"
+        self.assertIn("other", buckets["by_tier"])
+        self.assertEqual(buckets["by_tier"]["other"]["input"], 42)
+
+    def test_no_classifier_returns_no_by_tier(self):
+        import json as _json
+        self._seed("a", _json.dumps({"usage": {"input_tokens": 5}}))
+        buckets = self.store.aggregate_token_usage()
+        self.assertNotIn("by_tier", buckets)
+
 
 class TestDeleteItem(unittest.TestCase):
     """Pins the `delete_item` contract: dependent rows (failures,
